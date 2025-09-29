@@ -79,6 +79,22 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     default_value = adsk.core.ValueInput.createByString('0.003')
     inputs.addValueInput('extra_center', 'Extra Center', defaultLengthUnits, default_value)
 
+    # Bearing hole options
+    bearingHoleGroup = inputs.addGroupCommandInput('bearing_hole_group', 'Bearing Holes')
+    bearingHoleGroup.isExpanded = True
+    
+    # Start bearing hole
+    startBearingGroup = bearingHoleGroup.children.addGroupCommandInput('start_bearing_group', 'Start Bearing Hole')
+    startBearingGroup.isEnabledCheckBoxDisplayed = True
+    startBearingGroup.isEnabledCheckBoxChecked = False
+    startBearingSize = startBearingGroup.children.addValueInput('start_bearing_size', 'Diameter', 'in', adsk.core.ValueInput.createByString('1.125 in'))
+    
+    # End bearing hole
+    endBearingGroup = bearingHoleGroup.children.addGroupCommandInput('end_bearing_group', 'End Bearing Hole')
+    endBearingGroup.isEnabledCheckBoxDisplayed = True
+    endBearingGroup.isEnabledCheckBoxChecked = False
+    endBearingSize = endBearingGroup.children.addValueInput('end_bearing_size', 'Diameter', 'in', adsk.core.ValueInput.createByString('1.125 in'))
+
     # Create a separator.
     inputs.addSeparatorCommandInput( "message_sep")
     inputs.addTextBoxCommandInput( "status_msg", "", "Select", 1, True )
@@ -113,6 +129,10 @@ def command_execute(args: adsk.core.CommandEventArgs):
     swapCogs = inputs.itemById( "swap_cogs" ).value
     beltTeethInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
     extraCenterInp: adsk.core.ValueInput = inputs.itemById('extra_center')
+    startBearingGroup: adsk.core.GroupCommandInput = inputs.itemById('start_bearing_group')
+    startBearingSizeInp: adsk.core.ValueCommandInput = inputs.itemById('start_bearing_size')
+    endBearingGroup: adsk.core.GroupCommandInput = inputs.itemById('end_bearing_group')
+    endBearingSizeInp: adsk.core.ValueCommandInput = inputs.itemById('end_bearing_size')
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
 
     startSketchPt = None
@@ -178,6 +198,9 @@ def command_execute(args: adsk.core.CommandEventArgs):
         #     return
         ccutil.modifyCCLine( ccLine )
 
+    # Create bearing holes if enabled
+    createBearingHoles(ccLine, startBearingGroup, startBearingSizeInp, endBearingGroup, endBearingSizeInp)
+
     msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}</div>'
     status.formattedText = msg
     if not preview :
@@ -185,6 +208,49 @@ def command_execute(args: adsk.core.CommandEventArgs):
 
     # This was needed once debugging output was turned off....
     app.activeViewport.refresh()
+
+
+def createBearingHoles(ccLine, startBearingGroup, startBearingSizeInp, endBearingGroup, endBearingSizeInp):
+    """Create bearing holes at the center points of the CCLine (independently controlled)"""
+    try:
+        if ccLine.line is None:
+            return
+            
+        sketch = ccLine.line.parentSketch
+        if sketch is None:
+            return
+            
+        # Get the start and end points of the CCLine
+        startPt = ccLine.line.startSketchPoint
+        endPt = ccLine.line.endSketchPoint
+        
+        from ...lib import fusionAddInUtils as futil
+        
+        # Create start bearing hole if enabled
+        if startBearingGroup.isEnabledCheckBoxChecked:
+            startDiameter = startBearingSizeInp.value
+            startBearingHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(startPt, startDiameter / 2)
+            startBearingHole.isConstruction = False
+            
+            # Dimension for start bearing hole
+            textPt1 = futil.offsetPoint3D(startPt.geometry, startDiameter/4, startDiameter/4, 0)
+            startDim = sketch.sketchDimensions.addDiameterDimension(startBearingHole, textPt1)
+            startDim.value = startDiameter
+        
+        # Create end bearing hole if enabled
+        if endBearingGroup.isEnabledCheckBoxChecked:
+            endDiameter = endBearingSizeInp.value
+            endBearingHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(endPt, endDiameter / 2)
+            endBearingHole.isConstruction = False
+            
+            # Dimension for end bearing hole
+            textPt2 = futil.offsetPoint3D(endPt.geometry, -endDiameter/4, endDiameter/4, 0)
+            endDim = sketch.sketchDimensions.addDiameterDimension(endBearingHole, textPt2)
+            endDim.value = endDiameter
+        
+    except Exception as e:
+        # Log error but don't fail the command
+        futil.log(f'Error creating bearing holes: {str(e)}')
 
 
 # This event handler is called when the command needs to compute a new preview in the graphics window.
