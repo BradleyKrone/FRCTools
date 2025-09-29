@@ -94,6 +94,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # General logging for debug.
     # futil.log(f'{CMD_NAME} command Created Event')
+    
+    # Set dialog size to be wider
+    args.command.setDialogInitialSize(250, 300)  # width, height in pixels
 
     # https://help.autodesk.com/view/fusion360/ENU/?contextId=CommandInputs
     inputs = args.command.commandInputs
@@ -103,9 +106,6 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     centerSelection.addSelectionFilter( "SketchPoints" )
     centerSelection.addSelectionFilter( "SketchCircles" )
     centerSelection.setSelectionLimits( 1, 1 )
-
-    # Checkbox to require center point selection
-    inputs.addBoolValueInput('require_selection', 'Require Center Selection', True, '', True)
 
     # Bolt Patterns
     boltPattern = inputs.addDropDownCommandInput('bolt_pattern', 'Bolt Pattern', adsk.core.DropDownStyles.TextListDropDownStyle)
@@ -141,42 +141,21 @@ def command_execute(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
     centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
-    requireSelectionInp: adsk.core.BoolValueCommandInput = inputs.itemById('require_selection')
     suppressCenterHoleInp: adsk.core.BoolValueCommandInput = inputs.itemById('suppress_center_hole')
     centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
 
     centerPt: adsk.fusion.SketchPoint = None
-    sketch: adsk.fusion.Sketch = None
-    
-    if requireSelectionInp.value and centerSelection.selectionCount > 0:
-        # Use selected center point
-        selectedEntity = centerSelection.selection(0).entity
-        if selectedEntity.objectType == adsk.fusion.SketchCircle.classType() :
-            centerPt = selectedEntity.centerSketchPoint
-            sketch = centerPt.parentSketch
-        elif selectedEntity.objectType == adsk.fusion.SketchPoint.classType() :
-            centerPt = selectedEntity
-            sketch = centerPt.parentSketch
-        else :
-            futil.popup_error( f'  Cannot handle object type = {selectedEntity.objectType}')
-            return
-    else:
-        # Use sketch origin - get the active sketch
-        activeSketch = None
-        activeDoc = app.activeDocument
-        if activeDoc:
-            activeProduct = activeDoc.design
-            if activeProduct:
-                activeSketch = activeProduct.activeEditObject
-        
-        if activeSketch and activeSketch.objectType == adsk.fusion.Sketch.classType():
-            sketch = activeSketch
-            centerPt = sketch.originPoint
-        else:
-            futil.popup_error('No active sketch found. Please create or edit a sketch first.')
-            return
+    selectedEntity = centerSelection.selection(0).entity
+    if selectedEntity.objectType == adsk.fusion.SketchCircle.classType() :
+        centerPt = selectedEntity.centerSketchPoint
+    elif selectedEntity.objectType == adsk.fusion.SketchPoint.classType() :
+        centerPt = selectedEntity
+    else :
+        futil.popup_error( f'  Cannot handle object type = {selectedEntity.objectType}')
+        return
     
     boltPattern = bolt_patterns[ boltPatternInp.selectedItem.index ]
+    sketch = centerPt.parentSketch
 
     # Create the bolt pattern center hole (only if not suppressed)
     if not suppressCenterHoleInp.value:
@@ -242,19 +221,6 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         
         selected_pattern = bolt_patterns[boltPatternInp.selectedItem.index]
         centerHoleSizeInp.expression = f'{selected_pattern.centerDia} in'
-    
-    # If the require selection checkbox changed, show/hide the center selection
-    if changed_input.id == 'require_selection':
-        requireSelectionInp: adsk.core.BoolValueCommandInput = inputs.itemById('require_selection')
-        centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
-        
-        if requireSelectionInp.value:
-            centerSelection.isVisible = True
-            centerSelection.setSelectionLimits(1, 1)
-        else:
-            centerSelection.isVisible = False
-            centerSelection.clearSelection()
-            centerSelection.setSelectionLimits(0, 1)
 
 
 
@@ -266,19 +232,12 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
     inputs = args.inputs
     
-    # Check if center is selected (if required)
+    # Check if center is selected
     centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
-    requireSelectionInp: adsk.core.BoolValueCommandInput = inputs.itemById('require_selection')
     centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
     
     # Validate inputs
-    center_valid = True
-    if requireSelectionInp.value:
-        # Selection is required, check if we have one
-        center_valid = centerSelection.selectionCount > 0
-    # If selection is not required, center is always valid (will use origin)
-    
-    if center_valid and centerHoleSizeInp.value > 0:
+    if centerSelection.selectionCount > 0 and centerHoleSizeInp.value > 0:
         args.areInputsValid = True
     else:
         args.areInputsValid = False
