@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Circle -->
+  <circle cx="16" cy="16" r="12" fill="none" stroke="#0078d4" stroke-width="3"/>
+  
+  <!-- Diameter dimension line with arrows -->
+  <line x1="6" y1="16" x2="26" y2="16" stroke="#0078d4" stroke-width="2.5"/>
+  <polygon points="6,16 9,14 9,18" fill="#0078d4"/>
+  <polygon points="26,16 23,14 23,18" fill="#0078d4"/>
+  
+  <!-- Diameter symbol (⌀) -->
+  <text x="16" y="12" font-family="Arial" font-size="10" font-weight="bold" fill="#0078d4" text-anchor="middle">⌀</text>
+</svg>
