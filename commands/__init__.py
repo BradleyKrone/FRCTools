@@ -8,8 +8,6 @@ from .FilletXpert import entry as FilletXpert
 from .Lighten import entry as Lighten
 from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
-from .TimingBelt import entry as TimingBelt
-from .TimingPulley import entry as TimingPulley
 from .Tubify import entry as Tubify
 
 # Fusion will automatically call the start() and stop() functions.
@@ -20,8 +18,6 @@ commands = [
     Lighten,
     QuickCircle,
     PartsGen,
-    TimingBelt,
-    TimingPulley,
     Tubify
 ]
 
