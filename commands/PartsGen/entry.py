@@ -497,6 +497,22 @@ def _extrude_one_side(comp: adsk.fusion.Component,
 
 
 # ===========================================================================
+# Timeline grouping helper
+# ===========================================================================
+
+def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
+    """Group all timeline items from start_marker to the current marker into a named group."""
+    try:
+        timeline = design.timeline
+        end_marker = timeline.markerPosition - 1
+        if end_marker > start_marker:
+            group = timeline.timelineGroups.add(start_marker, end_marker)
+            group.name = group_name
+    except Exception:
+        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
+
+
+# ===========================================================================
 # Shaft creation
 # ===========================================================================
 
@@ -515,6 +531,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
     # Resolve face references and sketch plane
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
+    start_marker = design.timeline.markerPosition
     trans     = adsk.core.Matrix3D.create()
     workingOcc  = rootComp.occurrences.addNewComponent(trans)
     workingComp = workingOcc.component
@@ -625,6 +642,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
     except Exception:
         futil.log('PartsGen: failed to save shaft attributes')
 
+    _group_timeline_features(design, start_marker, workingComp.name)
+
 
 # ===========================================================================
 # Tube creation
@@ -651,6 +670,7 @@ def _create_tube(inputs: adsk.core.CommandInputs):
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
+    start_marker = design.timeline.markerPosition
     trans     = adsk.core.Matrix3D.create()
     workingOcc  = rootComp.occurrences.addNewComponent(trans)
     workingComp = workingOcc.component
@@ -795,6 +815,8 @@ def _create_tube(inputs: adsk.core.CommandInputs):
             comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
     except Exception:
         futil.log('PartsGen: failed to save tube attributes')
+
+    _group_timeline_features(design, start_marker, workingComp.name)
 
 
 # ===========================================================================
