@@ -6,7 +6,7 @@ from ... import config
 from .shaft_gen import _create_shaft
 from .tube_gen import _create_tube
 from .pulley_gen import _create_pulley
-from .belt_gen import _create_belt, handle_belt_selection_changed
+from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -98,12 +98,16 @@ ATTR_ADD_HOLES         = 'tube_add_holes'
 ATTR_HOLE_SIZE         = 'hole_size'
 ATTR_HOLE_DIAM         = 'hole_diam_expr'
 ATTR_LEN_EXPR          = 'custom_len_expr'
-ATTR_PULLEY_BELT_TYPE  = 'pulley_belt_type'
+ATTR_PULLEY_BELT_TYPE   = 'pulley_belt_type'
 ATTR_PULLEY_TOOTH_COUNT = 'pulley_tooth_count'
-ATTR_PULLEY_BELT_WIDTH = 'pulley_belt_width'
+ATTR_PULLEY_BELT_WIDTH  = 'pulley_belt_width'
+ATTR_PULLEY_SHOW_TEETH  = 'pulley_show_teeth'
 ATTR_BELT_TYPE         = 'belt_type'
 ATTR_BELT_WIDTH        = 'belt_width_expr'
 ATTR_BELT_SUPPRESS     = 'belt_suppress_teeth'
+ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
+ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
+ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
 
 
 # ===========================================================================
@@ -130,6 +134,8 @@ def start():
     futil.add_handler(ui.activeSelectionChanged, ui_selection_changed, local_handlers=ui_handlers)
     futil.add_handler(ui.markingMenuDisplaying,  ui_marking_menu,      local_handlers=ui_handlers)
 
+    register_belt_name_sync()
+
 
 def stop():
     submenu = config.get_solid_submenu()
@@ -144,6 +150,8 @@ def stop():
         command_definition.deleteMe()
     if edit_cmd_def:
         edit_cmd_def.deleteMe()
+
+    unregister_belt_name_sync()
 
     global ui_handlers
     ui_handlers = []
@@ -272,9 +280,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     beltWidthInp = inputs.addValueInput(
         'belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString('11')
+        adsk.core.ValueInput.createByString('0.394 in')
     )
     beltWidthInp.isVisible = False
+
+    pulleyShowTeethInp = inputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
+    pulleyShowTeethInp.isVisible = False
 
     # --- Timing Belt group ---------------------------------------------------
     tbCirclesInp = inputs.addSelectionInput(
@@ -300,6 +311,18 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', True)
     tbSuppressInp.isVisible = False
+
+    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', True)
+    tbGenPulleysInp.isVisible = False
+
+    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', False)
+    tbPulleyTeethInp.isVisible = False
+
+    tbPulleyWidthInp = inputs.addValueInput(
+        'tb_pulley_width', 'Pulley Width', 'mm',
+        adsk.core.ValueInput.createByString('0.394 in')
+    )
+    tbPulleyWidthInp.isVisible = False
 
     # Wire events
     futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
@@ -337,7 +360,11 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     tbCirclesInp:   adsk.core.SelectionCommandInput  = inputs.itemById('tb_pitch_circles')
     tbBeltTypeInp:  adsk.core.DropDownCommandInput   = inputs.itemById('tb_belt_type')
     tbBeltWidthInp: adsk.core.ValueCommandInput      = inputs.itemById('tb_belt_width')
-    tbSuppressInp:  adsk.core.BoolValueCommandInput  = inputs.itemById('tb_suppress_teeth')
+    tbSuppressInp:       adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
+    tbGenPulleysInp:     adsk.core.BoolValueCommandInput = inputs.itemById('tb_gen_pulleys')
+    tbPulleyTeethInp:    adsk.core.BoolValueCommandInput = inputs.itemById('tb_pulley_teeth')
+    tbPulleyWidthInp:    adsk.core.ValueCommandInput     = inputs.itemById('tb_pulley_width')
+    pulleyShowTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
 
     part_type        = partTypeInp.selectedItem.name
     part_is_shaft    = (part_type == PART_SHAFT)
@@ -368,6 +395,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     beltTypeInp.isVisible    = part_is_pulley
     toothCountInp.isVisible  = part_is_pulley
     beltWidthInp.isVisible   = part_is_pulley
+    if pulleyShowTeethInp is not None:
+        pulleyShowTeethInp.isVisible = part_is_pulley
 
     # Timing Belt inputs
     if tbCirclesInp is not None:
@@ -378,6 +407,12 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         tbBeltWidthInp.isVisible = part_is_belt
     if tbSuppressInp is not None:
         tbSuppressInp.isVisible = part_is_belt
+    if tbGenPulleysInp is not None:
+        tbGenPulleysInp.isVisible = part_is_belt
+    if tbPulleyTeethInp is not None:
+        tbPulleyTeethInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
+    if tbPulleyWidthInp is not None:
+        tbPulleyWidthInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
 
     # Length inputs — hidden when Pulley or Belt is selected
     lenTypeInp.isVisible   = not hide_length
@@ -415,14 +450,17 @@ def command_execute(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
-    if part_type == PART_SHAFT:
-        _create_shaft(inputs)
-    elif part_type == PART_TUBE:
-        _create_tube(inputs)
-    elif part_type == PART_PULLEY:
-        _create_pulley(inputs)
-    else:
-        _create_belt(inputs)
+    try:
+        if part_type == PART_SHAFT:
+            _create_shaft(inputs)
+        elif part_type == PART_TUBE:
+            _create_tube(inputs)
+        elif part_type == PART_PULLEY:
+            _create_pulley(inputs)
+        else:
+            _create_belt(inputs)
+    except Exception:
+        futil.handle_error('PartsGen command_execute', show_message_box=True)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
@@ -733,7 +771,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
         for key in (ATTR_PART_TYPE, ATTR_SHAFT_TYPE, ATTR_CUSTOM_OD, ATTR_CUSTOM_ID,
                     ATTR_TUBE_WIDTH, ATTR_TUBE_HEIGHT, ATTR_TUBE_THICK, ATTR_CUSTOM_THICK,
                     ATTR_ADD_HOLES, ATTR_HOLE_SIZE, ATTR_HOLE_DIAM, ATTR_LEN_EXPR,
-                    ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_TOOTH_COUNT, ATTR_PULLEY_BELT_WIDTH):
+                    ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_TOOTH_COUNT, ATTR_PULLEY_BELT_WIDTH,
+                    ATTR_PULLEY_SHOW_TEETH,
+                    ATTR_BELT_TYPE, ATTR_BELT_WIDTH, ATTR_BELT_SUPPRESS,
+                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_PULLEY_WIDTH):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -767,12 +808,16 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     h_expr          = _s(ATTR_TUBE_HEIGHT,        '1 in')
     thick_expr      = _s(ATTR_CUSTOM_THICK,       '0.1 in')
     hole_diam_expr  = _s(ATTR_HOLE_DIAM,          '0.25 in')
-    pulley_belt     = _s(ATTR_PULLEY_BELT_TYPE,   'HTD 5mm Pitch')
-    pulley_teeth    = _s(ATTR_PULLEY_TOOTH_COUNT, '18')
-    pulley_width    = _s(ATTR_PULLEY_BELT_WIDTH,  '11 mm')
-    belt_type_val   = _s(ATTR_BELT_TYPE,          'HTD 5mm Pitch')
-    belt_width_val  = _s(ATTR_BELT_WIDTH,         '9 mm')
-    belt_suppress   = _b(ATTR_BELT_SUPPRESS,       False)
+    pulley_belt       = _s(ATTR_PULLEY_BELT_TYPE,   'HTD 5mm Pitch')
+    pulley_teeth      = _s(ATTR_PULLEY_TOOTH_COUNT, '18')
+    pulley_width      = _s(ATTR_PULLEY_BELT_WIDTH,  '0.394 in')
+    pulley_show_teeth = _b(ATTR_PULLEY_SHOW_TEETH,  False)
+    belt_type_val     = _s(ATTR_BELT_TYPE,          'HTD 5mm Pitch')
+    belt_width_val    = _s(ATTR_BELT_WIDTH,         '9 mm')
+    belt_suppress     = _b(ATTR_BELT_SUPPRESS,       False)
+    belt_gen_pulleys  = _b(ATTR_BELT_GEN_PULLEYS,   True)
+    belt_pulley_teeth = _b(ATTR_BELT_PULLEY_TEETH,  False)
+    belt_pulley_width = _s(ATTR_BELT_PULLEY_WIDTH,  '0.394 in')
 
     # --- Part type ---
     partTypeInp = inputs.addDropDownCommandInput(
@@ -869,6 +914,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     beltWidthInp.isVisible = is_pulley
 
+    pulleyShowTeethInp = inputs.addBoolValueInput(
+        'pulley_show_teeth', 'Show Teeth', True, '', pulley_show_teeth)
+    pulleyShowTeethInp.isVisible = is_pulley
+
     # --- Timing Belt group — circles must be re-selected; other values pre-filled ---
     tbCirclesInp = inputs.addSelectionInput(
         'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
@@ -893,6 +942,18 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', belt_suppress)
     tbSuppressInp.isVisible = is_belt
+
+    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', belt_gen_pulleys)
+    tbGenPulleysInp.isVisible = is_belt
+
+    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', belt_pulley_teeth)
+    tbPulleyTeethInp.isVisible = is_belt and belt_gen_pulleys
+
+    tbPulleyWidthInp = inputs.addValueInput(
+        'tb_pulley_width', 'Pulley Width', 'mm',
+        adsk.core.ValueInput.createByString(belt_pulley_width)
+    )
+    tbPulleyWidthInp.isVisible = is_belt and belt_gen_pulleys
 
     # --- Length — always use Custom Length in edit mode; face refs are gone ---
     lenTypeInp = inputs.addDropDownCommandInput(

@@ -10,6 +10,10 @@ import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
 from ..CCDistance.CCLine import getCCLineFromEntity
+from .pulley_gen import (create_pulley_for_belt,
+                          ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_BELT_COMP_TOKEN,
+                          ATTR_PULLEY_PITCH_CIRCLE_IDX, ATTR_PULLEY_TOOTH_COUNT,
+                          ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH)
 
 app = adsk.core.Application.get()
 
@@ -18,9 +22,18 @@ app = adsk.core.Application.get()
 # ---------------------------------------------------------------------------
 ATTR_GROUP        = 'FRCTools_PartsGen'
 ATTR_PART_TYPE    = 'part_type'
-ATTR_BELT_TYPE    = 'belt_type'
-ATTR_BELT_WIDTH   = 'belt_width_expr'
-ATTR_BELT_SUPPRESS = 'belt_suppress_teeth'
+ATTR_BELT_TYPE       = 'belt_type'
+ATTR_BELT_WIDTH      = 'belt_width_expr'
+ATTR_BELT_SUPPRESS   = 'belt_suppress_teeth'
+ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
+ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
+ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+
+# ---------------------------------------------------------------------------
+# Belt-name-sync (commandTerminated hook)
+# ---------------------------------------------------------------------------
+_belt_sync_registered  = False
+_belt_sync_handlers: list = []  # keeps event handler alive (prevent GC)
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +50,235 @@ def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, grou
             group.name = group_name
     except Exception:
         futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
+
+
+# ---------------------------------------------------------------------------
+# Belt-name-sync — registration and update logic
+# ---------------------------------------------------------------------------
+
+def register_belt_name_sync():
+    """Hook into commandTerminated so belt names update after any design edit."""
+    global _belt_sync_registered
+    if _belt_sync_registered:
+        return
+    try:
+        ui = app.userInterface
+        futil.add_handler(ui.commandTerminated, _on_command_terminated,
+                          local_handlers=_belt_sync_handlers)
+        _belt_sync_registered = True
+    except Exception:
+        futil.handle_error('PartsGen register_belt_name_sync', show_message_box=False)
+
+
+def unregister_belt_name_sync():
+    """Release the commandTerminated handler (call from add-in stop())."""
+    global _belt_sync_registered
+    _belt_sync_handlers.clear()
+    _belt_sync_registered = False
+
+
+def _on_command_terminated(args: adsk.core.ApplicationCommandEventArgs):
+    """After any command, scan belt components and update names if needed."""
+    try:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        if design is None:
+            return
+        _scan_and_update_belt_names(design)
+    except Exception:
+        pass  # must never interrupt normal Fusion operation
+
+
+def _find_comp_by_token(design: adsk.fusion.Design, token: str):
+    """Find a component anywhere in the design tree by its entityToken."""
+    try:
+        root = design.rootComponent
+        visited: set = set()
+        queue = [root]
+        while queue:
+            comp = queue.pop()
+            et = comp.entityToken
+            if et in visited:
+                continue
+            visited.add(et)
+            if et == token:
+                return comp
+            for i in range(comp.occurrences.count):
+                queue.append(comp.occurrences.item(i).component)
+    except Exception:
+        pass
+    return None
+
+
+def _scan_and_update_belt_names(design: adsk.fusion.Design):
+    """Walk every component in the design and fix belt and pulley names."""
+    try:
+        root    = design.rootComponent
+        visited: set = set()
+        queue   = [root]
+        while queue:
+            comp = queue.pop()
+            token = comp.entityToken
+            if token in visited:
+                continue
+            visited.add(token)
+
+            belt_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_TYPE)
+            if belt_attr is not None:
+                _update_belt_name(comp, belt_attr.value)
+
+            pulley_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE)
+            if pulley_attr is not None:
+                _update_pulley_name(comp, pulley_attr.value, design)
+
+            for i in range(comp.occurrences.count):
+                queue.append(comp.occurrences.item(i).component)
+    except Exception:
+        pass
+
+
+def _get_pitch_circle(belt_comp: adsk.fusion.Component, circle_idx: int):
+    """Return the circle_idx-th construction circle from the belt's TimingBelt sketch."""
+    belt_sketch = belt_comp.sketches.itemByName('TimingBelt')
+    if belt_sketch is None:
+        return None
+    circles = [belt_sketch.sketchCurves.sketchCircles.item(i)
+               for i in range(belt_sketch.sketchCurves.sketchCircles.count)
+               if belt_sketch.sketchCurves.sketchCircles.item(i).isConstruction]
+    if circle_idx >= len(circles):
+        return None
+    return circles[circle_idx]
+
+
+def _find_occurrence_of(design: adsk.fusion.Design, comp_token: str):
+    """Return the first occurrence whose component has the given entityToken."""
+    root = design.rootComponent
+    for i in range(root.allOccurrences.count):
+        occ = root.allOccurrences.item(i)
+        if occ.component.entityToken == comp_token:
+            return occ
+    return None
+
+
+def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
+                    new_n_teeth: int, belt_pitch_mm: int,
+                    belt_comp_token: str, circle_idx: int):
+    """Delete the stale pulley occurrence and recreate it with the updated tooth count."""
+    try:
+        # Read attributes BEFORE deletion (comp becomes invalid after deleteMe)
+        attrs      = old_comp.attributes
+        width_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH)
+        teeth_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH)
+        width_mm   = int(width_attr.value.split()[0]) if width_attr else 9
+        show_teeth = teeth_attr is not None and teeth_attr.value.lower() == 'true'
+        old_token  = old_comp.entityToken
+
+        belt_comp = _find_comp_by_token(design, belt_comp_token)
+        if belt_comp is None:
+            return
+
+        proj_circle = _get_pitch_circle(belt_comp, circle_idx)
+        if proj_circle is None:
+            return
+
+        belt_occ   = _find_occurrence_of(design, belt_comp.entityToken)
+        pulley_occ = _find_occurrence_of(design, old_token)
+        if belt_occ is None or pulley_occ is None:
+            return
+
+        rebuild_start = design.timeline.markerPosition
+
+        pulley_occ.deleteMe()  # removes the component and any associated joints
+
+        create_pulley_for_belt(belt_pitch_mm, new_n_teeth, width_mm / 10.0,
+                               belt_occ, proj_circle, show_teeth, circle_idx,
+                               parent_comp=belt_comp)
+
+        # Wrap the delete + recreation into one named timeline group
+        prefix   = 'Pulley_HTD_5mm' if belt_pitch_mm == 5 else 'Pulley_GT2_3mm'
+        new_name = f'{prefix}-{new_n_teeth}Tx{width_mm}mm'
+        _group_timeline_features(design, rebuild_start, new_name)
+    except Exception:
+        futil.log('PartsGen: _rebuild_pulley failed')
+
+
+def _update_pulley_name(comp: adsk.fusion.Component, pulley_type_str: str,
+                         design: adsk.fusion.Design):
+    """Detect tooth-count change and rebuild the pulley geometry (and name) if needed."""
+    try:
+        belt_pitch_mm = 5 if '5mm' in pulley_type_str else 3
+
+        belt_token_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_BELT_COMP_TOKEN)
+        circle_idx_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_PITCH_CIRCLE_IDX)
+        if belt_token_attr is None or circle_idx_attr is None:
+            return  # standalone pulley — no belt link, skip auto-update
+
+        circle_idx = int(circle_idx_attr.value)
+        belt_comp  = _find_comp_by_token(design, belt_token_attr.value)
+        if belt_comp is None:
+            return
+
+        pitch_circle = _get_pitch_circle(belt_comp, circle_idx)
+        if pitch_circle is None:
+            return
+
+        new_n_teeth = int(2 * math.pi * pitch_circle.radius * 10 / belt_pitch_mm + 0.5)
+
+        stored_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT)
+        stored_n_teeth = int(stored_attr.value) if stored_attr else -1
+
+        if new_n_teeth != stored_n_teeth:
+            _rebuild_pulley(comp, design, new_n_teeth, belt_pitch_mm,
+                            belt_token_attr.value, circle_idx)
+    except Exception:
+        pass  # silently skip this component
+
+
+def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
+    """Recompute tooth count from pitch-circle geometry and rename the component."""
+    try:
+        belt_pitch_mm = 5 if '5mm' in belt_type_str else 3
+
+        sk = comp.sketches.itemByName('TimingBelt')
+        if sk is None:
+            return
+
+        # The only construction SketchCircles in the belt sketch are the two
+        # projected pitch circles.  Neither tooth-profile setup function adds
+        # construction circles, so this list always has exactly 2 items.
+        circles = [sk.sketchCurves.sketchCircles.item(i)
+                   for i in range(sk.sketchCurves.sketchCircles.count)
+                   if sk.sketchCurves.sketchCircles.item(i).isConstruction]
+        if len(circles) < 2:
+            return
+
+        r1, r2 = circles[0].radius, circles[1].radius
+        p1 = circles[0].centerSketchPoint.geometry
+        p2 = circles[1].centerSketchPoint.geometry
+        cc = math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2)
+
+        if cc < abs(r1 - r2) + 1e-6:
+            return  # degenerate — one circle inside the other
+
+        # Open-belt pitch-loop: 2 tangent lines + 2 wrap arcs
+        sin_a   = max(-1.0, min(1.0, (r1 - r2) / cc))
+        alpha   = math.asin(sin_a)
+        tangent = math.sqrt(cc ** 2 - (r1 - r2) ** 2)
+        loop_cm = 2 * tangent + r1 * (math.pi + 2 * alpha) + r2 * (math.pi - 2 * alpha)
+
+        tooth_count = int(loop_cm * 10 / belt_pitch_mm + 0.5)
+
+        # Extract belt width from the existing name (format: "Belt_XXX-NNNTxMMmm")
+        try:
+            width_mm = int(comp.name.split('Tx')[1].replace('mm', ''))
+        except Exception:
+            width_mm = 9  # fallback
+
+        prefix   = 'Belt_HTD_5mm' if belt_pitch_mm == 5 else 'Belt_GT2_3mm'
+        new_name = f'{prefix}-{tooth_count}Tx{width_mm}mm'
+        if comp.name != new_name:
+            comp.name = new_name
+    except Exception:
+        pass  # silently skip this component
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +337,9 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     beltTypeInp:        adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_type')
     beltWidthInp:       adsk.core.ValueCommandInput     = inputs.itemById('tb_belt_width')
     suppressTeethInp:   adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
+    genPulleysInp:      adsk.core.BoolValueCommandInput  = inputs.itemById('tb_gen_pulleys')
+    pulleyTeethInp:     adsk.core.BoolValueCommandInput  = inputs.itemById('tb_pulley_teeth')
+    pulleyWidthInp:     adsk.core.ValueCommandInput      = inputs.itemById('tb_pulley_width')
 
     if pitchLineSelection.selectionCount < 2:
         futil.popup_error('Parts Gen: please select two pitch circles for the Timing Belt.')
@@ -192,24 +437,53 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     angleDim.deleteMe()
     geoConstraints.addCollinear(baseLine, lineCurve)
 
-    if is_preview:
+    # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
+    if is_preview and not (suppressTeethInp and suppressTeethInp.value):
         extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
         return
 
-    extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
+    # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
+    if suppressTeethInp and suppressTeethInp.value:
+        extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
+    else:
+        extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
 
     # Save attributes so the right-click Edit command can restore the dialog
-    if not is_preview:
-        try:
-            attrs = workingComp.attributes
-            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
-            attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
-            attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
-            attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
-        except Exception:
-            futil.log('PartsGen: failed to save belt attributes')
+    try:
+        attrs = workingComp.attributes
+        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
+        attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
+        attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
+        attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
+        attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
+        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
+        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+    except Exception:
+        futil.log('PartsGen: failed to save belt attributes')
 
-        _group_timeline_features(design, start_marker, comp_name)
+    # Auto-generate matching pulleys for both pitch circles (optional).
+    gen_pulleys    = genPulleysInp  is not None and genPulleysInp.value
+    pulley_teeth   = pulleyTeethInp is not None and pulleyTeethInp.value
+    if gen_pulleys:
+        # proj_circles are the projected SketchCircles inside the belt sketch — they
+        # are live parametric references so the pulleys follow when C-C distance changes.
+        proj_circles = [circle1_proj, circle2_proj]
+        for i, circle in enumerate(userSelections[:2]):
+            try:
+                n_pulley_teeth = int(circle.radius * 20 * math.pi / beltPitchLength + 0.5)
+                futil.log(f'Belt: auto-pulley {i+1} — radius={circle.radius:.4f} cm, teeth={n_pulley_teeth}')
+                if n_pulley_teeth < 8:
+                    futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
+                    continue
+                pulley_width_cm = pulleyWidthInp.value if pulleyWidthInp is not None else beltWidthInp.value
+                create_pulley_for_belt(beltPitchLength, n_pulley_teeth, pulley_width_cm,
+                                       workingOcc, proj_circles[i], pulley_teeth,
+                                       circle_index=i, parent_comp=workingComp)
+            except Exception:
+                futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
+
+    # Group belt + all auto-generated pulleys into one timeline entry
+    _group_timeline_features(design, start_marker, comp_name)
 
 
 # ---------------------------------------------------------------------------

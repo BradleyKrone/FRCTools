@@ -71,7 +71,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     inputs.addBoolValueInput( "swap_cogs", "Swap Cogs", True )
 
-    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 1, 70 )
+    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 5, 70 )
     beltTeeth.isVisible = False
 
     # Create a value input field and set the default using 1 unit of the default length unit.
@@ -97,7 +97,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # Create a separator.
     inputs.addSeparatorCommandInput( "message_sep")
-    inputs.addTextBoxCommandInput( "status_msg", "", "Select", 1, True )
+    inputs.addTextBoxCommandInput( "status_msg", "", "Select", 2, True )
 
     # Connect to the events that are needed by this command.
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
@@ -201,7 +201,8 @@ def command_execute(args: adsk.core.CommandEventArgs):
     # Create bearing holes if enabled
     createBearingHoles(ccLine, startBearingGroup, startBearingSizeInp, endBearingGroup, endBearingSizeInp)
 
-    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}</div>'
+    ccDist = ccLine.data.ccDistIN + ccLine.data.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
     if not preview :
         CCLine.setCCLineAttributes( ccLine )

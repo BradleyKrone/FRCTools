@@ -23,11 +23,35 @@ BELT_GT2 = 'GT2 3mm Pitch'
 # ---------------------------------------------------------------------------
 # Attribute keys (written to the component so the edit command can restore)
 # ---------------------------------------------------------------------------
-ATTR_GROUP             = 'FRCTools_PartsGen'
-ATTR_PART_TYPE         = 'part_type'
-ATTR_PULLEY_BELT_TYPE  = 'pulley_belt_type'
-ATTR_PULLEY_TOOTH_COUNT = 'pulley_tooth_count'
-ATTR_PULLEY_BELT_WIDTH = 'pulley_belt_width'
+ATTR_GROUP              = 'FRCTools_PartsGen'
+ATTR_PART_TYPE          = 'part_type'
+ATTR_PULLEY_BELT_TYPE        = 'pulley_belt_type'
+ATTR_PULLEY_TOOTH_COUNT     = 'pulley_tooth_count'
+ATTR_PULLEY_BELT_WIDTH      = 'pulley_belt_width'
+ATTR_PULLEY_SHOW_TEETH      = 'pulley_show_teeth'
+ATTR_PULLEY_BELT_COMP_TOKEN  = 'pulley_belt_comp_token'
+ATTR_PULLEY_PITCH_CIRCLE_IDX = 'pulley_pitch_circle_index'
+
+# ---------------------------------------------------------------------------
+# Flange dimensions (Fusion 360 uses centimetres internally)
+# ---------------------------------------------------------------------------
+FLANGE_OD_OFFSET_CM  = 0.196 * 2.54   # flange OD = tooth OD + 0.196 in
+FLANGE_THICKNESS_CM  = 0.053 * 2.54   # 0.053 in  →  0.13462 cm
+HEX_BORE_FLATS_CM    = 0.5   * 2.54   # 0.5 in across flats →  1.27 cm
+LABEL_TEXT_HEIGHT_CM = 0.15 * 2.54    # 0.15 in font height for engraved label
+LABEL_ENGRAVE_CM     = 0.02 * 2.54    # 0.02 in engraving depth
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _outer_diameter_cm(belt_pitch_mm: int, n_teeth: int) -> float:
+    """Return the tooth outer diameter in cm without creating any sketch geometry."""
+    if belt_pitch_mm == 5:  # HTD 5mm
+        return (n_teeth * 5.0 / math.pi - 1.74) / 10
+    else:  # GT2 3mm
+        return (n_teeth * 3.0 / math.pi - 2 * 0.381) / 10
 
 
 # ---------------------------------------------------------------------------
@@ -47,15 +71,171 @@ def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, grou
 
 
 # ---------------------------------------------------------------------------
+# Flange helper — adds a disk flange on each side of the pulley body
+# ---------------------------------------------------------------------------
+
+def _add_flanges(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm: float):
+    """Extrude a flange disk on each side of the pulley body.
+
+    Flange OD = tooth_od_cm + FLANGE_OD_OFFSET_CM (0.196 in larger than tooth OD).
+    Bottom flange: from Z=0 downward by FLANGE_THICKNESS_CM.
+    Top flange:    from Z=belt_width_cm upward by FLANGE_THICKNESS_CM.
+    Both are joined to the existing pulley body.
+    """
+    extrudes      = comp.features.extrudeFeatures
+    flange_radius = (tooth_od_cm + FLANGE_OD_OFFSET_CM) / 2
+
+    # --- Bottom flange (extruded in -Z from component XY plane) ---
+    sk_bot = comp.sketches.add(comp.xYConstructionPlane)
+    sk_bot.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(0, 0, 0), flange_radius)
+    extrudes.addSimple(
+        sk_bot.profiles.item(0),
+        adsk.core.ValueInput.createByReal(-FLANGE_THICKNESS_CM),
+        adsk.fusion.FeatureOperations.JoinFeatureOperation,
+    )
+
+    # --- Top flange — offset construction plane at Z = belt_width_cm ---
+    planes      = comp.constructionPlanes
+    plane_input = planes.createInput()
+    plane_input.setByOffset(
+        comp.xYConstructionPlane,
+        adsk.core.ValueInput.createByReal(belt_width_cm)
+    )
+    top_plane = planes.add(plane_input)
+
+    sk_top = comp.sketches.add(top_plane)
+    sk_top.sketchCurves.sketchCircles.addByCenterRadius(
+        adsk.core.Point3D.create(0, 0, 0), flange_radius)
+    extrudes.addSimple(
+        sk_top.profiles.item(0),
+        adsk.core.ValueInput.createByReal(FLANGE_THICKNESS_CM),
+        adsk.fusion.FeatureOperations.JoinFeatureOperation,
+    )
+
+
+def _add_hex_bore(comp: adsk.fusion.Component, belt_width_cm: float):
+    """Cut a 0.5 in hex bore through the entire pulley (flanges + belt body)."""
+    # Circumscribed radius (center to corner) from across-flats dimension
+    circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
+
+    # Sketch on a plane at the bottom of the lower flange
+    planes      = comp.constructionPlanes
+    plane_input = planes.createInput()
+    plane_input.setByOffset(
+        comp.xYConstructionPlane,
+        adsk.core.ValueInput.createByReal(-FLANGE_THICKNESS_CM)
+    )
+    bot_plane = planes.add(plane_input)
+
+    sk    = comp.sketches.add(bot_plane)
+    lines = sk.sketchCurves.sketchLines
+    # Flat-top orientation: corners at 30°, 90°, 150°, 210°, 270°, 330°
+    pts = [
+        adsk.core.Point3D.create(
+            circumradius * math.cos(math.radians(30 + i * 60)),
+            circumradius * math.sin(math.radians(30 + i * 60)),
+            0,
+        )
+        for i in range(6)
+    ]
+    for i in range(6):
+        lines.addByTwoPoints(pts[i], pts[(i + 1) % 6])
+
+    # Cut through bottom flange + belt body + top flange
+    total_cm = 2 * FLANGE_THICKNESS_CM + belt_width_cm
+    comp.features.extrudeFeatures.addSimple(
+        sk.profiles.item(0),
+        adsk.core.ValueInput.createByReal(total_cm),
+        adsk.fusion.FeatureOperations.CutFeatureOperation,
+    )
+
+
+def _add_label(comp: adsk.fusion.Component, belt_width_cm: float, n_teeth: int):
+    """Engrave tooth count on the top flange face (e.g. \"18T\")."""
+    try:
+        label = f'{n_teeth}T'
+
+        # Construct plane on top face of upper flange
+        planes      = comp.constructionPlanes
+        plane_input = planes.createInput()
+        plane_input.setByOffset(
+            comp.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(belt_width_cm + FLANGE_THICKNESS_CM)
+        )
+        top_plane = planes.add(plane_input)
+        sk        = comp.sketches.add(top_plane)
+
+        # Place text just above the topmost corner of the hex bore
+        hex_circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
+        y_bot   = hex_circumradius + 0.02
+        y_top   = y_bot + LABEL_TEXT_HEIGHT_CM * 1.2
+        corner1 = adsk.core.Point3D.create(-1.5, y_bot, 0)
+        corner2 = adsk.core.Point3D.create( 1.5, y_top, 0)
+
+        text_input = sk.sketchTexts.createInput2(label, LABEL_TEXT_HEIGHT_CM)
+        text_input.setAsMultiLine(
+            corner1, corner2,
+            adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
+            adsk.core.VerticalAlignments.MiddleVerticalAlignment,
+            0
+        )
+        sk.sketchTexts.add(text_input).explode()  # convert to regular curves → profiles appear in sketch.profiles
+
+        n_profiles = sk.profiles.count
+        if n_profiles == 0:
+            futil.popup_error(
+                f'PartsGen label: sketch text "{label}" generated 0 profiles — '
+                f'cannot engrave. (text height = {LABEL_TEXT_HEIGHT_CM:.3f} cm)'
+            )
+            return
+
+        # Engrave each character profile individually so that profiles which fall
+        # outside the body boundary are skipped rather than aborting the whole cut.
+        extrudes = comp.features.extrudeFeatures
+        engraved = 0
+        for i in range(n_profiles):
+            try:
+                ext_in = extrudes.createInput(
+                    sk.profiles.item(i),
+                    adsk.fusion.FeatureOperations.CutFeatureOperation
+                )
+                ext_in.setOneSideExtent(
+                    adsk.fusion.DistanceExtentDefinition.create(
+                        adsk.core.ValueInput.createByReal(LABEL_ENGRAVE_CM)
+                    ),
+                    adsk.fusion.ExtentDirections.NegativeExtentDirection
+                )
+                extrudes.add(ext_in)
+                engraved += 1
+            except Exception:
+                pass  # profile does not intersect any body — skip it
+
+        if engraved == 0:
+            futil.popup_error(
+                f'PartsGen label: {n_profiles} profile(s) found but none could be '
+                f'engraved. The profiles may be outside the body or the extrusion '
+                f'direction is wrong. (belt_width={belt_width_cm:.3f} cm, '
+                f'flange_top={belt_width_cm + FLANGE_THICKNESS_CM:.3f} cm)'
+            )
+
+    except Exception:
+        futil.handle_error('PartsGen _add_label', show_message_box=True)
+
+
+# ---------------------------------------------------------------------------
 # Public creation entry point — called by PartsGen/entry.py
 # ---------------------------------------------------------------------------
 
 def _create_pulley(inputs: adsk.core.CommandInputs):
     """Create a timing pulley component from the PartsGen dialog inputs."""
 
-    beltType:   adsk.core.DropDownCommandInput = inputs.itemById('belt_type')
-    toothCount: adsk.core.ValueCommandInput    = inputs.itemById('tooth_count')
-    beltWidth:  adsk.core.ValueCommandInput    = inputs.itemById('belt_width')
+    beltType:      adsk.core.DropDownCommandInput  = inputs.itemById('belt_type')
+    toothCount:    adsk.core.ValueCommandInput     = inputs.itemById('tooth_count')
+    beltWidth:     adsk.core.ValueCommandInput     = inputs.itemById('belt_width')
+    showTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
+
+    show_teeth = showTeethInp.value if showTeethInp is not None else False
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
@@ -78,37 +258,166 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
 
     workingComp.name = comp_name
 
-    # Sketch on the root XY construction plane
-    sketchPlane = rootComp.xYConstructionPlane
-    sketch = workingComp.sketches.add(sketchPlane, workingOcc)
-    geometry_fn(sketch, belt_pitch, n_teeth)
-
-    # Extrude the single closed profile to form the pulley body
-    if sketch.profiles.count != 1:
-        futil.popup_error(
-            f'Parts Gen: Timing Pulley sketch has {sketch.profiles.count} profiles '
-            f'(expected 1).  The tooth geometry may not have closed correctly.'
-        )
-        workingOcc.deleteMe()
-        return
-
     extrudes   = workingComp.features.extrudeFeatures
     widthValue = adsk.core.ValueInput.createByReal(beltWidth.value)
-    extrudes.addSimple(
-        sketch.profiles.item(0),
-        widthValue,
-        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-    )
+
+    if show_teeth:
+        # Full toothed profile
+        sketchPlane = rootComp.xYConstructionPlane
+        sketch = workingComp.sketches.add(sketchPlane, workingOcc)
+        outer_diameter_cm = geometry_fn(sketch, belt_pitch, n_teeth)
+
+        if sketch.profiles.count != 1:
+            futil.popup_error(
+                f'Parts Gen: Timing Pulley sketch has {sketch.profiles.count} profiles '
+                f'(expected 1).  The tooth geometry may not have closed correctly.'
+            )
+            workingOcc.deleteMe()
+            return
+
+        extrudes.addSimple(
+            sketch.profiles.item(0),
+            widthValue,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+        )
+    else:
+        # Smooth cylinder — diameter equals the tooth outer diameter
+        outer_diameter_cm = _outer_diameter_cm(belt_pitch, n_teeth)
+        sk_cyl = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
+        sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
+            adsk.core.Point3D.create(0, 0, 0), outer_diameter_cm / 2
+        )
+        extrudes.addSimple(
+            sk_cyl.profiles.item(0),
+            widthValue,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+        )
+
+    _add_flanges(workingComp, beltWidth.value, outer_diameter_cm)
+    _add_hex_bore(workingComp, beltWidth.value)
+    _add_label(workingComp, beltWidth.value, n_teeth)
 
     # Save attributes so the right-click Edit command can restore the dialog
     try:
         attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,          'Timing Pulley')
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE,   beltType.selectedItem.name)
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT, str(n_teeth))
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,  beltWidth.expression)
+        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,           'Timing Pulley')
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE,    beltType.selectedItem.name)
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT,  str(n_teeth))
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,   beltWidth.expression)
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH,   str(show_teeth))
     except Exception:
         futil.log('PartsGen: failed to save pulley attributes')
+
+    _group_timeline_features(design, start_marker, comp_name)
+
+
+def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: float,
+                           belt_occ: adsk.fusion.Occurrence = None,
+                           proj_circle: adsk.fusion.SketchCircle = None,
+                           show_teeth: bool = False,
+                           circle_index: int = 0,
+                           parent_comp: adsk.fusion.Component = None):
+    """Create a timing pulley component from raw parameters.
+
+    Called by belt_gen._create_belt() to auto-generate matched pulleys when
+    a belt is created.  Uses the same geometry functions as _create_pulley()
+    but accepts numeric values instead of CommandInputs.
+
+    A parametric revolute Joint is created between the pulley and belt_occ
+    using proj_circle.centerSketchPoint as the live anchor, so the pulley
+    automatically repositions when the belt's C-C distance is edited.
+    """
+    design    = adsk.fusion.Design.cast(app.activeProduct)
+    rootComp  = design.rootComponent
+    parent    = parent_comp if parent_comp is not None else rootComp
+    start_marker = design.timeline.markerPosition
+
+    # Identity transform — the parametric Joint below positions the occurrence.
+    trans       = adsk.core.Matrix3D.create()
+    workingOcc  = parent.occurrences.addNewComponent(trans)
+    workingComp = workingOcc.component
+
+    width_mm = int(belt_width_cm * 10)   # cm → mm, then truncate
+
+    if belt_pitch_mm == 5:
+        comp_name      = f'Pulley_HTD_5mm-{n_teeth}Tx{width_mm}mm'
+        belt_type_name = BELT_HTD
+        geometry_fn    = createHTDPulleyGeometry
+    else:
+        comp_name      = f'Pulley_GT2_3mm-{n_teeth}Tx{width_mm}mm'
+        belt_type_name = BELT_GT2
+        geometry_fn    = createGT2PulleyGeometry
+
+    workingComp.name = comp_name
+
+    # Local XY plane — sketch geometry travels with the occurrence when the joint moves it.
+    extrudes   = workingComp.features.extrudeFeatures
+    widthValue = adsk.core.ValueInput.createByReal(belt_width_cm)
+
+    if show_teeth:
+        sketch = workingComp.sketches.add(workingComp.xYConstructionPlane)
+        outer_diameter_cm = geometry_fn(sketch, belt_pitch_mm, n_teeth)
+        if sketch.profiles.count != 1:
+            futil.popup_error(
+                f'PartsGen: auto-pulley sketch has {sketch.profiles.count} profiles '
+                f'(expected 1, n_teeth={n_teeth}, pitch={belt_pitch_mm}mm) — aborting.'
+            )
+            workingOcc.deleteMe()
+            return
+        extrudes.addSimple(sketch.profiles.item(0), widthValue,
+                           adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        joint_circle = sketch.sketchCurves.sketchCircles.item(0)
+    else:
+        outer_diameter_cm = _outer_diameter_cm(belt_pitch_mm, n_teeth)
+        sk_cyl = workingComp.sketches.add(workingComp.xYConstructionPlane)
+        sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
+            adsk.core.Point3D.create(0, 0, 0), outer_diameter_cm / 2)
+        extrudes.addSimple(sk_cyl.profiles.item(0), widthValue,
+                           adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+        joint_circle = sk_cyl.sketchCurves.sketchCircles.item(0)
+
+    _add_flanges(workingComp, belt_width_cm, outer_diameter_cm)
+    _add_hex_bore(workingComp, belt_width_cm)
+    _add_label(workingComp, belt_width_cm, n_teeth)
+
+    try:
+        attrs = workingComp.attributes
+        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,           'Timing Pulley')
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE,    belt_type_name)
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT,  str(n_teeth))
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,   f'{width_mm} mm')
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH,   str(show_teeth))
+        if belt_occ is not None:
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_COMP_TOKEN,  belt_occ.component.entityToken)
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_PITCH_CIRCLE_IDX, str(circle_index))
+    except Exception:
+        futil.log('PartsGen: failed to save auto-pulley attributes')
+
+    # Parametric revolute Joint: pulley centre <-> projected pitch-circle centre in
+    # the belt sketch.  When CCDistance edits the belt the projected point moves,
+    # Fusion re-solves the joint, and the pulley repositions automatically.
+    if proj_circle is not None and belt_occ is not None:
+        try:
+            pulley_ctx = adsk.core.ObjectCollection.create()
+            pulley_ctx.add(workingOcc)
+            belt_ctx = adsk.core.ObjectCollection.create()
+            belt_ctx.add(belt_occ)
+            # createByCurve + CenterJointKeyPoint is the reliable way to anchor
+            # a joint at the centre of a sketch circle.
+            outer_circle = joint_circle
+            pulley_geom = adsk.fusion.JointGeometry.createByCurve(
+                outer_circle,
+                adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+            belt_geom   = adsk.fusion.JointGeometry.createByCurve(
+                proj_circle,
+                adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+            joint_input = parent.joints.createInput(pulley_geom, belt_geom)
+            joint_input.setAsRevoluteJointMotion(
+                adsk.fusion.JointDirections.ZAxisJointDirection)
+            joint = parent.joints.add(joint_input)
+            joint.name = f'{comp_name}_revolute'
+        except Exception:
+            futil.handle_error(f'PartsGen: joint for {comp_name}', show_message_box=True)
 
     _group_timeline_features(design, start_marker, comp_name)
 
@@ -227,6 +536,7 @@ def createHTDPulleyGeometry(sketch: adsk.fusion.Sketch, beltPitchMM: float, toot
     circularPattern = geoConstraints.createCircularPatternInput(toothEntities, outerCircle.centerSketchPoint)
     circularPattern.quantity = adsk.core.ValueInput.createByReal(toothCount)
     geoConstraints.addCircularPattern(circularPattern)
+    return outer_diameter / 10  # cm
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +664,4 @@ def createGT2PulleyGeometry(sketch: adsk.fusion.Sketch, beltPitchMM: float, toot
     circularPattern = geoConstraints.createCircularPatternInput(toothEntities, outerCircle.centerSketchPoint)
     circularPattern.quantity = adsk.core.ValueInput.createByReal(toothCount)
     geoConstraints.addCircularPattern(circularPattern)
+    return outer_diameter / 10  # cm

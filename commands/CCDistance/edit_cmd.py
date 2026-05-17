@@ -80,7 +80,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     swap_cogs = inputs.addBoolValueInput( "swap_cogs", "Swap Cogs", True )
 
-    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 1, 70 )
+    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 30, 300, 5, 70 )
     beltTeeth.isVisible = False
 
     # Create a value input field and set the default using 1 unit of the default length unit.
@@ -91,7 +91,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # Create a separator.
     inputs.addSeparatorCommandInput( "message_sep")
-    status = inputs.addTextBoxCommandInput( "status_msg", "", "status", 1, True )
+    status = inputs.addTextBoxCommandInput( "status_msg", "", "status", 2, True )
 
     status.formattedText = '<div align="center">Select a C-C Distance object.</div>'
     disable_edit_inputs( inputs )
@@ -292,11 +292,12 @@ def initialize_input_state( inputs: adsk.core.CommandInputs, lineData: CCLine.CC
     extraCenter.value = lineData.ExtraCenterIN * 2.54
     motionType.listItems.item( lineData.motion ).isSelected = True
 
-    msg = f'<div align="center">{ccutil.createLabelString( lineData )}</div>'
+    ccutil.calcCCLineData( lineData )
+    ccDist = lineData.ccDistIN + lineData.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( lineData )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
 
 
-# This event handler is called when the user clicks the OK button in the command dialog or 
 # is immediately called after the created event not command inputs were created for the dialog.
 def edit_command_execute(args: adsk.core.CommandEventArgs):
 
@@ -369,7 +370,8 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         #     return
         ccutil.modifyCCLine( ccLine )
 
-    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}</div>'
+    ccDist = ccLine.data.ccDistIN + ccLine.data.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
     if not preview :
         CCLine.setCCLineAttributes( ccLine )
