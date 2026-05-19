@@ -172,9 +172,11 @@ def edit_command_input_changed(args: adsk.core.InputChangedEventArgs):
         elif motionType.selectedItem.index == 3:
             # Chain type is selected
             extraCenter.value = 0
+            cog1Teeth.value = 16
             cog1Teeth.isVisible = True
             cog1Group.isVisible = False
             cog1Group.isEnabledCheckBoxChecked = False
+            cog2Teeth.value = 16
             cog2Teeth.isVisible = True
             cog2Group.isVisible = False
             cog2Group.isEnabledCheckBoxChecked = False
