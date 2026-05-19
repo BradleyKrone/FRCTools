@@ -18,12 +18,20 @@ def calcCCLineData( ld: CCLineData ):
         ld.PD2 = GearsPitchDiameterIN( ld.N2, 20 )
         ld.OD1 = GearsOuterDiameterIN( ld.N1, 20 )
         ld.OD2 = GearsOuterDiameterIN( ld.N2, 20 )
+    elif ld.motion == 3:
+        # #25 Chain (pitch = 0.25 in)
+        CHAIN_25_PITCH_IN = 0.25
+        ld.ccDistIN = ChainCCDistanceIN( ld.N1, ld.N2, ld.Teeth, CHAIN_25_PITCH_IN )
+        ld.PD1 = ChainPitchDiameterIN( ld.N1, CHAIN_25_PITCH_IN )
+        ld.PD2 = ChainPitchDiameterIN( ld.N2, CHAIN_25_PITCH_IN )
+        ld.OD1 = ChainOuterDiameterIN( ld.N1, CHAIN_25_PITCH_IN )
+        ld.OD2 = ChainOuterDiameterIN( ld.N2, CHAIN_25_PITCH_IN )
     else :
         if ld.motion == 1:
             # HTD 5mm Belt
             beltPitchMM = 5
         else :
-            # HTD 3mm Belt
+            # GT2 3mm Belt
             beltPitchMM = 3
         ld.ccDistIN = BeltCCDistanceIN( ld.N1, ld.N2, ld.Teeth, beltPitchMM )
         ld.PD1 = BeltPitchDiameterIN( ld.N1, beltPitchMM )
@@ -67,6 +75,19 @@ def BeltPitchDiameterIN( NT: int, pitchMM: int ) -> float:
 def BeltOuterDiameterIN( NT: int, pitchMM: int ) -> float:
         # Approximation of the OD of the flanges on the pulleys
     return BeltPitchDiameterIN(NT, pitchMM) + 0.15
+
+def ChainCCDistanceIN( N1: int, N2: int, numLinks: int, pitchIN: float ) -> float:
+    A = numLinks - (N1 + N2) / 2.0
+    discriminant = A * A - 2 * (N2 - N1) ** 2 / (math.pi ** 2)
+    if discriminant < 0:
+        return 0.0
+    return pitchIN / 4.0 * (A + math.sqrt(discriminant))
+
+def ChainPitchDiameterIN( NT: int, pitchIN: float ) -> float:
+    return pitchIN / math.sin(math.pi / NT)
+
+def ChainOuterDiameterIN( NT: int, pitchIN: float ) -> float:
+    return ChainPitchDiameterIN(NT, pitchIN) + pitchIN
 
 def createCCLine( 
     startpt: adsk.fusion.SketchPoint, 
@@ -171,12 +192,14 @@ def createLabelString( ld: CCLineData ) -> str:
                 lineLabel = f'Gear 20DP {p1}T({n1}T-CD)+{n2}T'
         else:
             lineLabel = f'Gear 20DP {n1}T+{n2}T'
+    elif ld.motion == 3:
+        lineLabel = f'{ld.Teeth}L #25 Chain ({n1}Tx{n2}T)'
     else :
         if ld.motion == 1:
     #         # HTD 5mm Belt
             lineLabel = f'{ld.Teeth}T HTD 5mm ({n1}Tx{n2}T)'
         else :
-    #         # HTD 3mm Belt
+    #         # GT2 3mm Belt
             lineLabel = f'{ld.Teeth}T GT2 3mm ({n1}Tx{n2}T)'
     
     if abs(ld.ExtraCenterIN) > 0.0005 :
