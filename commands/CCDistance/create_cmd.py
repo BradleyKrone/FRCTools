@@ -74,6 +74,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 1, 70 )
     beltTeeth.isVisible = False
 
+    chainLinks = inputs.addIntegerSpinnerCommandInput( "chain_links", "Chain Links", 20, 400, 2, 60 )
+    chainLinks.isVisible = False
+
     # Create a value input field and set the default using 1 unit of the default length unit.
     defaultLengthUnits = "in"
     default_value = adsk.core.ValueInput.createByString('0.003')
@@ -112,6 +115,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     swapCogs = inputs.itemById( "swap_cogs" ).value
     beltTeethInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinksInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenterInp: adsk.core.ValueInput = inputs.itemById('extra_center')
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
 
@@ -137,7 +141,10 @@ def command_execute(args: adsk.core.CommandEventArgs):
         ccLine = CCLine.getCCLineFromEntity( ccLine.line )
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
-    ccLine.data.Teeth = int(beltTeethInp.value)
+    if motionType.selectedItem.index == 3:
+        ccLine.data.Teeth = int(chainLinksInp.value)
+    else:
+        ccLine.data.Teeth = int(beltTeethInp.value)
     ccLine.data.N1 = int(cog1TeethInp.value)
     if cog1Group.isEnabledCheckBoxChecked :
         ccLine.data.PIN1 = pinionTeeth[ cog1Pinion.selectedItem.index ]
@@ -213,6 +220,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     cog2Group: adsk.core.GroupCommandInput = inputs.itemById('use_pinion_cog2')
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     beltTeeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenter: adsk.core.ValueInput = inputs.itemById('extra_center')
     requireSelectionInp = inputs.itemById( "require_selection" )
 
@@ -223,8 +231,22 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             cog1Group.isVisible = True
             cog2Group.isVisible = True
             beltTeeth.isVisible = False
+            chainLinks.isVisible = False
+        elif motionType.selectedItem.index == 3:
+            # Chain type is selected
+            extraCenter.value = 0
+            cog1Teeth.isVisible = True
+            cog1Group.isVisible = False
+            cog1Group.isEnabledCheckBoxChecked = False
+            cog2Teeth.isVisible = True
+            cog2Group.isVisible = False
+            cog2Group.isEnabledCheckBoxChecked = False
+            beltTeeth.isVisible = False
+            if chainLinks.value == 0:
+                chainLinks.value = 60
+            chainLinks.isVisible = True
         else:
-            # Non-gear type is selected
+            # Belt type is selected
             extraCenter.value = 0
             cog1Teeth.isVisible = True
             cog1Group.isVisible = False
@@ -235,6 +257,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             if beltTeeth.value == 0 :
                 beltTeeth.value = 70
             beltTeeth.isVisible = True
+            chainLinks.isVisible = False
 
 
     if changed_input.id == 'require_selection':
@@ -296,12 +319,19 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         ld.motion = motionType.selectedItem.index
         ld.N1 = cog1Teeth.value
         ld.N2 = cog2Teeth.value
-        ld.Teeth = beltTeeth.value
+        if motionType.selectedItem.index == 3:
+            chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
+            ld.Teeth = chainLinks.value
+        else:
+            ld.Teeth = beltTeeth.value
         ccutil.calcCCLineData( ld )
 
         if ld.ccDistIN < (ld.OD1 + ld.OD2) / 2.0 :
-            # belt is too short
-            status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
+            # belt/chain is too short
+            if motionType.selectedItem.index == 3:
+                status.formattedText = '<div align="center"><font color="red">Chain is too short!</font></div>'
+            else:
+                status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
             args.areInputsValid = False
             return
 
