@@ -151,74 +151,106 @@ def _add_hex_bore(comp: adsk.fusion.Component, belt_width_cm: float):
     )
 
 
-def _add_label(comp: adsk.fusion.Component, belt_width_cm: float, n_teeth: int):
-    """Engrave tooth count on the top flange face (e.g. \"18T\")."""
-    try:
-        label = f'{n_teeth}T'
+def _engrave_label_face(comp: adsk.fusion.Component, label: str,
+                        z_offset_cm: float, cut_direction, mirror: bool):
+    """Engrave *label* on one flange face.
 
-        # Construct plane on top face of upper flange
-        planes      = comp.constructionPlanes
-        plane_input = planes.createInput()
-        plane_input.setByOffset(
-            comp.xYConstructionPlane,
-            adsk.core.ValueInput.createByReal(belt_width_cm + FLANGE_THICKNESS_CM)
-        )
-        top_plane = planes.add(plane_input)
-        sk        = comp.sketches.add(top_plane)
+    Args:
+        z_offset_cm:   Z position of the sketch plane (in component local space).
+        cut_direction: ExtentDirections constant — Negative cuts into the body
+                       from the top face; Positive cuts in from the bottom face.
+        mirror:        When True the text corners are swapped in X so the label
+                       reads correctly when viewed from the outside of the bottom
+                       flange (i.e. from the -Z direction).
+    """
+    planes      = comp.constructionPlanes
+    plane_input = planes.createInput()
+    plane_input.setByOffset(
+        comp.xYConstructionPlane,
+        adsk.core.ValueInput.createByReal(z_offset_cm)
+    )
+    plane = planes.add(plane_input)
+    sk    = comp.sketches.add(plane)
 
-        # Place text just above the topmost corner of the hex bore
-        hex_circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
-        y_bot   = hex_circumradius + 0.02
-        y_top   = y_bot + LABEL_TEXT_HEIGHT_CM * 1.2
+    hex_circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
+    y_bot = hex_circumradius + 0.02
+    y_top = y_bot + LABEL_TEXT_HEIGHT_CM * 1.2
+
+    # Mirroring the X corners causes the text to appear reversed in the sketch,
+    # which reads correctly when the face is viewed from the outside (-Z side).
+    if mirror:
+        corner1 = adsk.core.Point3D.create( 1.5, y_bot, 0)
+        corner2 = adsk.core.Point3D.create(-1.5, y_top, 0)
+    else:
         corner1 = adsk.core.Point3D.create(-1.5, y_bot, 0)
         corner2 = adsk.core.Point3D.create( 1.5, y_top, 0)
 
-        text_input = sk.sketchTexts.createInput2(label, LABEL_TEXT_HEIGHT_CM)
-        text_input.setAsMultiLine(
-            corner1, corner2,
-            adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
-            adsk.core.VerticalAlignments.MiddleVerticalAlignment,
-            0
+    text_input = sk.sketchTexts.createInput2(label, LABEL_TEXT_HEIGHT_CM)
+    text_input.setAsMultiLine(
+        corner1, corner2,
+        adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
+        adsk.core.VerticalAlignments.MiddleVerticalAlignment,
+        0
+    )
+    sk.sketchTexts.add(text_input).explode()
+
+    n_profiles = sk.profiles.count
+    if n_profiles == 0:
+        futil.popup_error(
+            f'PartsGen label: sketch text "{label}" generated 0 profiles — '
+            f'cannot engrave. (text height = {LABEL_TEXT_HEIGHT_CM:.3f} cm)'
         )
-        sk.sketchTexts.add(text_input).explode()  # convert to regular curves → profiles appear in sketch.profiles
+        return
 
-        n_profiles = sk.profiles.count
-        if n_profiles == 0:
-            futil.popup_error(
-                f'PartsGen label: sketch text "{label}" generated 0 profiles — '
-                f'cannot engrave. (text height = {LABEL_TEXT_HEIGHT_CM:.3f} cm)'
+    # Engrave each character profile individually so that profiles which fall
+    # outside the body boundary are skipped rather than aborting the whole cut.
+    extrudes = comp.features.extrudeFeatures
+    engraved = 0
+    for i in range(n_profiles):
+        try:
+            ext_in = extrudes.createInput(
+                sk.profiles.item(i),
+                adsk.fusion.FeatureOperations.CutFeatureOperation
             )
-            return
-
-        # Engrave each character profile individually so that profiles which fall
-        # outside the body boundary are skipped rather than aborting the whole cut.
-        extrudes = comp.features.extrudeFeatures
-        engraved = 0
-        for i in range(n_profiles):
-            try:
-                ext_in = extrudes.createInput(
-                    sk.profiles.item(i),
-                    adsk.fusion.FeatureOperations.CutFeatureOperation
-                )
-                ext_in.setOneSideExtent(
-                    adsk.fusion.DistanceExtentDefinition.create(
-                        adsk.core.ValueInput.createByReal(LABEL_ENGRAVE_CM)
-                    ),
-                    adsk.fusion.ExtentDirections.NegativeExtentDirection
-                )
-                extrudes.add(ext_in)
-                engraved += 1
-            except Exception:
-                pass  # profile does not intersect any body — skip it
-
-        if engraved == 0:
-            futil.popup_error(
-                f'PartsGen label: {n_profiles} profile(s) found but none could be '
-                f'engraved. The profiles may be outside the body or the extrusion '
-                f'direction is wrong. (belt_width={belt_width_cm:.3f} cm, '
-                f'flange_top={belt_width_cm + FLANGE_THICKNESS_CM:.3f} cm)'
+            ext_in.setOneSideExtent(
+                adsk.fusion.DistanceExtentDefinition.create(
+                    adsk.core.ValueInput.createByReal(LABEL_ENGRAVE_CM)
+                ),
+                cut_direction
             )
+            extrudes.add(ext_in)
+            engraved += 1
+        except Exception:
+            pass  # profile does not intersect any body — skip it
 
+    if engraved == 0:
+        futil.popup_error(
+            f'PartsGen label: {n_profiles} profile(s) found but none could be '
+            f'engraved on the {"bottom" if mirror else "top"} face. '
+            f'(z_offset={z_offset_cm:.3f} cm)'
+        )
+
+
+def _add_label(comp: adsk.fusion.Component, belt_width_cm: float, n_teeth: int):
+    """Engrave tooth count on both flange faces (e.g. \"18T\").
+
+    Top face: normal orientation, readable from above (+Z).
+    Bottom face: mirrored so the label reads correctly from below (-Z).
+    """
+    try:
+        label = f'{n_teeth}T'
+        _engrave_label_face(
+            comp, label,
+            z_offset_cm  = belt_width_cm + FLANGE_THICKNESS_CM,
+            cut_direction = adsk.fusion.ExtentDirections.NegativeExtentDirection,
+            mirror        = False,
+        )
+        _engrave_label_face(
+            comp, label,
+            z_offset_cm  = -FLANGE_THICKNESS_CM,
+            cut_direction = adsk.fusion.ExtentDirections.PositiveExtentDirection,
+            mirror        = True,
+        )
     except Exception:
         futil.handle_error('PartsGen _add_label', show_message_box=True)
 
