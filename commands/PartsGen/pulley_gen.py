@@ -332,8 +332,16 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
     parent    = parent_comp if parent_comp is not None else rootComp
     start_marker = design.timeline.markerPosition
 
-    # Identity transform — the parametric Joint below positions the occurrence.
-    trans       = adsk.core.Matrix3D.create()
+    # Pre-position the occurrence at the pitch-circle centre so the two pulleys
+    # do not overlap during geometry creation (label engraving in particular).
+    # Without this, both pulleys start at the origin and the label cut from one
+    # pulley visually overlaps the other, making the tooth count hard to read.
+    # The parametric Joint created below locks the position parametrically so
+    # the pulley follows automatically when the C-C distance is edited.
+    trans = adsk.core.Matrix3D.create()
+    if proj_circle is not None:
+        c = proj_circle.centerSketchPoint.geometry
+        trans.translation = adsk.core.Vector3D.create(c.x, c.y, 0.0)
     workingOcc  = parent.occurrences.addNewComponent(trans)
     workingComp = workingOcc.component
 
@@ -350,7 +358,8 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
 
     workingComp.name = comp_name
 
-    # Local XY plane — sketch geometry travels with the occurrence when the joint moves it.
+    # Local XY plane — sketch geometry is in the component's local space and
+    # is transformed to the pitch-circle centre via the occurrence transform above.
     extrudes   = workingComp.features.extrudeFeatures
     widthValue = adsk.core.ValueInput.createByReal(belt_width_cm)
 
@@ -402,9 +411,9 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
             pulley_ctx.add(workingOcc)
             belt_ctx = adsk.core.ObjectCollection.create()
             belt_ctx.add(belt_occ)
-            # createByCurve + CenterJointKeyPoint is the reliable way to anchor
-            # a joint at the centre of a sketch circle.
-            outer_circle = joint_circle
+            # Use createForAssemblyContext so the joint targets this specific
+            # occurrence rather than the component prototype.
+            outer_circle = joint_circle.createForAssemblyContext(workingOcc)
             pulley_geom = adsk.fusion.JointGeometry.createByCurve(
                 outer_circle,
                 adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
