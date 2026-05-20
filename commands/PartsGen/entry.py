@@ -433,6 +433,9 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     elif tbCirclesInp is not None:
         tbCirclesInp.setSelectionLimits(0, 2)
 
+    if part_is_belt and tbCirclesInp is not None and args.input.id == 'part_type':
+        tbCirclesInp.hasFocus = True
+
     # Auto-advance to Face 2 once Face 1 is filled
     if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
         face2Sel.hasFocus = True

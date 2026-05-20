@@ -355,7 +355,15 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
     trans     = adsk.core.Matrix3D.create()
-    workingOcc  = rootComp.occurrences.addNewComponent(trans)
+    try:
+        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+    except RuntimeError:
+        futil.popup_error(
+            'Cannot create belt: this document is in Part Design mode, '
+            'which only supports a single component.\n\n'
+            'Please open or create an Assembly document and try again.'
+        )
+        return
     workingComp = workingOcc.component
 
     sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)

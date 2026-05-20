@@ -176,14 +176,8 @@ def _engrave_label_face(comp: adsk.fusion.Component, label: str,
     y_bot = hex_circumradius + 0.02
     y_top = y_bot + LABEL_TEXT_HEIGHT_CM * 1.2
 
-    # Mirroring the X corners causes the text to appear reversed in the sketch,
-    # which reads correctly when the face is viewed from the outside (-Z side).
-    if mirror:
-        corner1 = adsk.core.Point3D.create( 1.5, y_bot, 0)
-        corner2 = adsk.core.Point3D.create(-1.5, y_top, 0)
-    else:
-        corner1 = adsk.core.Point3D.create(-1.5, y_bot, 0)
-        corner2 = adsk.core.Point3D.create( 1.5, y_top, 0)
+    corner1 = adsk.core.Point3D.create(-1.5, y_bot, 0)
+    corner2 = adsk.core.Point3D.create( 1.5, y_top, 0)
 
     text_input = sk.sketchTexts.createInput2(label, LABEL_TEXT_HEIGHT_CM)
     text_input.setAsMultiLine(
@@ -192,6 +186,9 @@ def _engrave_label_face(comp: adsk.fusion.Component, label: str,
         adsk.core.VerticalAlignments.MiddleVerticalAlignment,
         0
     )
+    # isHorizontalFlip makes the text readable from the outside of the bottom face (-Z).
+    if mirror:
+        text_input.isHorizontalFlip = True
     sk.sketchTexts.add(text_input).explode()
 
     n_profiles = sk.profiles.count
@@ -273,7 +270,15 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
     rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
     trans     = adsk.core.Matrix3D.create()
-    workingOcc  = rootComp.occurrences.addNewComponent(trans)
+    try:
+        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+    except RuntimeError:
+        futil.popup_error(
+            'Cannot create pulley: this document is in Part Design mode, '
+            'which only supports a single component.\n\n'
+            'Please open or create an Assembly document and try again.'
+        )
+        return
     workingComp = workingOcc.component
 
     n_teeth  = int(toothCount.value)

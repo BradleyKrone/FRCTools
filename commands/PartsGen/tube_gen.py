@@ -366,7 +366,15 @@ def _create_tube(inputs: adsk.core.CommandInputs):
     rootComp     = design.rootComponent
     start_marker = design.timeline.markerPosition
     trans        = adsk.core.Matrix3D.create()
-    workingOcc   = rootComp.occurrences.addNewComponent(trans)
+    try:
+        workingOcc   = rootComp.occurrences.addNewComponent(trans)
+    except RuntimeError:
+        futil.popup_error(
+            'Cannot create tube: this document is in Part Design mode, '
+            'which only supports a single component.\n\n'
+            'Please open or create an Assembly document and try again.'
+        )
+        return
     workingComp  = workingOcc.component
 
     w_in = w_cm / IN_TO_CM
