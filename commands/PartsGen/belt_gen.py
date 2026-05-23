@@ -28,6 +28,7 @@ ATTR_BELT_SUPPRESS   = 'belt_suppress_teeth'
 ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
 ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+ATTR_BELT_LOOP_LENGTH  = 'belt_loop_length'
 
 # ---------------------------------------------------------------------------
 # Belt-name-sync (commandTerminated hook)
@@ -136,6 +137,34 @@ def _scan_and_update_belt_names(design: adsk.fusion.Design):
         pass
 
 
+def scan_and_rebuild_belts(design: adsk.fusion.Design):
+    """Rebuild belt 3D features for all belt components in the design.
+
+    Belt-only (no pulley occurrence changes) — safe to call during command
+    preview so the belt body updates without disruptive occurrence rebuilds.
+    Pulley name/tooth-count sync happens later via the commandTerminated hook.
+    """
+    try:
+        root    = design.rootComponent
+        visited: set = set()
+        queue   = [root]
+        while queue:
+            comp = queue.pop()
+            token = comp.entityToken
+            if token in visited:
+                continue
+            visited.add(token)
+
+            belt_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_TYPE)
+            if belt_attr is not None:
+                _update_belt_name(comp, belt_attr.value)
+
+            for i in range(comp.occurrences.count):
+                queue.append(comp.occurrences.item(i).component)
+    except Exception:
+        pass
+
+
 def _get_pitch_circle(belt_comp: adsk.fusion.Component, circle_idx: int):
     """Return the circle_idx-th construction circle from the belt's TimingBelt sketch."""
     belt_sketch = belt_comp.sketches.itemByName('TimingBelt')
@@ -199,6 +228,88 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
         _group_timeline_features(design, rebuild_start, new_name)
     except Exception:
         futil.log('PartsGen: _rebuild_pulley failed')
+
+
+def _rebuild_belt_3d(comp: adsk.fusion.Component, belt_pitch_mm: int,
+                     tooth_count: int, new_loop_cm: float):
+    """Delete the belt's 3D features and recreate them from the current sketch geometry.
+
+    Called when the belt loop length changes (CC distance edited without entering the
+    sketch) so that the tooth path-pattern uses the updated pitch-loop path and count.
+    """
+    try:
+        sk = comp.sketches.itemByName('TimingBelt')
+        if sk is None:
+            return
+
+        suppress_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_SUPPRESS)
+        suppressed = suppress_attr is not None and suppress_attr.value.lower() == 'true'
+
+        width_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_WIDTH)
+        if width_attr is None:
+            return
+
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        belt_width_cm = design.unitsManager.evaluateExpression(width_attr.value)
+
+        features = comp.features
+
+        futil.log(f'PartsGen: _rebuild_belt_3d — patterns={features.pathPatternFeatures.count}'
+                  f' extrudes={features.extrudeFeatures.count}'
+                  f' bodies={comp.bRepBodies.count}')
+
+        # Delete path-pattern features first (they depend on the extrude features)
+        for i in range(features.pathPatternFeatures.count - 1, -1, -1):
+            try:
+                features.pathPatternFeatures.item(i).deleteMe()
+            except Exception as e:
+                futil.log(f'PartsGen: _rebuild_belt_3d — pattern delete failed: {e}')
+
+        # Delete extrude features
+        for i in range(features.extrudeFeatures.count - 1, -1, -1):
+            try:
+                features.extrudeFeatures.item(i).deleteMe()
+            except Exception as e:
+                futil.log(f'PartsGen: _rebuild_belt_3d — extrude delete failed: {e}')
+
+        # Explicitly remove any bodies left behind by failed features (orphaned geometry)
+        for i in range(comp.bRepBodies.count - 1, -1, -1):
+            try:
+                comp.bRepBodies.item(i).deleteMe()
+            except Exception as e:
+                futil.log(f'PartsGen: _rebuild_belt_3d — body delete failed: {e}')
+
+        futil.log(f'PartsGen: _rebuild_belt_3d — after cleanup: bodies={comp.bRepBodies.count}')
+
+        # Anchor findConnectedCurves on any construction line (the tangent lines)
+        tangent_line = None
+        for i in range(sk.sketchCurves.sketchLines.count):
+            ln = sk.sketchCurves.sketchLines.item(i)
+            if ln.isConstruction:
+                tangent_line = ln
+                break
+        if tangent_line is None:
+            futil.log('PartsGen: _rebuild_belt_3d — no construction tangent line found')
+            return
+
+        path_curves = sk.findConnectedCurves(tangent_line)
+        futil.log(f'PartsGen: _rebuild_belt_3d — path_curves count={path_curves.count}')
+
+        if suppressed:
+            extrudeBeltPreview(sk, path_curves, belt_width_cm)
+        else:
+            extrudeBelt(sk, path_curves, belt_width_cm, tooth_count, belt_pitch_mm)
+
+        futil.log(f'PartsGen: _rebuild_belt_3d — done, bodies={comp.bRepBodies.count}')
+
+        # Update the stored loop length so the next command-terminated event is a no-op
+        existing = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH)
+        if existing:
+            existing.deleteMe()
+        comp.attributes.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(new_loop_cm, 8)))
+
+    except Exception:
+        futil.log('PartsGen: _rebuild_belt_3d failed')
 
 
 def _update_pulley_name(comp: adsk.fusion.Component, pulley_type_str: str,
@@ -266,6 +377,11 @@ def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
         loop_cm = 2 * tangent + r1 * (math.pi + 2 * alpha) + r2 * (math.pi - 2 * alpha)
 
         tooth_count = int(loop_cm * 10 / belt_pitch_mm + 0.5)
+
+        stored_len_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH)
+        stored_len = float(stored_len_attr.value) if stored_len_attr else None
+        if stored_len is None or abs(loop_cm - stored_len) > 1e-6:
+            _rebuild_belt_3d(comp, belt_pitch_mm, tooth_count, loop_cm)
 
         # Extract belt width from the existing name (format: "Belt_XXX-NNNTxMMmm")
         try:
@@ -391,9 +507,9 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
     pathCurves = adsk.core.ObjectCollection.create()
     for curve in PitchLoop:
-        pathCurves.add(curve.createForAssemblyContext(workingOcc))
+        pathCurves.add(curve)          # native SketchCurve — keeps parametric link alive
 
-    curveLength = sum(curve.length for curve in pathCurves)
+    curveLength = sum(curve.length for curve in PitchLoop)
     toothCount  = int(curveLength * 10 / beltPitchLength + 0.5)
     futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
 
@@ -463,6 +579,7 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
         attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
         attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
+        attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
         attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
         attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
         attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')

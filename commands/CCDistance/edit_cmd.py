@@ -169,8 +169,8 @@ def edit_command_input_changed(args: adsk.core.InputChangedEventArgs):
             cog2Group.isVisible = True
             beltTeeth.isVisible = False
             chainLinks.isVisible = False
-        elif motionType.selectedItem.index == 3:
-            # Chain type is selected
+        elif motionType.selectedItem.index in (3, 4):
+            # Chain type is selected (#25 or #35)
             extraCenter.value = 0
             cog1Teeth.value = 16
             cog1Teeth.isVisible = True
@@ -308,7 +308,7 @@ def initialize_input_state( inputs: adsk.core.CommandInputs, lineData: CCLine.CC
         chainLinks.isVisible = False
         cog1Group.isVisible = True
         cog2Group.isVisible = True
-    elif lineData.motion == 3:
+    elif lineData.motion in (3, 4):
         chainLinks.value = lineData.Teeth
         chainLinks.isVisible = True
         beltTeeth.isVisible = False
@@ -362,7 +362,7 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         return
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
-    if motionType.selectedItem.index == 3:
+    if motionType.selectedItem.index in (3, 4):
         ccLine.data.Teeth = int(chainLinksInp.value)
     else:
         ccLine.data.Teeth = int(beltTeethInp.value)
@@ -412,6 +412,15 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     if not preview :
         CCLine.setCCLineAttributes( ccLine )
 
+    # Rebuild any belt components whose loop length changed due to this CC distance edit.
+    # This runs on both preview and final execute to prevent ghost belt bodies.
+    try:
+        from ..PartsGen.belt_gen import scan_and_rebuild_belts
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        scan_and_rebuild_belts(design)
+    except Exception:
+        pass
+
     # This was needed once debugging output was turned off....
     app.activeViewport.refresh()
 
@@ -446,7 +455,7 @@ def edit_command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         ld.motion = motionType.selectedItem.index
         ld.N1 = cog1Teeth.value
         ld.N2 = cog2Teeth.value
-        if motionType.selectedItem.index == 3:
+        if motionType.selectedItem.index in (3, 4):
             chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
             ld.Teeth = chainLinks.value
         else:
@@ -455,7 +464,7 @@ def edit_command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
         if ld.ccDistIN < (ld.OD1 + ld.OD2) / 2.0 :
             # belt/chain is too short
-            if motionType.selectedItem.index == 3:
+            if motionType.selectedItem.index in (3, 4):
                 status.formattedText = '<div align="center"><font color="red">Chain is too short!</font></div>'
             else:
                 status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'

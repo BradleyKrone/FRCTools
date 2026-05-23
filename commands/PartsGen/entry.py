@@ -7,6 +7,8 @@ from .shaft_gen import _create_shaft
 from .tube_gen import _create_tube
 from .pulley_gen import _create_pulley
 from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
+from .sprocket_gen import _create_sprocket
+from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -37,6 +39,8 @@ PART_SHAFT   = 'Shaft'
 PART_TUBE    = 'Tube'
 PART_PULLEY  = 'Timing Pulley'
 PART_BELT    = 'Timing Belt'
+PART_SPROCKET = 'Sprocket'
+PART_CHAIN   = 'Chain'
 
 # ---------------------------------------------------------------------------
 # Shaft types
@@ -109,6 +113,16 @@ ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
 ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
 
+ATTR_SPROCKET_TOOTH_COUNT = 'sprocket_tooth_count'
+ATTR_SPROCKET_WIDTH       = 'sprocket_width_expr'
+ATTR_SPROCKET_SHOW_TEETH  = 'sprocket_show_teeth'
+ATTR_SPROCKET_CHAIN_TYPE  = 'sprocket_chain_type'
+
+ATTR_CHAIN_TYPE           = 'chain_type'
+ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
+ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
+ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
+
 
 # ===========================================================================
 # start / stop
@@ -135,6 +149,7 @@ def start():
     futil.add_handler(ui.markingMenuDisplaying,  ui_marking_menu,      local_handlers=ui_handlers)
 
     register_belt_name_sync()
+    register_chain_name_sync()
 
 
 def stop():
@@ -152,6 +167,7 @@ def stop():
         edit_cmd_def.deleteMe()
 
     unregister_belt_name_sync()
+    unregister_chain_name_sync()
 
     global ui_handlers
     ui_handlers = []
@@ -168,10 +184,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp = inputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    partTypeInp.listItems.add(PART_SHAFT,  True,  '')
-    partTypeInp.listItems.add(PART_TUBE,   False, '')
-    partTypeInp.listItems.add(PART_PULLEY, False, '')
-    partTypeInp.listItems.add(PART_BELT,   False, '')
+    partTypeInp.listItems.add(PART_SHAFT,    True,  '')
+    partTypeInp.listItems.add(PART_TUBE,    False, '')
+    partTypeInp.listItems.add(PART_PULLEY,  False, '')
+    partTypeInp.listItems.add(PART_BELT,    False, '')
+    partTypeInp.listItems.add(PART_SPROCKET, False, '')
+    partTypeInp.listItems.add(PART_CHAIN,   False, '')
 
     # --- Shaft group ---------------------------------------------------------
     shaftTypeInp = inputs.addDropDownCommandInput(
@@ -324,7 +342,51 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     tbPulleyWidthInp.isVisible = False
 
-    # Wire events
+    # --- Chain Sprocket group ------------------------------------------------
+    sprocketToothCountInp = inputs.addValueInput(
+        'sprocket_tooth_count', 'Tooth Count', '',
+        adsk.core.ValueInput.createByString('12')
+    )
+    sprocketToothCountInp.isVisible = False
+
+    sprocketWidthInp = inputs.addValueInput(
+        'sprocket_width', 'Sprocket Width', 'in',
+        adsk.core.ValueInput.createByString('0.375 in')
+    )
+    sprocketWidthInp.isVisible = False
+
+    sprocketShowTeethInp = inputs.addBoolValueInput(
+        'sprocket_show_teeth', 'Show Teeth', True, '', False)
+    sprocketShowTeethInp.isVisible = False
+
+    sprocketChainTypeInp = inputs.addDropDownCommandInput(
+        'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    sprocketChainTypeInp.listItems.add('#25 Chain', True,  '')
+    sprocketChainTypeInp.listItems.add('#35 Chain', False, '')
+    sprocketChainTypeInp.isVisible = False
+
+    # --- Chain group ---------------------------------------------------------
+    chainCirclesInp = inputs.addSelectionInput(
+        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
+    )
+    chainCirclesInp.addSelectionFilter('SketchCurves')
+    chainCirclesInp.setSelectionLimits(0, 2)
+    chainCirclesInp.isVisible = False
+
+    chainSprocketWidthInp = inputs.addValueInput(
+        'chain_sprocket_width', 'Chain Width', 'in',
+        adsk.core.ValueInput.createByString('0.375 in')
+    )
+    chainSprocketWidthInp.isVisible = False
+
+    chainGenSprocketsInp = inputs.addBoolValueInput(
+        'chain_gen_sprockets', 'Generate Sprockets', True, '', True)
+    chainGenSprocketsInp.isVisible = False
+
+    chainSprocketTeethInp = inputs.addBoolValueInput(
+        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', False)
+    chainSprocketTeethInp.isVisible = False
     futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
     futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
@@ -371,11 +433,13 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_tube     = (part_type == PART_TUBE)
     part_is_pulley   = (part_type == PART_PULLEY)
     part_is_belt     = (part_type == PART_BELT)
+    part_is_sprocket = (part_type == PART_SPROCKET)
+    part_is_chain    = (part_type == PART_CHAIN)
     is_custom_shaft  = (shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
-    hide_length      = part_is_pulley or part_is_belt
+    hide_length      = part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
 
     # Shaft inputs
     shaftTypeInp.isVisible   = part_is_shaft
@@ -414,6 +478,35 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     if tbPulleyWidthInp is not None:
         tbPulleyWidthInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
 
+    # Chain Sprocket inputs
+    sprocketToothCountInp = inputs.itemById('sprocket_tooth_count')
+    sprocketWidthInp      = inputs.itemById('sprocket_width')
+    sprocketShowTeethInp  = inputs.itemById('sprocket_show_teeth')
+    sprocketChainTypeInp  = inputs.itemById('sprocket_chain_type')
+    if sprocketToothCountInp is not None:
+        sprocketToothCountInp.isVisible = part_is_sprocket
+    if sprocketWidthInp is not None:
+        sprocketWidthInp.isVisible = part_is_sprocket
+    if sprocketShowTeethInp is not None:
+        sprocketShowTeethInp.isVisible = part_is_sprocket
+    if sprocketChainTypeInp is not None:
+        sprocketChainTypeInp.isVisible = part_is_sprocket
+
+    # Chain inputs
+    chainCirclesInp       = inputs.itemById('chain_pitch_circles')
+    chainSprocketWidthInp = inputs.itemById('chain_sprocket_width')
+    chainGenSprocketsInp  = inputs.itemById('chain_gen_sprockets')
+    chainSprocketTeethInp = inputs.itemById('chain_sprocket_teeth')
+    if chainCirclesInp is not None:
+        chainCirclesInp.isVisible = part_is_chain
+    if chainSprocketWidthInp is not None:
+        chainSprocketWidthInp.isVisible = part_is_chain
+    if chainGenSprocketsInp is not None:
+        chainGenSprocketsInp.isVisible = part_is_chain
+    if chainSprocketTeethInp is not None:
+        chainSprocketTeethInp.isVisible = (
+            part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
+
     # Length inputs — hidden when Pulley or Belt is selected
     lenTypeInp.isVisible   = not hide_length
     face1Sel.isVisible     = not hide_length and is_between_faces
@@ -433,8 +526,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     elif tbCirclesInp is not None:
         tbCirclesInp.setSelectionLimits(0, 2)
 
+    if chainCirclesInp is not None:
+        if part_is_chain:
+            chainCirclesInp.setSelectionLimits(2, 2)
+        else:
+            chainCirclesInp.setSelectionLimits(0, 2)
+
     if part_is_belt and tbCirclesInp is not None and args.input.id == 'part_type':
         tbCirclesInp.hasFocus = True
+
+    if part_is_chain and chainCirclesInp is not None and args.input.id == 'part_type':
+        chainCirclesInp.hasFocus = True
 
     # Auto-advance to Face 2 once Face 1 is filled
     if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
@@ -443,6 +545,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # CCLine detection for Timing Belt circles
     if args.input.id == 'tb_pitch_circles':
         handle_belt_selection_changed(inputs)
+
+    # CCLine detection for Chain circles
+    if args.input.id == 'chain_pitch_circles':
+        handle_chain_selection_changed(inputs)
 
 
 # ===========================================================================
@@ -460,6 +566,10 @@ def command_execute(args: adsk.core.CommandEventArgs):
             _create_tube(inputs)
         elif part_type == PART_PULLEY:
             _create_pulley(inputs)
+        elif part_type == PART_SPROCKET:
+            _create_sprocket(inputs)
+        elif part_type == PART_CHAIN:
+            _create_chain(inputs)
         else:
             _create_belt(inputs)
     except Exception:
@@ -475,6 +585,8 @@ def command_preview(args: adsk.core.CommandEventArgs):
         suppressTeethInp = inputs.itemById('tb_suppress_teeth')
         if suppressTeethInp and suppressTeethInp.value:
             args.isValidResult = True
+    elif part_type == PART_CHAIN:
+        _create_chain(inputs, is_preview=True)
     else:
         command_execute(args)
         args.isValidResult = True
@@ -515,6 +627,19 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         args.areInputsValid = True
         return
 
+    # --- Chain Sprocket validation ------------------------------------------
+    if part_type == PART_SPROCKET:
+        tc = inputs.itemById('sprocket_tooth_count')
+        sw = inputs.itemById('sprocket_width')
+        if tc is None or tc.value < 9:
+            args.areInputsValid = False
+            return
+        if sw is None or sw.value <= 0:
+            args.areInputsValid = False
+            return
+        args.areInputsValid = True
+        return
+
     # --- Timing Belt validation ---------------------------------------------
     if part_type == PART_BELT:
         tbCirclesInp:   adsk.core.SelectionCommandInput = inputs.itemById('tb_pitch_circles')
@@ -523,6 +648,19 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             args.areInputsValid = False
             return
         if tbBeltWidthInp is None or tbBeltWidthInp.value <= 0:
+            args.areInputsValid = False
+            return
+        args.areInputsValid = True
+        return
+
+    # --- Chain validation ---------------------------------------------------
+    if part_type == PART_CHAIN:
+        chainCirclesInp = inputs.itemById('chain_pitch_circles')
+        chainWidthInp   = inputs.itemById('chain_sprocket_width')
+        if chainCirclesInp is None or chainCirclesInp.selectionCount < 2:
+            args.areInputsValid = False
+            return
+        if chainWidthInp is None or chainWidthInp.value <= 0:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -777,7 +915,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_TOOTH_COUNT, ATTR_PULLEY_BELT_WIDTH,
                     ATTR_PULLEY_SHOW_TEETH,
                     ATTR_BELT_TYPE, ATTR_BELT_WIDTH, ATTR_BELT_SUPPRESS,
-                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_PULLEY_WIDTH):
+                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_PULLEY_WIDTH,
+                    ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
+                    ATTR_SPROCKET_CHAIN_TYPE,
+                    ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
+                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -795,6 +937,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     is_tube         = (part_type == PART_TUBE)
     is_pulley       = (part_type == PART_PULLEY)
     is_belt         = (part_type == PART_BELT)
+    is_sprocket     = (part_type == PART_SPROCKET)
+    is_chain        = (part_type == PART_CHAIN)
     is_custom_shaft = (shaft_type == SHAFT_CUSTOM)
 
     tube_thick      = _s(ATTR_TUBE_THICK,   THICK_1_8)
@@ -821,15 +965,25 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     belt_gen_pulleys  = _b(ATTR_BELT_GEN_PULLEYS,   True)
     belt_pulley_teeth = _b(ATTR_BELT_PULLEY_TEETH,  False)
     belt_pulley_width = _s(ATTR_BELT_PULLEY_WIDTH,  '0.394 in')
+    sprocket_teeth    = _s(ATTR_SPROCKET_TOOTH_COUNT, '12')
+    sprocket_width_val = _s(ATTR_SPROCKET_WIDTH,     '0.375 in')
+    sprocket_show_teeth_val = _b(ATTR_SPROCKET_SHOW_TEETH, False)
+    sprocket_chain_type_val = _s(ATTR_SPROCKET_CHAIN_TYPE, '#25 Chain')
+    chain_type_val       = _s(ATTR_CHAIN_TYPE,          '25')
+    chain_spr_width_val  = _s(ATTR_CHAIN_SPROCKET_WIDTH, '0.375 in')
+    chain_gen_spr_val    = _b(ATTR_CHAIN_GEN_SPROCKETS,  True)
+    chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
 
     # --- Part type ---
     partTypeInp = inputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    partTypeInp.listItems.add(PART_SHAFT,  is_shaft,   '')
-    partTypeInp.listItems.add(PART_TUBE,   is_tube,    '')
-    partTypeInp.listItems.add(PART_PULLEY, is_pulley,  '')
-    partTypeInp.listItems.add(PART_BELT,   is_belt,    '')
+    partTypeInp.listItems.add(PART_SHAFT,    is_shaft,    '')
+    partTypeInp.listItems.add(PART_TUBE,    is_tube,     '')
+    partTypeInp.listItems.add(PART_PULLEY,  is_pulley,   '')
+    partTypeInp.listItems.add(PART_BELT,    is_belt,     '')
+    partTypeInp.listItems.add(PART_SPROCKET, is_sprocket, '')
+    partTypeInp.listItems.add(PART_CHAIN,   is_chain,    '')
 
     # --- Shaft group ---
     shaftTypeInp = inputs.addDropDownCommandInput(
@@ -958,13 +1112,59 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     tbPulleyWidthInp.isVisible = is_belt and belt_gen_pulleys
 
+    # --- Chain Sprocket group ---
+    sprocketToothCountInp = inputs.addValueInput(
+        'sprocket_tooth_count', 'Tooth Count', '',
+        adsk.core.ValueInput.createByString(sprocket_teeth)
+    )
+    sprocketToothCountInp.isVisible = is_sprocket
+
+    sprocketWidthInpEdit = inputs.addValueInput(
+        'sprocket_width', 'Sprocket Width', 'in',
+        adsk.core.ValueInput.createByString(sprocket_width_val)
+    )
+    sprocketWidthInpEdit.isVisible = is_sprocket
+
+    sprocketShowTeethInpEdit = inputs.addBoolValueInput(
+        'sprocket_show_teeth', 'Show Teeth', True, '', sprocket_show_teeth_val)
+    sprocketShowTeethInpEdit.isVisible = is_sprocket
+
+    sprocketChainTypeInpEdit = inputs.addDropDownCommandInput(
+        'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    sprocketChainTypeInpEdit.listItems.add('#25 Chain', sprocket_chain_type_val == '#25 Chain', '')
+    sprocketChainTypeInpEdit.listItems.add('#35 Chain', sprocket_chain_type_val == '#35 Chain', '')
+    sprocketChainTypeInpEdit.isVisible = is_sprocket
+
+    # --- Chain group ---
+    chainCirclesInpEdit = inputs.addSelectionInput(
+        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
+    )
+    chainCirclesInpEdit.addSelectionFilter('SketchCurves')
+    chainCirclesInpEdit.setSelectionLimits(0, 2)
+    chainCirclesInpEdit.isVisible = is_chain
+
+    chainSprocketWidthInpEdit = inputs.addValueInput(
+        'chain_sprocket_width', 'Chain Width', 'in',
+        adsk.core.ValueInput.createByString(chain_spr_width_val)
+    )
+    chainSprocketWidthInpEdit.isVisible = is_chain
+
+    chainGenSprocketsInpEdit = inputs.addBoolValueInput(
+        'chain_gen_sprockets', 'Generate Sprockets', True, '', chain_gen_spr_val)
+    chainGenSprocketsInpEdit.isVisible = is_chain
+
+    chainSprocketTeethInpEdit = inputs.addBoolValueInput(
+        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
+    chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
+
     # --- Length — always use Custom Length in edit mode; face refs are gone ---
     lenTypeInp = inputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     lenTypeInp.listItems.add(LEN_FACES,  False, '')
     lenTypeInp.listItems.add(LEN_CUSTOM, True,  '')
-    lenTypeInp.isVisible = not is_pulley and not is_belt
+    lenTypeInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
 
     face1Sel = inputs.addSelectionInput(
         'face1_selection', 'Face 1', 'Select the starting planar face'
@@ -984,7 +1184,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString(len_expr)
     )
-    customLenInp.isVisible = not is_pulley and not is_belt
+    customLenInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)
@@ -1017,6 +1217,10 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         _create_tube(inputs)
     elif part_type == PART_PULLEY:
         _create_pulley(inputs)
+    elif part_type == PART_SPROCKET:
+        _create_sprocket(inputs)
+    elif part_type == PART_CHAIN:
+        _create_chain(inputs)
     else:
         _create_belt(inputs)
 

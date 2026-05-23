@@ -21,11 +21,21 @@ def calcCCLineData( ld: CCLineData ):
     elif ld.motion == 3:
         # #25 Chain (pitch = 0.25 in)
         CHAIN_25_PITCH_IN = 0.25
+        CHAIN_25_ROLLER_DIAM_IN = 0.130   # ANSI B29.1
         ld.ccDistIN = ChainCCDistanceIN( ld.N1, ld.N2, ld.Teeth, CHAIN_25_PITCH_IN )
         ld.PD1 = ChainPitchDiameterIN( ld.N1, CHAIN_25_PITCH_IN )
         ld.PD2 = ChainPitchDiameterIN( ld.N2, CHAIN_25_PITCH_IN )
-        ld.OD1 = ld.PD1 + CHAIN_25_PITCH_IN
-        ld.OD2 = ld.PD2 + CHAIN_25_PITCH_IN
+        ld.OD1 = ld.PD1 + CHAIN_25_ROLLER_DIAM_IN
+        ld.OD2 = ld.PD2 + CHAIN_25_ROLLER_DIAM_IN
+    elif ld.motion == 4:
+        # #35 Chain (pitch = 3/8 in)
+        CHAIN_35_PITCH_IN = 0.375
+        CHAIN_35_ROLLER_DIAM_IN = 0.200   # ANSI B29.1
+        ld.ccDistIN = ChainCCDistanceIN( ld.N1, ld.N2, ld.Teeth, CHAIN_35_PITCH_IN )
+        ld.PD1 = ChainPitchDiameterIN( ld.N1, CHAIN_35_PITCH_IN )
+        ld.PD2 = ChainPitchDiameterIN( ld.N2, CHAIN_35_PITCH_IN )
+        ld.OD1 = ld.PD1 + CHAIN_35_ROLLER_DIAM_IN
+        ld.OD2 = ld.PD2 + CHAIN_35_ROLLER_DIAM_IN
     else :
         if ld.motion == 1:
             # HTD 5mm Belt
@@ -86,8 +96,9 @@ def ChainCCDistanceIN( N1: int, N2: int, numLinks: int, pitchIN: float ) -> floa
 def ChainPitchDiameterIN( NT: int, pitchIN: float ) -> float:
     return pitchIN / math.sin(math.pi / NT)
 
-def ChainOuterDiameterIN( NT: int, pitchIN: float ) -> float:
-    return ChainPitchDiameterIN(NT, pitchIN) + pitchIN
+def ChainOuterDiameterIN( NT: int, pitchIN: float, rollerDiamIN: float ) -> float:
+    # Tip diameter = pitch diameter + roller diameter (ANSI B29.1)
+    return ChainPitchDiameterIN(NT, pitchIN) + rollerDiamIN
 
 def createCCLine( 
     startpt: adsk.fusion.SketchPoint, 
@@ -192,6 +203,8 @@ def createLabelString( ld: CCLineData ) -> str:
             lineLabel = f'Gear 20DP {n1}T+{n2}T'
     elif ld.motion == 3:
         lineLabel = f'{ld.Teeth}L #25 Chain ({n1}Tx{n2}T)'
+    elif ld.motion == 4:
+        lineLabel = f'{ld.Teeth}L #35 Chain ({n1}Tx{n2}T)'
     else :
         if ld.motion == 1:
     #         # HTD 5mm Belt

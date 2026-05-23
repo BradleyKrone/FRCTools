@@ -161,7 +161,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
         ccLine = CCLine.getCCLineFromEntity( ccLine.line )
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
-    if motionType.selectedItem.index == 3:
+    if motionType.selectedItem.index in (3, 4):
         ccLine.data.Teeth = int(chainLinksInp.value)
     else:
         ccLine.data.Teeth = int(beltTeethInp.value)
@@ -299,8 +299,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             cog2Group.isVisible = True
             beltTeeth.isVisible = False
             chainLinks.isVisible = False
-        elif motionType.selectedItem.index == 3:
-            # Chain type is selected
+        elif motionType.selectedItem.index in (3, 4):
+            # Chain type is selected (#25 or #35)
             extraCenter.value = 0
             cog1Teeth.value = 16
             cog1Teeth.isVisible = True
