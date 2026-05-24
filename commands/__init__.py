@@ -6,6 +6,7 @@ from .BoltPattern import entry as BoltPattern
 from .CCDistance import entry as CCDistance
 from .FilletXpert import entry as FilletXpert
 from .Lighten import entry as Lighten
+from .PartGen import entry as PartGen
 from .TimingBelt import entry as TimingBelt
 from .TimingPulley import entry as TimingPulley
 from .Tubify import entry as Tubify
@@ -16,6 +17,7 @@ commands = [
     CCDistance,
     FilletXpert,
     Lighten,
+    PartGen,
     TimingBelt,
     TimingPulley,
     Tubify
