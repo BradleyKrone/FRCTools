@@ -305,8 +305,12 @@ def _add_face_holes(comp: adsk.fusion.Component,
             seed_cut = extrudes.add(cutInput)
 
             # --- Feature rectangular pattern — replicates the seed cut -----
-            n_width  = max(1, int(widthIn))
-            n_length = max(1, int(lengthIn))
+            # Add a small epsilon before truncation to counteract floating-point
+            # imprecision in edge-length measurements from ToEntity extrusions.
+            # Without this, a 2" face may measure as 1.9999…" and int() gives 1
+            # instead of 2, dropping the second row of holes.
+            n_width  = max(1, int(widthIn  + 1e-9))
+            n_length = max(1, int(lengthIn + 1e-9))
 
             if custom_len_expr is not None:
                 qty_length = adsk.core.ValueInput.createByString(

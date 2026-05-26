@@ -267,19 +267,21 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         'face1_selection', 'Face 1', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
-    face1Sel.setSelectionLimits(1, 1)
+    face1Sel.setSelectionLimits(0, 1)
+    face1Sel.isVisible = False
 
     face2Sel = inputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
-    face2Sel.setSelectionLimits(1, 1)
+    face2Sel.setSelectionLimits(0, 1)
+    face2Sel.isVisible = False
 
     customLenInp = inputs.addValueInput(
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString('6 in')
     )
-    customLenInp.isVisible = False
+    customLenInp.isVisible = True
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = inputs.addDropDownCommandInput(
@@ -537,6 +539,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     if part_is_chain and chainCirclesInp is not None and args.input.id == 'part_type':
         chainCirclesInp.hasFocus = True
+
+    # Auto-focus Face 1 when switching to Between Two Faces mode
+    if args.input.id == 'length_type' and is_between_faces:
+        face1Sel.hasFocus = True
 
     # Auto-advance to Face 2 once Face 1 is filled
     if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
