@@ -42,10 +42,11 @@ bolt_patterns: list[BoltPattern] = [
     # Name, center hole radius, pattern radius, hole size, # of holes, suppression
     BoltPattern('Kraken X60', 0.75, 2.0, 0.196, 12, [0,0,0,0,0,0,0,0,0,0,0,1]),
     BoltPattern('Kraken X44', 0.75, 1.375, 0.196, 12, [0,0,0,0,0,0,0,0,0,0,0,1]),
-    BoltPattern('NEO Vortex', 0.75, 2.0, 0.196, 8, [0,0,0,1,0,0,0,1]),
-    BoltPattern('NEO 550', 0.5118, 0.9843, 0.125, 4, []),
+    # BoltPattern('NEO Vortex', 0.75, 2.0, 0.196, 8, [0,0,0,1,0,0,0,1]),
+    # BoltPattern('NEO 550', 0.5118, 0.9843, 0.125, 4, []),
     BoltPattern('REV MAXPlanetary', 1.125, 2.0, 0.196, 8, [0,0,1,1,0,0,1,1]),
-    BoltPattern('2" MultiMotor', 0.75, 2.0, 0.196, 24, [0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1]),
+    # BoltPattern('2" MultiMotor', 0.75, 2.0, 0.196, 24, [0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1]),
+    BoltPattern('Hex Bearing Retention', 1.125, 1.422, 0.159, 6, [0,0,0,0,0,0]),
 ]
 
 # Executed when add-in is run.
@@ -93,6 +94,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # General logging for debug.
     # futil.log(f'{CMD_NAME} command Created Event')
+    
+    # Set dialog size to be wider
+    args.command.setDialogInitialSize(250, 300)  # width, height in pixels
 
     # https://help.autodesk.com/view/fusion360/ENU/?contextId=CommandInputs
     inputs = args.command.commandInputs
@@ -109,6 +113,16 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         boltPattern.listItems.add( bp.name, True, '')
     boltPattern.listItems.item( 0 ).isSelected = True
 
+    # Center hole options
+    centerHoleGroup = inputs.addGroupCommandInput('center_hole_group', 'Center Hole Options')
+    centerHoleGroup.isExpanded = True
+    
+    # Checkbox to suppress center hole
+    suppressCenterHole = centerHoleGroup.children.addBoolValueInput('suppress_center_hole', 'Suppress Center Hole', True, '', False)
+    
+    # Value input for center hole diameter (in inches)
+    selected_pattern = bolt_patterns[0]  # Default pattern
+    centerHoleSize = centerHoleGroup.children.addValueInput('center_hole_size', 'Center Hole Diameter', 'in', adsk.core.ValueInput.createByString(f'{selected_pattern.centerDia} in'))
 
     # TODO Connect to the events that are needed by this command.
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
@@ -127,6 +141,8 @@ def command_execute(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
     centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
+    suppressCenterHoleInp: adsk.core.BoolValueCommandInput = inputs.itemById('suppress_center_hole')
+    centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
 
     centerPt: adsk.fusion.SketchPoint = None
     selectedEntity = centerSelection.selection(0).entity
@@ -141,11 +157,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
     boltPattern = bolt_patterns[ boltPatternInp.selectedItem.index ]
     sketch = centerPt.parentSketch
 
-    # Create the bolt pattern center hole
-    centerHole = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, boltPattern.centerDia * 2.54 / 2 )
-    textPt = futil.offsetPoint3D( centerHole.centerSketchPoint.geometry, boltPattern.centerDia/4, boltPattern.centerDia/4, 0 )
-    centerDim = sketch.sketchDimensions.addDiameterDimension( centerHole, textPt )
-    centerDim.value = boltPattern.centerDia * 2.54
+    # Create the bolt pattern center hole (only if not suppressed)
+    if not suppressCenterHoleInp.value:
+        # Use user-specified size instead of pattern default
+        centerHoleDia = centerHoleSizeInp.value
+        centerHole = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, centerHoleDia / 2 )
+        textPt = futil.offsetPoint3D( centerHole.centerSketchPoint.geometry, centerHoleDia/4, centerHoleDia/4, 0 )
+        centerDim = sketch.sketchDimensions.addDiameterDimension( centerHole, textPt )
+        centerDim.value = centerHoleDia
 
     # Create the bolt pattern bolt circle
     boltCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, boltPattern.patternDia * 2.54 / 2 )
@@ -194,6 +213,14 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Input Changed Event fired from a change to {changed_input.id}')
+    
+    # If the bolt pattern selection changed, update the center hole size default
+    if changed_input.id == 'bolt_pattern':
+        boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
+        centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
+        
+        selected_pattern = bolt_patterns[boltPatternInp.selectedItem.index]
+        centerHoleSizeInp.expression = f'{selected_pattern.centerDia} in'
 
 
 
@@ -204,6 +231,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # futil.log(f'{CMD_NAME} Command Validate Event')
 
     inputs = args.inputs
+    
+    # Check if center is selected
+    centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
+    centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
+    
+    # Validate inputs
+    if centerSelection.selectionCount > 0 and centerHoleSizeInp.value > 0:
+        args.areInputsValid = True
+    else:
+        args.areInputsValid = False
 
 # This event handler is called when the command terminates.
 def command_destroy(args: adsk.core.CommandEventArgs):

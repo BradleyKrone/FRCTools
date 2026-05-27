@@ -18,12 +18,30 @@ def calcCCLineData( ld: CCLineData ):
         ld.PD2 = GearsPitchDiameterIN( ld.N2, 20 )
         ld.OD1 = GearsOuterDiameterIN( ld.N1, 20 )
         ld.OD2 = GearsOuterDiameterIN( ld.N2, 20 )
+    elif ld.motion == 3:
+        # #25 Chain (pitch = 0.25 in)
+        CHAIN_25_PITCH_IN = 0.25
+        CHAIN_25_ROLLER_DIAM_IN = 0.130   # ANSI B29.1
+        ld.ccDistIN = ChainCCDistanceIN( ld.N1, ld.N2, ld.Teeth, CHAIN_25_PITCH_IN )
+        ld.PD1 = ChainPitchDiameterIN( ld.N1, CHAIN_25_PITCH_IN )
+        ld.PD2 = ChainPitchDiameterIN( ld.N2, CHAIN_25_PITCH_IN )
+        ld.OD1 = ld.PD1 + CHAIN_25_ROLLER_DIAM_IN
+        ld.OD2 = ld.PD2 + CHAIN_25_ROLLER_DIAM_IN
+    elif ld.motion == 4:
+        # #35 Chain (pitch = 3/8 in)
+        CHAIN_35_PITCH_IN = 0.375
+        CHAIN_35_ROLLER_DIAM_IN = 0.200   # ANSI B29.1
+        ld.ccDistIN = ChainCCDistanceIN( ld.N1, ld.N2, ld.Teeth, CHAIN_35_PITCH_IN )
+        ld.PD1 = ChainPitchDiameterIN( ld.N1, CHAIN_35_PITCH_IN )
+        ld.PD2 = ChainPitchDiameterIN( ld.N2, CHAIN_35_PITCH_IN )
+        ld.OD1 = ld.PD1 + CHAIN_35_ROLLER_DIAM_IN
+        ld.OD2 = ld.PD2 + CHAIN_35_ROLLER_DIAM_IN
     else :
         if ld.motion == 1:
             # HTD 5mm Belt
             beltPitchMM = 5
         else :
-            # HTD 3mm Belt
+            # GT2 3mm Belt
             beltPitchMM = 3
         ld.ccDistIN = BeltCCDistanceIN( ld.N1, ld.N2, ld.Teeth, beltPitchMM )
         ld.PD1 = BeltPitchDiameterIN( ld.N1, beltPitchMM )
@@ -68,6 +86,20 @@ def BeltOuterDiameterIN( NT: int, pitchMM: int ) -> float:
         # Approximation of the OD of the flanges on the pulleys
     return BeltPitchDiameterIN(NT, pitchMM) + 0.15
 
+def ChainCCDistanceIN( N1: int, N2: int, numLinks: int, pitchIN: float ) -> float:
+    A = numLinks - (N1 + N2) / 2.0
+    discriminant = A * A - 2 * (N2 - N1) ** 2 / (math.pi ** 2)
+    if discriminant < 0:
+        return 0.0
+    return pitchIN / 4.0 * (A + math.sqrt(discriminant))
+
+def ChainPitchDiameterIN( NT: int, pitchIN: float ) -> float:
+    return pitchIN / math.sin(math.pi / NT)
+
+def ChainOuterDiameterIN( NT: int, pitchIN: float, rollerDiamIN: float ) -> float:
+    # Tip diameter = pitch diameter + roller diameter (ANSI B29.1)
+    return ChainPitchDiameterIN(NT, pitchIN) + rollerDiamIN
+
 def createCCLine( 
     startpt: adsk.fusion.SketchPoint, 
     endpt: adsk.fusion.SketchPoint ) -> adsk.fusion.SketchLine :
@@ -97,58 +129,56 @@ def dimAndLabelCCLine( ccLine: CCLine ) :
     line = ccLine.line
     ld = ccLine.data
 
-    midPt = futil.midPoint3D( line.startSketchPoint.geometry, line.endSketchPoint.geometry )
-    normal = futil.sketchLineNormal( line )
-    normal = futil.multVector2D( normal, ld.ccDistIN / 4 )
+    sketch.isComputeDeferred = True
+    try:
+        midPt = futil.midPoint3D( line.startSketchPoint.geometry, line.endSketchPoint.geometry )
+        normal = futil.sketchLineNormal( line )
+        normal = futil.multVector2D( normal, ld.ccDistIN / 4 )
 
-    # Dimension C-C line
-    if abs(normal.y) < 0.001  :
-        textPt = futil.offsetPoint3D( midPt, normal.x, normal.y, 0 )
-    elif normal.y < 0 :
-        textPt = futil.offsetPoint3D( midPt, normal.x, normal.y, 0 )
-    else:
-        textPt = futil.offsetPoint3D( midPt, -normal.x, -normal.y, 0 )
-    
-    ccLine.lengthDim = sketch.sketchDimensions.addDistanceDimension( 
-        line.startSketchPoint, line.endSketchPoint, 
-        adsk.fusion.DimensionOrientations.AlignedDimensionOrientation, textPt )
-    ccLine.lengthDim.value = (ld.ccDistIN + ld.ExtraCenterIN) * 2.54
+        # Dimension C-C line
+        if abs(normal.y) < 0.001  :
+            textPt = futil.offsetPoint3D( midPt, normal.x, normal.y, 0 )
+        elif normal.y < 0 :
+            textPt = futil.offsetPoint3D( midPt, normal.x, normal.y, 0 )
+        else:
+            textPt = futil.offsetPoint3D( midPt, -normal.x, -normal.y, 0 )
+        
+        ccLine.lengthDim = sketch.sketchDimensions.addDistanceDimension( 
+            line.startSketchPoint, line.endSketchPoint, 
+            adsk.fusion.DimensionOrientations.AlignedDimensionOrientation, textPt )
+        ccLine.lengthDim.value = (ld.ccDistIN + ld.ExtraCenterIN) * 2.54
 
-    # Create SketchText and attach it to the C-C Line
-    label = createLabelString( ld )
-    textHeight = computeTextSizeIN( ld ) * 2.54 # in cm
+        # Create SketchText and attach it to the C-C Line
+        label = createLabelString( ld )
+        textHeight = computeTextSizeIN( ld ) * 2.54 # in cm
 
-    # futil.log( f'ccDist = {ld.ccDistIN}in, Text Height = {textHeight}in')
-    cornerPt = line.startSketchPoint.geometry
-    diagPt =  futil.addPoint3D( cornerPt, adsk.core.Point3D.create( line.length, textHeight, 0 ) )
-    textInput = sketch.sketchTexts.createInput2( label, textHeight )
-    textInput.setAsMultiLine( cornerPt, diagPt, 
-                        adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
-                        adsk.core.VerticalAlignments.MiddleVerticalAlignment, 0 )
-    ccLine.textBox = sketch.sketchTexts.add( textInput )
-    textDef: adsk.fusion.MultiLineTextDefinition = ccLine.textBox.definition
-    textBoxLines = textDef.rectangleLines
-    textBaseLine = textBoxLines[0]
-    TextHeightLine = textBoxLines[1]
-    # midPt3D = futil.midPoint3D(textBaseLine.startSketchPoint.geometry, textBaseLine.endSketchPoint.geometry )
-    # ccLine.midPt = sketch.sketchPoints.add( midPt3D )
+        cornerPt = line.startSketchPoint.geometry
+        diagPt =  futil.addPoint3D( cornerPt, adsk.core.Point3D.create( line.length, textHeight, 0 ) )
+        textInput = sketch.sketchTexts.createInput2( label, textHeight )
+        textInput.setAsMultiLine( cornerPt, diagPt, 
+                            adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
+                            adsk.core.VerticalAlignments.MiddleVerticalAlignment, 0 )
+        ccLine.textBox = sketch.sketchTexts.add( textInput )
+        textDef: adsk.fusion.MultiLineTextDefinition = ccLine.textBox.definition
+        textBoxLines = textDef.rectangleLines
+        textBaseLine = textBoxLines[0]
+        TextHeightLine = textBoxLines[1]
 
-    textPoint = futil.offsetPoint3D( TextHeightLine.startSketchPoint.geometry, -textHeight/2, textHeight/2, 0 )
-    ccLine.textHeight = sketch.sketchDimensions.addDistanceDimension( TextHeightLine.startSketchPoint, TextHeightLine.endSketchPoint,
-                                                              adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
-                                                              textPoint  )
-    ccLine.textHeight.value = textHeight * 2.0
+        textPoint = futil.offsetPoint3D( TextHeightLine.startSketchPoint.geometry, -textHeight/2, textHeight/2, 0 )
+        ccLine.textHeight = sketch.sketchDimensions.addDistanceDimension( TextHeightLine.startSketchPoint, TextHeightLine.endSketchPoint,
+                                                                  adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+                                                                  textPoint  )
+        ccLine.textHeight.value = textHeight * 2.0
 
-    # sketch.geometricConstraints.addMidPoint( ccLine.midPt, textBaseLine  )
-    # sketch.geometricConstraints.addMidPoint( ccLine.midPt, line  )
-    # sketch.geometricConstraints.addParallel( textBaseLine, line  )
-    if textBaseLine.startSketchPoint.geometry.distanceTo(line.startSketchPoint.geometry) < \
-        textBaseLine.startSketchPoint.geometry.distanceTo(line.endSketchPoint.geometry) :
-        sketch.geometricConstraints.addCoincident( textBaseLine.startSketchPoint, line.startSketchPoint )
-        sketch.geometricConstraints.addCoincident( textBaseLine.endSketchPoint, line.endSketchPoint )
-    else:
-        sketch.geometricConstraints.addCoincident( textBaseLine.startSketchPoint, line.endSketchPoint )
-        sketch.geometricConstraints.addCoincident( textBaseLine.endSketchPoint, line.startSketchPoint )
+        if textBaseLine.startSketchPoint.geometry.distanceTo(line.startSketchPoint.geometry) < \
+            textBaseLine.startSketchPoint.geometry.distanceTo(line.endSketchPoint.geometry) :
+            sketch.geometricConstraints.addCoincident( textBaseLine.startSketchPoint, line.startSketchPoint )
+            sketch.geometricConstraints.addCoincident( textBaseLine.endSketchPoint, line.endSketchPoint )
+        else:
+            sketch.geometricConstraints.addCoincident( textBaseLine.startSketchPoint, line.endSketchPoint )
+            sketch.geometricConstraints.addCoincident( textBaseLine.endSketchPoint, line.startSketchPoint )
+    finally:
+        sketch.isComputeDeferred = False
 
 
 def createLabelString( ld: CCLineData ) -> str:
@@ -171,12 +201,16 @@ def createLabelString( ld: CCLineData ) -> str:
                 lineLabel = f'Gear 20DP {p1}T({n1}T-CD)+{n2}T'
         else:
             lineLabel = f'Gear 20DP {n1}T+{n2}T'
+    elif ld.motion == 3:
+        lineLabel = f'{ld.Teeth}L #25 Chain ({n1}Tx{n2}T)'
+    elif ld.motion == 4:
+        lineLabel = f'{ld.Teeth}L #35 Chain ({n1}Tx{n2}T)'
     else :
         if ld.motion == 1:
     #         # HTD 5mm Belt
             lineLabel = f'{ld.Teeth}T HTD 5mm ({n1}Tx{n2}T)'
         else :
-    #         # HTD 3mm Belt
+    #         # GT2 3mm Belt
             lineLabel = f'{ld.Teeth}T GT2 3mm ({n1}Tx{n2}T)'
     
     if abs(ld.ExtraCenterIN) > 0.0005 :
@@ -200,32 +234,35 @@ def createCirclePair( line: adsk.fusion.SketchLine,
                       dia1IN: float, dia2IN: float, dimAngleDeg: float ) :
 
     sketch = line.parentSketch
+    angleRad = dimAngleDeg * math.pi / 180
 
-    # Create Start point centered circle and dimension it
-    startCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( line.startSketchPoint, dia1IN * 2.54 / 2 )
-    startCircle.isConstruction = True
+    sketch.isComputeDeferred = True
+    try:
+        # Create Start point centered circle and dimension it
+        startCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( line.startSketchPoint, dia1IN * 2.54 / 2 )
+        startCircle.isConstruction = True
 
-    dimDir = adsk.core.Vector2D.create( dia1IN * 2.54 / 5, 0 )
-    rotMatrix = adsk.core.Matrix2D.create()
-    rotMatrix.setToRotation( dimAngleDeg * math.pi / 180, adsk.core.Point2D.create() )
-    dimDir.transformBy( rotMatrix )
-    textPoint = futil.offsetPoint3D( startCircle.centerSketchPoint.geometry, dimDir.x, dimDir.y, 0 )
-    diaDim1 = sketch.sketchDimensions.addDiameterDimension( startCircle, textPoint )
-    diaDim1.value = dia1IN * 2.54
-    # sketch.geometricConstraints.addCoincident( startCircle.centerSketchPoint, line.startSketchPoint )
+        dimDir = adsk.core.Vector2D.create( dia1IN * 2.54 / 5, 0 )
+        rotMatrix = adsk.core.Matrix2D.create()
+        rotMatrix.setToRotation( angleRad, adsk.core.Point2D.create() )
+        dimDir.transformBy( rotMatrix )
+        textPoint = futil.offsetPoint3D( startCircle.centerSketchPoint.geometry, dimDir.x, dimDir.y, 0 )
+        diaDim1 = sketch.sketchDimensions.addDiameterDimension( startCircle, textPoint )
+        diaDim1.value = dia1IN * 2.54
 
-    # Create End point centered circle and dimension it
-    endCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( line.endSketchPoint, dia2IN * 2.54 / 2 )
-    endCircle.isConstruction = True
+        # Create End point centered circle and dimension it
+        endCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( line.endSketchPoint, dia2IN * 2.54 / 2 )
+        endCircle.isConstruction = True
 
-    dimDir = adsk.core.Vector2D.create( dia2IN * 2.54 / 5, 0 )
-    rotMatrix = adsk.core.Matrix2D.create()
-    rotMatrix.setToRotation( dimAngleDeg * math.pi / 180, adsk.core.Point2D.create() )
-    dimDir.transformBy( rotMatrix )
-    textPoint = futil.offsetPoint3D( endCircle.centerSketchPoint.geometry, dimDir.x, dimDir.y, 0 )
-    diaDim2 = sketch.sketchDimensions.addDiameterDimension( endCircle, textPoint )
-    diaDim2.value = dia2IN * 2.54
-    # sketch.geometricConstraints.addCoincident( endCircle.centerSketchPoint, line.endSketchPoint )
+        dimDir = adsk.core.Vector2D.create( dia2IN * 2.54 / 5, 0 )
+        rotMatrix = adsk.core.Matrix2D.create()
+        rotMatrix.setToRotation( angleRad, adsk.core.Point2D.create() )
+        dimDir.transformBy( rotMatrix )
+        textPoint = futil.offsetPoint3D( endCircle.centerSketchPoint.geometry, dimDir.x, dimDir.y, 0 )
+        diaDim2 = sketch.sketchDimensions.addDiameterDimension( endCircle, textPoint )
+        diaDim2.value = dia2IN * 2.54
+    finally:
+        sketch.isComputeDeferred = False
 
     return ([ startCircle, endCircle ], [diaDim1, diaDim2])
 
@@ -242,19 +279,25 @@ def modifyCCLine( ccLine: CCLine ):
 
     ld = ccLine.data
 
+    sketch = ccLine.line.parentSketch
+    sketch.isComputeDeferred = True
     try:
-        ccLine.lengthDim.value = (ld.ccDistIN + ld.ExtraCenterIN) * 2.54
-    except:
-        futil.popup_error( f'Failed to resize centerline to length={(ld.ccDistIN + ld.ExtraCenterIN)}in!  Are both ends of C-C Distance constrained?' )
-        return
+        try:
+            ccLine.lengthDim.value = (ld.ccDistIN + ld.ExtraCenterIN) * 2.54
+        except:
+            sketch.isComputeDeferred = False
+            futil.popup_error( f'Failed to resize centerline to length={(ld.ccDistIN + ld.ExtraCenterIN)}in!  Are both ends of C-C Distance constrained?' )
+            return
 
-    label = createLabelString( ld )
-    ccLine.textBox.text = label
-    ccLine.textBox.height = computeTextSizeIN( ld ) * 2.54
-    ccLine.textHeight.value = ccLine.textBox.height * 2.0
+        label = createLabelString( ld )
+        ccLine.textBox.text = label
+        ccLine.textBox.height = computeTextSizeIN( ld ) * 2.54
+        ccLine.textHeight.value = ccLine.textBox.height * 2.0
 
-    ccLine.PD1Dim.value = ld.PD1 * 2.54
-    ccLine.PD2Dim.value = ld.PD2 * 2.54
-    ccLine.OD1Dim.value = ld.OD1 * 2.54
-    ccLine.OD2Dim.value = ld.OD2 * 2.54
+        ccLine.PD1Dim.value = ld.PD1 * 2.54
+        ccLine.PD2Dim.value = ld.PD2 * 2.54
+        ccLine.OD1Dim.value = ld.OD1 * 2.54
+        ccLine.OD2Dim.value = ld.OD2 * 2.54
+    finally:
+        sketch.isComputeDeferred = False
 

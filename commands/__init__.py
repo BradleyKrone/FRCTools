@@ -4,20 +4,22 @@
 # You need to use aliases (import "entry" as "my_module") assuming you have the default module named "entry".
 from .BoltPattern import entry as BoltPattern
 from .CCDistance import entry as CCDistance
+from .FaceFillet import entry as FaceFillet
 from .FilletXpert import entry as FilletXpert
 from .Lighten import entry as Lighten
-from .TimingBelt import entry as TimingBelt
-from .TimingPulley import entry as TimingPulley
+from .QuickCircle import entry as QuickCircle
+from .PartsGen import entry as PartsGen
 from .Tubify import entry as Tubify
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
     BoltPattern,
     CCDistance,
+    FaceFillet,
     FilletXpert,
     Lighten,
-    TimingBelt,
-    TimingPulley,
+    QuickCircle,
+    PartsGen,
     Tubify
 ]
 

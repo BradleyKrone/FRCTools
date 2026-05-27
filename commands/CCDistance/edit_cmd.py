@@ -80,8 +80,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     swap_cogs = inputs.addBoolValueInput( "swap_cogs", "Swap Cogs", True )
 
-    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 1, 70 )
+    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 30, 300, 5, 70 )
     beltTeeth.isVisible = False
+
+    chainLinks = inputs.addIntegerSpinnerCommandInput( "chain_links", "Chain Links", 20, 400, 2, 60 )
+    chainLinks.isVisible = False
 
     # Create a value input field and set the default using 1 unit of the default length unit.
     defaultLengthUnits = "in"
@@ -91,7 +94,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # Create a separator.
     inputs.addSeparatorCommandInput( "message_sep")
-    status = inputs.addTextBoxCommandInput( "status_msg", "", "status", 1, True )
+    status = inputs.addTextBoxCommandInput( "status_msg", "", "status", 2, True )
 
     status.formattedText = '<div align="center">Select a C-C Distance object.</div>'
     disable_edit_inputs( inputs )
@@ -153,6 +156,7 @@ def edit_command_input_changed(args: adsk.core.InputChangedEventArgs):
     cog2Group: adsk.core.GroupCommandInput = inputs.itemById('use_pinion_cog2')
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     beltTeeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenter: adsk.core.ValueInput = inputs.itemById('extra_center')
     swapCogsInp = inputs.itemById( "swap_cogs" )
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
@@ -164,8 +168,24 @@ def edit_command_input_changed(args: adsk.core.InputChangedEventArgs):
             cog1Group.isVisible = True
             cog2Group.isVisible = True
             beltTeeth.isVisible = False
+            chainLinks.isVisible = False
+        elif motionType.selectedItem.index in (3, 4):
+            # Chain type is selected (#25 or #35)
+            extraCenter.value = 0
+            cog1Teeth.value = 16
+            cog1Teeth.isVisible = True
+            cog1Group.isVisible = False
+            cog1Group.isEnabledCheckBoxChecked = False
+            cog2Teeth.value = 16
+            cog2Teeth.isVisible = True
+            cog2Group.isVisible = False
+            cog2Group.isEnabledCheckBoxChecked = False
+            beltTeeth.isVisible = False
+            if chainLinks.value == 0:
+                chainLinks.value = 60
+            chainLinks.isVisible = True
         else:
-            # Non-gear type is selected
+            # Belt type is selected
             extraCenter.value = 0
             cog1Teeth.isVisible = True
             cog1Group.isVisible = False
@@ -176,6 +196,7 @@ def edit_command_input_changed(args: adsk.core.InputChangedEventArgs):
             if beltTeeth.value == 0 :
                 beltTeeth.value = 70
             beltTeeth.isVisible = True
+            chainLinks.isVisible = False
 
     if changed_input.id == 'curve_selection':
         # Check if nothing is selected and disable if true.
@@ -219,6 +240,7 @@ def disable_edit_inputs( inputs: adsk.core.CommandInputs ):
     cog2Teeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById('cog2_teeth')
     cog2Group: adsk.core.GroupCommandInput = inputs.itemById('use_pinion_cog2')
     beltTeeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenter: adsk.core.ValueInput = inputs.itemById('extra_center')
     swap_cogs = inputs.itemById( "swap_cogs" )
 
@@ -229,6 +251,7 @@ def disable_edit_inputs( inputs: adsk.core.CommandInputs ):
     cog2Teeth.isVisible = False
     cog2Group.isVisible = False
     beltTeeth.isVisible = False
+    chainLinks.isVisible = False
     extraCenter.isVisible = False
     swap_cogs.isVisible = False
 
@@ -244,6 +267,7 @@ def initialize_input_state( inputs: adsk.core.CommandInputs, lineData: CCLine.CC
     cog2Group: adsk.core.GroupCommandInput = inputs.itemById('use_pinion_cog2')
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     beltTeeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenter: adsk.core.ValueInput = inputs.itemById('extra_center')
     swap_cogs = inputs.itemById( "swap_cogs" )
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
@@ -281,22 +305,31 @@ def initialize_input_state( inputs: adsk.core.CommandInputs, lineData: CCLine.CC
 
     if lineData.motion == 0 :
         beltTeeth.isVisible = False
+        chainLinks.isVisible = False
         cog1Group.isVisible = True
         cog2Group.isVisible = True
+    elif lineData.motion in (3, 4):
+        chainLinks.value = lineData.Teeth
+        chainLinks.isVisible = True
+        beltTeeth.isVisible = False
+        cog1Group.isVisible = False
+        cog2Group.isVisible = False
     else:
         beltTeeth.value = lineData.Teeth
         beltTeeth.isVisible = True
+        chainLinks.isVisible = False
         cog1Group.isVisible = False
         cog2Group.isVisible = False
 
     extraCenter.value = lineData.ExtraCenterIN * 2.54
     motionType.listItems.item( lineData.motion ).isSelected = True
 
-    msg = f'<div align="center">{ccutil.createLabelString( lineData )}</div>'
+    ccutil.calcCCLineData( lineData )
+    ccDist = lineData.ccDistIN + lineData.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( lineData )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
 
 
-# This event handler is called when the user clicks the OK button in the command dialog or 
 # is immediately called after the created event not command inputs were created for the dialog.
 def edit_command_execute(args: adsk.core.CommandEventArgs):
 
@@ -317,6 +350,7 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     swapCogs = inputs.itemById( "swap_cogs" ).value
     beltTeethInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinksInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenterInp: adsk.core.ValueInput = inputs.itemById('extra_center')
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
 
@@ -328,7 +362,10 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         return
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
-    ccLine.data.Teeth = int(beltTeethInp.value)
+    if motionType.selectedItem.index in (3, 4):
+        ccLine.data.Teeth = int(chainLinksInp.value)
+    else:
+        ccLine.data.Teeth = int(beltTeethInp.value)
     ccLine.data.N1 = int(cog1TeethInp.value)
     if cog1Group.isEnabledCheckBoxChecked :
         ccLine.data.PIN1 = pinionTeeth[ cog1Pinion.selectedItem.index ]
@@ -369,10 +406,20 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         #     return
         ccutil.modifyCCLine( ccLine )
 
-    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}</div>'
+    ccDist = ccLine.data.ccDistIN + ccLine.data.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
     if not preview :
         CCLine.setCCLineAttributes( ccLine )
+
+    # Rebuild any belt components whose loop length changed due to this CC distance edit.
+    # This runs on both preview and final execute to prevent ghost belt bodies.
+    try:
+        from ..PartsGen.belt_gen import scan_and_rebuild_belts
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        scan_and_rebuild_belts(design)
+    except Exception:
+        pass
 
     # This was needed once debugging output was turned off....
     app.activeViewport.refresh()
@@ -408,12 +455,19 @@ def edit_command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         ld.motion = motionType.selectedItem.index
         ld.N1 = cog1Teeth.value
         ld.N2 = cog2Teeth.value
-        ld.Teeth = beltTeeth.value
+        if motionType.selectedItem.index in (3, 4):
+            chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
+            ld.Teeth = chainLinks.value
+        else:
+            ld.Teeth = beltTeeth.value
         ccutil.calcCCLineData( ld )
 
         if ld.ccDistIN < (ld.OD1 + ld.OD2) / 2.0 :
-            # belt is too short
-            status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
+            # belt/chain is too short
+            if motionType.selectedItem.index in (3, 4):
+                status.formattedText = '<div align="center"><font color="red">Chain is too short!</font></div>'
+            else:
+                status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
             args.areInputsValid = False
             return
 

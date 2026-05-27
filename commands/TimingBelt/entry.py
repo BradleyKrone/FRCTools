@@ -139,9 +139,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
     # Determine if two circles are selected or a pitch loop is selected
     pathCurves = adsk.core.ObjectCollection.create()
     if userSelections[0].objectType == adsk.fusion.SketchCircle.classType():
-        c1 = userSelections[0].geometry
-        c2 = userSelections[1].geometry
-        PitchLoop = createPitchLoopFromCircles( sketch, c1, c2 )
+        # Project the original pitch circles into the belt sketch using sketch.include().
+        # This creates a parametric link so that when the CCDistance sketch is edited
+        # (e.g. a different centre distance), the belt geometry updates automatically.
+        projList1 = sketch.include( userSelections[0] )
+        projList2 = sketch.include( userSelections[1] )
+        circle1_proj = projList1.item(0)
+        circle2_proj = projList2.item(0)
+        PitchLoop = createPitchLoopFromSketchCircles( sketch, circle1_proj, circle2_proj )
 
         futil.log(f'path curves len = {PitchLoop.count}')
         for curve in PitchLoop:
@@ -529,6 +534,22 @@ def createGT2_3mmProfile( parentSketch: adsk.fusion.Sketch ):
 
     return baseLine
 
+def createPitchLoopFromSketchCircles( sketch: adsk.fusion.Sketch,
+                                      circle1: adsk.fusion.SketchCircle,
+                                      circle2: adsk.fusion.SketchCircle ) -> adsk.core.ObjectCollection :
+    """Build the pitch-loop tangent lines and end arcs from already-projected SketchCircle
+    objects.  Unlike createPitchLoopFromCircles, this function does NOT create new circles
+    from snapshot geometry; instead it constrains the tangent geometry directly to the
+    supplied circles so the belt updates when the source sketch is edited."""
+    geoConstraints = sketch.geometricConstraints
+
+    # Circles were projected via sketch.include() — ensure they are construction lines.
+    circle1.isConstruction = True
+    circle2.isConstruction = True
+
+    return _buildPitchLoop( sketch, geoConstraints, circle1, circle2 )
+
+
 def createPitchLoopFromCircles( sketch: adsk.fusion.Sketch, 
                                c1: adsk.core.Circle3D, c2: adsk.core.Circle3D ) -> adsk.core.ObjectCollection :
     geoConstraints = sketch.geometricConstraints
@@ -538,6 +559,13 @@ def createPitchLoopFromCircles( sketch: adsk.fusion.Sketch,
     circle1.isConstruction = True
     circle2 = sketch.sketchCurves.sketchCircles.addByCenterRadius( c2.center, c2.radius )
     circle2.isConstruction = True
+
+    return _buildPitchLoop( sketch, geoConstraints, circle1, circle2 )
+
+
+def _buildPitchLoop( sketch: adsk.fusion.Sketch, geoConstraints,
+                     circle1: adsk.fusion.SketchCircle,
+                     circle2: adsk.fusion.SketchCircle ) -> adsk.core.ObjectCollection :
 
     # Create pitch line curves from two circles
     CLstartPt = futil.toPoint2D( circle1.centerSketchPoint.geometry )
@@ -581,10 +609,6 @@ def createPitchLoopFromCircles( sketch: adsk.fusion.Sketch,
         None
 
     connectedCurves = sketch.findConnectedCurves( tangentLine1 )
-    # curves = []
-    # for curve in connectedCurves:
-    #     curves.append( curve )
-
     return connectedCurves
 
 # Find the anchor line and endpoint on that line to use for the tooth starting point

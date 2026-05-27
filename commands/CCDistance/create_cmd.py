@@ -71,17 +71,36 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     inputs.addBoolValueInput( "swap_cogs", "Swap Cogs", True )
 
-    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 1, 70 )
+    beltTeeth = inputs.addIntegerSpinnerCommandInput( "belt_teeth", "Belt Teeth", 35, 400, 5, 70 )
     beltTeeth.isVisible = False
+
+    chainLinks = inputs.addIntegerSpinnerCommandInput( "chain_links", "Chain Links", 20, 400, 2, 60 )
+    chainLinks.isVisible = False
 
     # Create a value input field and set the default using 1 unit of the default length unit.
     defaultLengthUnits = "in"
     default_value = adsk.core.ValueInput.createByString('0.003')
     inputs.addValueInput('extra_center', 'Extra Center', defaultLengthUnits, default_value)
 
+    # Bearing hole options
+    bearingHoleGroup = inputs.addGroupCommandInput('bearing_hole_group', 'Bearing Holes')
+    bearingHoleGroup.isExpanded = True
+    
+    # Start bearing hole
+    startBearingGroup = bearingHoleGroup.children.addGroupCommandInput('start_bearing_group', 'Start Bearing Hole')
+    startBearingGroup.isEnabledCheckBoxDisplayed = True
+    startBearingGroup.isEnabledCheckBoxChecked = False
+    startBearingSize = startBearingGroup.children.addValueInput('start_bearing_size', 'Diameter', 'in', adsk.core.ValueInput.createByString('1.125 in'))
+    
+    # End bearing hole
+    endBearingGroup = bearingHoleGroup.children.addGroupCommandInput('end_bearing_group', 'End Bearing Hole')
+    endBearingGroup.isEnabledCheckBoxDisplayed = True
+    endBearingGroup.isEnabledCheckBoxChecked = False
+    endBearingSize = endBearingGroup.children.addValueInput('end_bearing_size', 'Diameter', 'in', adsk.core.ValueInput.createByString('1.125 in'))
+
     # Create a separator.
     inputs.addSeparatorCommandInput( "message_sep")
-    inputs.addTextBoxCommandInput( "status_msg", "", "Select", 1, True )
+    inputs.addTextBoxCommandInput( "status_msg", "", "Select", 2, True )
 
     # Connect to the events that are needed by this command.
     futil.add_handler(args.command.execute, command_execute, local_handlers=local_handlers)
@@ -112,7 +131,12 @@ def command_execute(args: adsk.core.CommandEventArgs):
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     swapCogs = inputs.itemById( "swap_cogs" ).value
     beltTeethInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinksInp: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenterInp: adsk.core.ValueInput = inputs.itemById('extra_center')
+    startBearingGroup: adsk.core.GroupCommandInput = inputs.itemById('start_bearing_group')
+    startBearingSizeInp: adsk.core.ValueCommandInput = inputs.itemById('start_bearing_size')
+    endBearingGroup: adsk.core.GroupCommandInput = inputs.itemById('end_bearing_group')
+    endBearingSizeInp: adsk.core.ValueCommandInput = inputs.itemById('end_bearing_size')
     status: adsk.core.TextBoxCommandInput = inputs.itemById('status_msg')
 
     startSketchPt = None
@@ -137,7 +161,10 @@ def command_execute(args: adsk.core.CommandEventArgs):
         ccLine = CCLine.getCCLineFromEntity( ccLine.line )
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
-    ccLine.data.Teeth = int(beltTeethInp.value)
+    if motionType.selectedItem.index in (3, 4):
+        ccLine.data.Teeth = int(chainLinksInp.value)
+    else:
+        ccLine.data.Teeth = int(beltTeethInp.value)
     ccLine.data.N1 = int(cog1TeethInp.value)
     if cog1Group.isEnabledCheckBoxChecked :
         ccLine.data.PIN1 = pinionTeeth[ cog1Pinion.selectedItem.index ]
@@ -178,13 +205,60 @@ def command_execute(args: adsk.core.CommandEventArgs):
         #     return
         ccutil.modifyCCLine( ccLine )
 
-    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}</div>'
+    # Create bearing holes if enabled
+    createBearingHoles(ccLine, startBearingGroup, startBearingSizeInp, endBearingGroup, endBearingSizeInp)
+
+    ccDist = ccLine.data.ccDistIN + ccLine.data.ExtraCenterIN
+    msg = f'<div align="center">{ccutil.createLabelString( ccLine.data )}<br>Center Distance: {ccDist:.4f} in</div>'
     status.formattedText = msg
     if not preview :
         CCLine.setCCLineAttributes( ccLine )
 
     # This was needed once debugging output was turned off....
     app.activeViewport.refresh()
+
+
+def createBearingHoles(ccLine, startBearingGroup, startBearingSizeInp, endBearingGroup, endBearingSizeInp):
+    """Create bearing holes at the center points of the CCLine (independently controlled)"""
+    try:
+        if ccLine.line is None:
+            return
+            
+        sketch = ccLine.line.parentSketch
+        if sketch is None:
+            return
+            
+        # Get the start and end points of the CCLine
+        startPt = ccLine.line.startSketchPoint
+        endPt = ccLine.line.endSketchPoint
+        
+        from ...lib import fusionAddInUtils as futil
+        
+        # Create start bearing hole if enabled
+        if startBearingGroup.isEnabledCheckBoxChecked:
+            startDiameter = startBearingSizeInp.value
+            startBearingHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(startPt, startDiameter / 2)
+            startBearingHole.isConstruction = False
+            
+            # Dimension for start bearing hole
+            textPt1 = futil.offsetPoint3D(startPt.geometry, startDiameter/4, startDiameter/4, 0)
+            startDim = sketch.sketchDimensions.addDiameterDimension(startBearingHole, textPt1)
+            startDim.value = startDiameter
+        
+        # Create end bearing hole if enabled
+        if endBearingGroup.isEnabledCheckBoxChecked:
+            endDiameter = endBearingSizeInp.value
+            endBearingHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(endPt, endDiameter / 2)
+            endBearingHole.isConstruction = False
+            
+            # Dimension for end bearing hole
+            textPt2 = futil.offsetPoint3D(endPt.geometry, -endDiameter/4, endDiameter/4, 0)
+            endDim = sketch.sketchDimensions.addDiameterDimension(endBearingHole, textPt2)
+            endDim.value = endDiameter
+        
+    except Exception as e:
+        # Log error but don't fail the command
+        futil.log(f'Error creating bearing holes: {str(e)}')
 
 
 # This event handler is called when the command needs to compute a new preview in the graphics window.
@@ -213,6 +287,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     cog2Group: adsk.core.GroupCommandInput = inputs.itemById('use_pinion_cog2')
     cog2Pinion: adsk.core.DropDownCommandInput = inputs.itemById('pinion_cog2')
     beltTeeth: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "belt_teeth" )
+    chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
     extraCenter: adsk.core.ValueInput = inputs.itemById('extra_center')
     requireSelectionInp = inputs.itemById( "require_selection" )
 
@@ -223,8 +298,24 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             cog1Group.isVisible = True
             cog2Group.isVisible = True
             beltTeeth.isVisible = False
+            chainLinks.isVisible = False
+        elif motionType.selectedItem.index in (3, 4):
+            # Chain type is selected (#25 or #35)
+            extraCenter.value = 0
+            cog1Teeth.value = 16
+            cog1Teeth.isVisible = True
+            cog1Group.isVisible = False
+            cog1Group.isEnabledCheckBoxChecked = False
+            cog2Teeth.value = 16
+            cog2Teeth.isVisible = True
+            cog2Group.isVisible = False
+            cog2Group.isEnabledCheckBoxChecked = False
+            beltTeeth.isVisible = False
+            if chainLinks.value == 0:
+                chainLinks.value = 60
+            chainLinks.isVisible = True
         else:
-            # Non-gear type is selected
+            # Belt type is selected
             extraCenter.value = 0
             cog1Teeth.isVisible = True
             cog1Group.isVisible = False
@@ -235,6 +326,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             if beltTeeth.value == 0 :
                 beltTeeth.value = 70
             beltTeeth.isVisible = True
+            chainLinks.isVisible = False
 
 
     if changed_input.id == 'require_selection':
@@ -296,12 +388,19 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         ld.motion = motionType.selectedItem.index
         ld.N1 = cog1Teeth.value
         ld.N2 = cog2Teeth.value
-        ld.Teeth = beltTeeth.value
+        if motionType.selectedItem.index == 3:
+            chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
+            ld.Teeth = chainLinks.value
+        else:
+            ld.Teeth = beltTeeth.value
         ccutil.calcCCLineData( ld )
 
         if ld.ccDistIN < (ld.OD1 + ld.OD2) / 2.0 :
-            # belt is too short
-            status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
+            # belt/chain is too short
+            if motionType.selectedItem.index == 3:
+                status.formattedText = '<div align="center"><font color="red">Chain is too short!</font></div>'
+            else:
+                status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'
             args.areInputsValid = False
             return
 
