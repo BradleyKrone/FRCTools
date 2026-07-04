@@ -247,7 +247,8 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
                     edge_offset_cm: float,
                     is_fill: bool,
                     custom_count: int,
-                    skip_first: bool = False):
+                    skip_first: bool = False,
+                    is_preview: bool = False):
     """Cut one row of holes starting near `corner_pt`, running along `dir_vec`,
     offset `HOLE_OFFSET_CM` from the corner (longitudinal) and `edge_offset_cm`
     from the *other* edge of the pair (perpendicular, along `ref_dir_vec`).
@@ -261,7 +262,13 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
     `skip_first` is set when this row's natural corner hole would coincide with
     the *other* row's corner hole in a "Both Edges" pair (they share that one
     corner hole) — the row then starts one pitch (1 in) further along and its
-    count is reduced by one, since the corner hole already exists."""
+    count is reduced by one, since the corner hole already exists.
+
+    `is_preview` builds a lightweight version: the seed hole is placed by
+    coordinate only, and all sketch dimensions plus the live-length parameter
+    link are skipped. Dimension solving and parameter-expression recomputes are
+    the expensive, flicker-inducing steps, and they aren't needed for a preview
+    that Fusion rolls back on the next edit — they're only done on execute."""
     start_offset_in = 0.5 + (1.0 if skip_first else 0.0)
     start_offset_cm = start_offset_in * IN_TO_CM
 
@@ -288,17 +295,20 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
 
     circle = sketch.sketchCurves.sketchCircles.addByCenterRadius(center, hole_diam_cm / 2.0)
 
-    textPt = futil.offsetPoint3D(circle.centerSketchPoint.geometry, 0.1, 0.1, 0)
-    diamDim = sketch.sketchDimensions.addDiameterDimension(circle, textPt)
-    diamDim.value = hole_diam_cm
+    # Dimensioning (below) is the expensive part — skip it entirely for preview,
+    # where the hole only needs to be shown, not permanently constrained.
+    if not is_preview:
+        textPt = futil.offsetPoint3D(circle.centerSketchPoint.geometry, 0.1, 0.1, 0)
+        diamDim = sketch.sketchDimensions.addDiameterDimension(circle, textPt)
+        diamDim.value = hole_diam_cm
 
-    # Pin the hole's position with real driving dimensions off the actual edges,
-    # rather than leaving it floating at a fixed sketch coordinate.
-    perpDim = sketch.sketchDimensions.addOffsetDimension(own_line, circle.centerSketchPoint, corner_pt)
-    perpDim.value = edge_offset_cm
+        # Pin the hole's position with real driving dimensions off the actual edges,
+        # rather than leaving it floating at a fixed sketch coordinate.
+        perpDim = sketch.sketchDimensions.addOffsetDimension(own_line, circle.centerSketchPoint, corner_pt)
+        perpDim.value = edge_offset_cm
 
-    longDim = sketch.sketchDimensions.addOffsetDimension(other_line, circle.centerSketchPoint, corner_pt)
-    longDim.value = start_offset_cm
+        longDim = sketch.sketchDimensions.addOffsetDimension(other_line, circle.centerSketchPoint, corner_pt)
+        longDim.value = start_offset_cm
 
     # Construction line along the pattern direction, used by the rectangular pattern.
     line_len_cm = length_in * IN_TO_CM + 5.0
@@ -361,7 +371,7 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
     # the formula at creation time. Note: Fusion's expression parser separates
     # function arguments with ';', not ','. On any failure we keep the literal
     # count silently — the holes are still correct, just not auto-updating.
-    if is_fill:
+    if is_fill and not is_preview:
         try:
             length_param = _length_param_name(sketch, own_line)
             if length_param is not None:
@@ -391,7 +401,8 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
                        edge_offset_cm: float,
                        both_edges: bool,
                        is_fill: bool,
-                       custom_count: int):
+                       custom_count: int,
+                       is_preview: bool = False):
     try:
         if not isinstance(edgeA.geometry, adsk.core.Line3D) or not isinstance(edgeB.geometry, adsk.core.Line3D):
             futil.log(f'{CMD_NAME}: edge pair is not linear, skipping')
@@ -461,7 +472,8 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
 
         try:
             _build_hole_row(sketch, body, corner_pt, dirA, perpA, lineA, lineB, lengthA_in,
-                            hole_diam_cm, edge_offset_cm, is_fill, custom_count)
+                            hole_diam_cm, edge_offset_cm, is_fill, custom_count,
+                            is_preview=is_preview)
         except Exception:
             futil.handle_error(f'{CMD_NAME} _process_edge_pair (primary row)', show_message_box=True)
 
@@ -469,7 +481,7 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
             try:
                 _build_hole_row(sketch, body, corner_pt, dirB, perpB, lineB, lineA, lengthB_in,
                                 hole_diam_cm, edge_offset_cm, is_fill, custom_count,
-                                skip_first=both_corners_collide)
+                                skip_first=both_corners_collide, is_preview=is_preview)
             except Exception:
                 futil.handle_error(f'{CMD_NAME} _process_edge_pair (second row)', show_message_box=True)
 
@@ -477,7 +489,7 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
         futil.handle_error(f'{CMD_NAME} _process_edge_pair', show_message_box=True)
 
 
-def _run(inputs: adsk.core.CommandInputs):
+def _run(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     edgeSel:        adsk.core.SelectionCommandInput = inputs.itemById('edge_selection')
     rowPlacementInp: adsk.core.DropDownCommandInput = inputs.itemById('row_placement')
     edgeOffsetInp:  adsk.core.ValueCommandInput     = inputs.itemById('edge_offset')
@@ -497,16 +509,19 @@ def _run(inputs: adsk.core.CommandInputs):
 
     for i in range(0, len(entities) - 1, 2):
         _process_edge_pair(entities[i], entities[i + 1], hole_diam_cm, edge_offset_cm,
-                           both_edges, is_fill, custom_count)
+                           both_edges, is_fill, custom_count, is_preview=is_preview)
 
-    _group_timeline_features(design, start_marker, CMD_NAME)
+    # Timeline grouping triggers a recompute and only matters for the committed
+    # result — skip it during preview.
+    if not is_preview:
+        _group_timeline_features(design, start_marker, CMD_NAME)
 
 
 # Called when the user clicks OK.
 def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Execute Event')
     try:
-        _run(args.command.commandInputs)
+        _run(args.command.commandInputs, is_preview=False)
     except Exception:
         futil.handle_error(f'{CMD_NAME} command_execute', show_message_box=True)
 
@@ -515,8 +530,11 @@ def command_execute(args: adsk.core.CommandEventArgs):
 def command_preview(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Preview Event')
     try:
-        _run(args.command.commandInputs)
-        args.isValidResult = True
+        _run(args.command.commandInputs, is_preview=True)
+        # Leave isValidResult False so Fusion discards this lightweight preview
+        # and re-runs command_execute for the full, dimensioned/parametric result
+        # on OK — rather than reusing the stripped-down preview geometry.
+        args.isValidResult = False
     except Exception:
         futil.handle_error(f'{CMD_NAME} command_preview', show_message_box=False)
 
