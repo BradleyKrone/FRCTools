@@ -10,6 +10,7 @@ from .Lighten import entry as Lighten
 from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
 from .Tubify import entry as Tubify
+from .AutoHole import entry as AutoHole
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
@@ -20,7 +21,8 @@ commands = [
     Lighten,
     QuickCircle,
     PartsGen,
-    Tubify
+    Tubify,
+    AutoHole
 ]
 
 
