@@ -1,7 +1,9 @@
 import adsk.core
 import adsk.fusion
+import datetime
 import math
 import os
+import traceback
 from ...lib import fusionAddInUtils as futil
 from ... import config
 
@@ -22,6 +24,11 @@ ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resource
 # Local list of event handlers used to maintain a reference so
 # they are not released and garbage collected.
 local_handlers = []
+
+# Written fresh every run (preview or execute) with a full trace of what the
+# command did, so behavior can be inspected after the fact without relying on
+# Fusion's Text Command window (which requires config.DEBUG and scrolls away).
+DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'debug_log.txt')
 
 # ---------------------------------------------------------------------------
 # Units / constants
@@ -176,6 +183,28 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _dbg_reset(is_preview: bool):
+    """Start a fresh debug_log.txt for this run — overwrites the previous run's
+    log so the file always reflects only the most recent _run() call."""
+    try:
+        with open(DEBUG_LOG_PATH, 'w', encoding='utf-8') as f:
+            f.write(f'=== {CMD_NAME} run {datetime.datetime.now().isoformat(timespec="seconds")} '
+                    f'(preview={is_preview}) ===\n')
+    except Exception:
+        pass
+
+
+def _dbg(message: str):
+    """Log to both Fusion's Text Command window (futil.log) and debug_log.txt,
+    so a full trace of the run is always available on disk to inspect afterward."""
+    futil.log(message)
+    try:
+        with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(message + '\n')
+    except Exception:
+        pass
+
+
 def _resolve_hole_diam_cm(inputs: adsk.core.CommandInputs) -> float:
     holeSizeInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
     if holeSizeInp.selectedItem.name == HOLE_CUSTOM:
@@ -282,16 +311,21 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
     else:
         count = max(0, custom_count - (1 if skip_first else 0))
 
+    _dbg(f'{CMD_NAME}:   _build_hole_row length_in={length_in:.4f} skip_first={skip_first} '
+         f'is_fill={is_fill} custom_count={custom_count} -> count={count}, '
+         f'start_offset_cm={start_offset_cm:.4f}')
+
     if count <= 0:
-        futil.log(f'{CMD_NAME}: no additional holes needed for this row (shared corner hole), skipping')
+        _dbg(f'{CMD_NAME}:   no additional holes needed for this row (shared corner hole), skipping')
         return
     if length_in * IN_TO_CM <= start_offset_cm:
-        futil.log(f'{CMD_NAME}: edge too short for the required start offset, skipping row')
+        _dbg(f'{CMD_NAME}:   edge too short for the required start offset, skipping row')
         return
 
     comp = body.parentComponent
 
     center = _seed_center(corner_pt, dir_vec, ref_dir_vec, start_offset_cm, edge_offset_cm)
+    _dbg(f'{CMD_NAME}:   seed center={futil.format_Point3D(center)}, hole_diam_cm={hole_diam_cm:.4f}')
 
     circle = sketch.sketchCurves.sketchCircles.addByCenterRadius(center, hole_diam_cm / 2.0)
 
@@ -337,16 +371,32 @@ def _build_hole_row(sketch: adsk.fusion.Sketch,
             seed_profile = profile
             best_dist_sq = dist_sq
 
+    _dbg(f'{CMD_NAME}:   sketch has {sketch.profiles.count} profiles total, holeArea={holeArea:.6f}')
+
     if seed_profile is None:
-        futil.log(f'{CMD_NAME}: seed profile not found for row, skipping')
+        _dbg(f'{CMD_NAME}:   seed profile not found for row (no profile matched area/centroid), skipping')
         return
+
+    _dbg(f'{CMD_NAME}:   seed profile found, dist_sq from target center={best_dist_sq:.6f}')
 
     extrudes = comp.features.extrudeFeatures
     cutInput = extrudes.createInput(seed_profile, adsk.fusion.FeatureOperations.CutFeatureOperation)
     cutExtent = adsk.fusion.ThroughAllExtentDefinition.create()
     cutInput.setOneSideExtent(cutExtent, adsk.fusion.ExtentDirections.NegativeExtentDirection)
     cutInput.participantBodies = [body]
-    seed_cut = extrudes.add(cutInput)
+    try:
+        seed_cut = extrudes.add(cutInput)
+    except RuntimeError as err:
+        # The seed hole's profile can fall outside the body's remaining material
+        # when it lands on/overlaps a hole already cut by another row (e.g. two
+        # rows converging from different, non-shared edges). That's an expected
+        # geometric collision, not a bug — skip this row quietly instead of
+        # surfacing a crash-looking error dialog. Logged in full either way so the
+        # cause is visible in debug_log.txt if it's actually something else.
+        _dbg(f'{CMD_NAME}:   seed extrude FAILED, skipping row. Error: {err}')
+        return
+    else:
+        _dbg(f'{CMD_NAME}:   seed extrude OK')
 
     # Create the pattern with a plain integer count first — a literal quantity
     # always succeeds, so the holes are placed regardless of whether the live
@@ -402,16 +452,18 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
                        both_edges: bool,
                        is_fill: bool,
                        custom_count: int,
+                       processed_edges: set,
                        is_preview: bool = False):
+    _dbg(f'{CMD_NAME}: edgeA.entityToken={edgeA.entityToken}, edgeB.entityToken={edgeB.entityToken}')
     try:
         if not isinstance(edgeA.geometry, adsk.core.Line3D) or not isinstance(edgeB.geometry, adsk.core.Line3D):
-            futil.log(f'{CMD_NAME}: edge pair is not linear, skipping')
+            _dbg(f'{CMD_NAME}: edge pair is not linear, skipping')
             return
 
         facesB = list(edgeB.faces)
         common = [f for f in edgeA.faces if any(f.entityToken == g.entityToken for g in facesB)]
         if not common:
-            futil.log(f'{CMD_NAME}: edge pair does not share a common face, skipping')
+            _dbg(f'{CMD_NAME}: edge pair does not share a common face, skipping')
             return
         target_face = common[0] if len(common) == 1 else max(common, key=lambda f: f.area)
 
@@ -424,7 +476,7 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
         lineA_col = sketch.project(edgeA)
         lineB_col = sketch.project(edgeB)
         if lineA_col.count == 0 or lineB_col.count == 0:
-            futil.log(f'{CMD_NAME}: failed to project edge(s) into sketch, skipping pair')
+            _dbg(f'{CMD_NAME}: failed to project edge(s) into sketch, skipping pair')
             return
         lineA: adsk.fusion.SketchLine = lineA_col.item(0)
         lineB: adsk.fusion.SketchLine = lineB_col.item(0)
@@ -447,12 +499,14 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
             dirB = futil.multVector2D(dirB, -1.0)
 
         if corner is None:
-            futil.log(f'{CMD_NAME}: selected edges do not share a vertex, skipping pair')
+            _dbg(f'{CMD_NAME}: selected edges do not share a vertex, skipping pair')
             return
 
         lengthA_in = lineA.length / IN_TO_CM
         lengthB_in = lineB.length / IN_TO_CM
         corner_pt = corner.geometry
+        _dbg(f'{CMD_NAME}: corner={futil.format_Point3D(corner_pt)}, lengthA_in={lengthA_in:.4f}, '
+             f'lengthB_in={lengthB_in:.4f}, both_edges={both_edges}')
 
         # True perpendiculars to each edge, oriented toward the other edge's side —
         # correct regardless of the angle at which the two edges meet.
@@ -469,23 +523,43 @@ def _process_edge_pair(edgeA: adsk.fusion.BRepEdge,
             centerB = _seed_center(corner_pt, dirB, perpB, HOLE_OFFSET_CM, edge_offset_cm)
             dist = math.hypot(centerA.x - centerB.x, centerA.y - centerB.y)
             both_corners_collide = dist < hole_diam_cm
+            _dbg(f'{CMD_NAME}: corner-hole dist={dist:.4f} vs hole_diam_cm={hole_diam_cm:.4f} '
+                 f'-> both_corners_collide={both_corners_collide}')
 
-        try:
-            _build_hole_row(sketch, body, corner_pt, dirA, perpA, lineA, lineB, lengthA_in,
-                            hole_diam_cm, edge_offset_cm, is_fill, custom_count,
-                            is_preview=is_preview)
-        except Exception:
-            futil.handle_error(f'{CMD_NAME} _process_edge_pair (primary row)', show_message_box=True)
+        # An edge can belong to two different selected corner pairs (e.g. all 4
+        # corners of a rectangular plate selected for a full perimeter — each edge
+        # is shared by its two adjoining corners). Cutting a row for it twice makes
+        # the second row's holes collide with the first row's already-cut holes,
+        # which fails the seed extrude ("profile falls outside the boundary of the
+        # body"). Track edges already given a row (by entityToken) across the whole
+        # run and skip re-processing one.
+        if edgeA.entityToken in processed_edges:
+            _dbg(f'{CMD_NAME}: primary edge already has a hole row from another pair, skipping')
+        else:
+            processed_edges.add(edgeA.entityToken)
+            try:
+                _build_hole_row(sketch, body, corner_pt, dirA, perpA, lineA, lineB, lengthA_in,
+                                hole_diam_cm, edge_offset_cm, is_fill, custom_count,
+                                is_preview=is_preview)
+            except Exception:
+                _dbg(f'{CMD_NAME}: EXCEPTION building primary row:\n{traceback.format_exc()}')
+                futil.handle_error(f'{CMD_NAME} _process_edge_pair (primary row)', show_message_box=True)
 
         if both_edges:
-            try:
-                _build_hole_row(sketch, body, corner_pt, dirB, perpB, lineB, lineA, lengthB_in,
-                                hole_diam_cm, edge_offset_cm, is_fill, custom_count,
-                                skip_first=both_corners_collide, is_preview=is_preview)
-            except Exception:
-                futil.handle_error(f'{CMD_NAME} _process_edge_pair (second row)', show_message_box=True)
+            if edgeB.entityToken in processed_edges:
+                _dbg(f'{CMD_NAME}: secondary edge already has a hole row from another pair, skipping')
+            else:
+                processed_edges.add(edgeB.entityToken)
+                try:
+                    _build_hole_row(sketch, body, corner_pt, dirB, perpB, lineB, lineA, lengthB_in,
+                                    hole_diam_cm, edge_offset_cm, is_fill, custom_count,
+                                    skip_first=both_corners_collide, is_preview=is_preview)
+                except Exception:
+                    _dbg(f'{CMD_NAME}: EXCEPTION building second row:\n{traceback.format_exc()}')
+                    futil.handle_error(f'{CMD_NAME} _process_edge_pair (second row)', show_message_box=True)
 
     except Exception:
+        _dbg(f'{CMD_NAME}: EXCEPTION in _process_edge_pair:\n{traceback.format_exc()}')
         futil.handle_error(f'{CMD_NAME} _process_edge_pair', show_message_box=True)
 
 
@@ -504,17 +578,30 @@ def _run(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
     entities = [edgeSel.selection(i).entity for i in range(edgeSel.selectionCount)]
 
+    _dbg_reset(is_preview)
+    _dbg(f'{CMD_NAME}: {len(entities)} edges selected ({len(entities) // 2} pairs), '
+         f'hole_diam_cm={hole_diam_cm:.4f}, edge_offset_cm={edge_offset_cm:.4f}, '
+         f'both_edges={both_edges}, is_fill={is_fill}, custom_count={custom_count}')
+
     design       = adsk.fusion.Design.cast(app.activeProduct)
     start_marker = design.timeline.markerPosition
 
+    # Shared across all pairs in this run so an edge already given a row (e.g. by
+    # an adjoining corner's pair) isn't processed again — see _process_edge_pair.
+    processed_edges = set()
+
     for i in range(0, len(entities) - 1, 2):
+        _dbg(f'{CMD_NAME}: --- pair {i // 2} ---')
         _process_edge_pair(entities[i], entities[i + 1], hole_diam_cm, edge_offset_cm,
-                           both_edges, is_fill, custom_count, is_preview=is_preview)
+                           both_edges, is_fill, custom_count, processed_edges,
+                           is_preview=is_preview)
 
     # Timeline grouping triggers a recompute and only matters for the committed
     # result — skip it during preview.
     if not is_preview:
         _group_timeline_features(design, start_marker, CMD_NAME)
+
+    _dbg(f'{CMD_NAME}: run complete')
 
 
 # Called when the user clicks OK.

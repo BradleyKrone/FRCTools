@@ -1,0 +1,17 @@
+=== AutoHole run 2026-07-04T12:06:49 (preview=False) ===
+AutoHole: 2 edges selected (1 pairs), hole_diam_cm=0.7541, edge_offset_cm=1.2700, both_edges=True, is_fill=True, custom_count=0
+AutoHole: --- pair 0 ---
+AutoHole: edgeA.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OPQ7CMAyF4RLMvkAk2/lpegBY2Fmr0KaIDSFOwhmQmBADE+dgY4WD4KQdoMWxlM/PT7YRGFAeyU8dsRciMElxMJ1dn6fj8n25vzw9bmdxMGgHWDKagpyydROVIWPV2sZWBfS+xWB0WcTslRmTQeR9CHmdAQ1MUmhBAkmb20TeZcinDRUzUty3ghCbTaz2sd7uYtWEQ4A5eFDUJ8NCSkyYoNdWnUX/aSbgBGn2j0+PfNj7PhSgMKpbAQAA, edgeB.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OPQ7CMAyF4RLMvkAk2/lpegBY2Fmr0KaIDSFOwhmQmBADE+dgY4WD4KQdoDSx5M/PL3YQGFAuSaaO2AsRmKQ4mM6uz9Nx+b7cX54et7M4GLQDLBlNQU7ZuonKkLFqbWOrAnrfYjC6LGL2yozJ4OR9CHmdAQ1MUmhBAgmX20S+g/y1oWL/FP2tIMRmE6t9rLe7WDXhEGAOHhT1wbCQEhMm6LVVZ9EjzQScIM0e9+mfB+L7ALKknChbAQAA
+AutoHole: corner=(0.0,0.0,0.0), lengthA_in=10.0000, lengthB_in=15.2000, both_edges=True
+AutoHole: corner-hole dist=0.0000 vs hole_diam_cm=0.7541 -> both_corners_collide=True
+AutoHole:   _build_hole_row length_in=10.0000 skip_first=False is_fill=True custom_count=0 -> count=10, start_offset_cm=1.2700
+AutoHole:   seed center=(-1.27,1.27,0.0), hole_diam_cm=0.7541
+AutoHole:   sketch has 25 profiles total, holeArea=0.446585
+AutoHole:   seed profile found, dist_sq from target center=0.000000
+AutoHole:   seed extrude FAILED, skipping row. Error: 3 : EXTRUDE_CREATION_FAIL_ERROR - Cannot complete extrusion. / EXTRUDE_BOOLEAN_FAIL - Cannot extend extrusion to object. The extrusion profile falls outside the boundary of the selected body. Select a face or plane instead, or adjust the profile so that it falls inside the boundary of the selected body.
+AutoHole:   _build_hole_row length_in=15.2000 skip_first=True is_fill=True custom_count=0 -> count=14, start_offset_cm=3.8100
+AutoHole:   seed center=(-1.27,3.81,0.0), hole_diam_cm=0.7541
+AutoHole:   sketch has 26 profiles total, holeArea=0.446585
+AutoHole:   seed profile found, dist_sq from target center=0.000000
+AutoHole:   seed extrude OK
+AutoHole: run complete
