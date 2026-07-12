@@ -36,25 +36,6 @@ image::BoltPatternCreate.png[]
 
 == Solid Tab Tools
 
-=== Timing Belt Tool image:icons/TimingBelt.png['Timing Belt', 30]
-TIP: kbd:[Solid Tab] menu:Create[FRCTools > Extrude Timing Belt]
-
-This tool generates Timing Belt solids from a C-C Distance input or alternatively from two pitch circles.  A simpliflied preview is used to speed up the UI response time.  The resulting solid body is not referenced to the C-C sketch geometry as this made the UI laggy and unresponsive.
-
-.Preview of the solid to be created by the Timing Belt tool
-image::TimingBeltPreview.png[]
-
-.Complete Timing Belt
-image::TimingBeltDone.png[]
-
-== Timing Pulley Tool image:icons/TimingPulley.png['Timing Pulley', 30]
-TIP: kbd:[Solid Tab] menu:Create[FRCTools > Timing Pulley]
-
-This tool creates very simple HTD 5mm or GT2 3mm timing pulley shapes.  It does not add flanges or center bores.
-
-image::TimingPulleyCreate.png[]
-
-
 == Tubify Tool image:icons/Tubify.png['Tubify', 30]
 TIP: kbd:[Solid Tab] menu:Create[FRCTools > Tubify Solid]
 

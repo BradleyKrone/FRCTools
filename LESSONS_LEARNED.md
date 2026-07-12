@@ -23,6 +23,12 @@ session.
 
 ## Lessons
 
+### Python silently keeps only the last def when a function is defined twice
+`geom_utils.py` had two `addPoint2D`/`lineNormal` defs (overload-style); Python has no overloading,
+so the first def is dead and callers may hit the wrong signature. **Fix:** one def per name; with
+no linter in this repo, grep for `def <name>` before adding a "new" helper to a futil module.
+`lib/fusionAddInUtils/geom_utils.py`
+
 ### Log the caught exception text whenever an except turns into a silent skip
 Swallowing an error with `except RuntimeError: return` (no logging) makes an *expected* skip
 (e.g. two hole rows colliding) indistinguishable from a real bug eating every result. **Fix:**
