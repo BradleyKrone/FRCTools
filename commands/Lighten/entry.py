@@ -88,9 +88,6 @@ def stop():
     if command_definition:
         command_definition.deleteMe()
 
-    global ui_handlers
-    ui_handlers = []
-
 # Function that is called when a user clicks the corresponding button in the UI.
 # This defines the contents of the command dialog and connects to the command related events.
 def command_created(args: adsk.core.CommandCreatedEventArgs):
@@ -347,7 +344,6 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers
     local_handlers = []
 
-# def offsetProfile( solid: adsk.fusion.BRepBody, profile: LightenProfile ) :
 def offsetProfile( profile: LightenProfile ) :
 
     # Create a temporary sketch

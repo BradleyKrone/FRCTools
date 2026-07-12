@@ -187,7 +187,6 @@ def command_execute(args: adsk.core.CommandEventArgs):
 def tubifySolid( tubifyInfo: TubifyParams ) :
 
     orientedBB = tubifyInfo.solid.orientedMinimumBoundingBox
-    # futil.print_OrientedBB( orientedBB )
     longLength = orientedBB.height
     if orientedBB.width > longLength:
         longLength = orientedBB.width
@@ -244,9 +243,6 @@ def tubifySolid( tubifyInfo: TubifyParams ) :
         otherWideSideFaces.add( wideSideFaces.item(3) )
         wideSideFaces.removeByIndex( 1 )
         wideSideFaces.removeByIndex( 2 ) # 3 becomes 2
-
-    # futil.log( f'Found {len(wideSideFaces)} wide side Faces, {len(otherWideSideFaces)} other wide faces, and {len(narrowSideFaces)} narrow side Faces.')
-
 
     # Obtain the component of the solid body
     workingComp = tubifyInfo.solid.parentComponent
@@ -349,8 +345,6 @@ def createHoleProfiles(
     sketchEdges = adsk.core.ObjectCollection.create()
     for edge in sideFaces.item(0).edges :
         sketchEdges.add( sketch.project( edge ).item(0) )
-    
-    # futil.print_SketchObjectCollection( sketchEdges )
 
     longEdge: adsk.fusion.SketchLine = sketchEdges.item(0)
     shortEdge: adsk.fusion.SketchLine = sketchEdges.item(1)
@@ -366,26 +360,19 @@ def createHoleProfiles(
     if longEdge.startSketchPoint.geometry.isEqualTo( shortEdge.startSketchPoint.geometry ) :
         # Set the corner point, unit vectors are correct.
         cornerPoint = longEdge.startSketchPoint
-        # futil.log( f'longEdge Start is shortEdge Start.')
     elif longEdge.startSketchPoint.geometry.isEqualTo( shortEdge.endSketchPoint.geometry ) :
         # Set the corner point, se unit vector is flipped.
         cornerPoint = longEdge.startSketchPoint
         seUnitVec = futil.multVector2D( seUnitVec, -1.0 )
-        # futil.log( f'longEdge Start is shortEdge End.')
     elif longEdge.endSketchPoint.geometry.isEqualTo( shortEdge.startSketchPoint.geometry ) :
         # Set the corner point, le unit vector is flipped.
         cornerPoint = longEdge.endSketchPoint
         leUnitVec = futil.multVector2D( leUnitVec, -1.0 )
-        # futil.log( f'longEdge End is shortEdge Start.')
     elif longEdge.endSketchPoint.geometry.isEqualTo( shortEdge.endSketchPoint.geometry ) :
         # Set the corner point, both unit vectors are flipped.
         cornerPoint = longEdge.endSketchPoint
         leUnitVec = futil.multVector2D( leUnitVec, -1.0 )
         seUnitVec = futil.multVector2D( seUnitVec, -1.0 )
-        # futil.log( f'longEdge End is shortEdge End.')
-        # futil.print_SketchCurve( longEdge )
-        # futil.print_SketchCurve( shortEdge )
-        # futil.log( f'leUnitVec= {futil.format_Vector2D(leUnitVec)}, seUnitVec= {futil.format_Vector2D(seUnitVec)}')
     else:
         # We should never get here!!!
         futil.print_Point3D( longEdge.startSketchPoint.geometry, "longEdge start: ")
@@ -402,8 +389,6 @@ def createHoleProfiles(
     else :
         LengthOffsetIn = tubifyInfo.end_offset
 
-    # futil.log( f'hs={tubifyInfo.config.hole_spacing} off={tubifyInfo.end_offset}, dia={tubifyInfo.config.hole_diameter}')
-    # futil.log( f'LengthOffset={LengthOffsetIn}')
     # Create the corner hole to use as the rectangular pattern
     holeDiameter = tubifyInfo.config.hole_diameter * 2.54
     if LengthOffsetIn > 0 :
@@ -415,8 +400,6 @@ def createHoleProfiles(
         diag.add( seUnitVec )
         holeCenterPt = adsk.core.Point3D.create( diag.x, diag.y, 0 )
     holeCenterPt = futil.addPoint3D( holeCenterPt, cornerPoint.geometry )
-    # futil.log( f' -------- Corner Hole center point:::')
-    # futil.print_Point3D( holeCenterPt )
     cornerHole = sketch.sketchCurves.sketchCircles.addByCenterRadius( holeCenterPt, holeDiameter / 2 )
     textPoint = futil.offsetPoint3D( cornerHole.centerSketchPoint.geometry, 0.1, 0.1, 0 )
     diamDim = sketch.sketchDimensions.addDiameterDimension( cornerHole, textPoint )
@@ -428,12 +411,6 @@ def createHoleProfiles(
         longEdge, cornerHole.centerSketchPoint, textPoint )
     widthDim.value = 0.5 * 2.54
 
-    # horizDim = sketch.sketchDimensions.addDistanceDimension( 
-    #     cornerHole.centerSketchPoint, cornerPoint, 
-    #     adsk.fusion.DimensionOrientations.HorizontalDimensionOrientation, textPoint )
-    # horizDim.value = 0.5 * 2.54
-
-
     # Either create the length direction dimension of make the center
     # coincident with the end line if the offset is zero.
     if abs( LengthOffsetIn ) < 0.001 :
@@ -443,10 +420,6 @@ def createHoleProfiles(
         lengthDim = sketch.sketchDimensions.addOffsetDimension( 
             shortEdge, cornerHole.centerSketchPoint, textPoint )
         lengthDim.value = abs(LengthOffsetIn * 2.54)
-        # vertDim = sketch.sketchDimensions.addDistanceDimension( 
-        #     cornerHole.centerSketchPoint, cornerPoint, 
-        #     adsk.fusion.DimensionOrientations.VerticalDimensionOrientation, textPoint )
-        # vertDim.value = dimValue
 
     # Create the rectangular pattern
     rectPattern = sketch.geometricConstraints.createRectangularPatternInput( 
@@ -479,9 +452,6 @@ def createHoleProfiles(
     sketch.geometricConstraints.addRectangularPattern( rectPattern )
 
     holeArea = holeDiameter * holeDiameter * math.pi / 4.0
-
-    # for p in sketch.profiles:
-    #     futil.log(f'   Profile area = {p.areaProperties().area}, hole area = {holeArea}')
 
     # Find the holes profiles
     holeProfiles = adsk.core.ObjectCollection.create()

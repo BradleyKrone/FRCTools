@@ -24,10 +24,6 @@ ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resource
 # they are not released and garbage collected.
 local_handlers = []
 
-# Local list of ui event handlers used to maintain a reference so
-# they are not released and garbage collected.
-ui_handlers = []
-
 # Bolt Pattern struct
 class BoltPattern(typing.NamedTuple) :
     name: str = ""
@@ -69,7 +65,6 @@ def start():
 
 # Executed when add-in is stopped.
 def stop():
-    global edit_cmd_def
 
     # Get the various UI elements for this command
     submenu = config.get_sketch_create_submenu()
@@ -84,9 +79,6 @@ def stop():
     # Delete the command definition
     if command_definition:
         command_definition.deleteMe()
-
-    global ui_handlers
-    ui_handlers = []
 
 # Function that is called when a user clicks the corresponding button in the UI.
 # This defines the contents of the command dialog and connects to the command related events.

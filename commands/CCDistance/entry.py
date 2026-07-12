@@ -250,12 +250,6 @@ def ui_marking_menu(args: adsk.core.MarkingMenuEventArgs):
 
     if len(args.selectedEntities) == 1:
         ccLine = CCLine.getCCLineFromEntity( args.selectedEntities[0] )
-        # for control in controls:
-        #     if control.objectType == adsk.core.SeparatorControl.classType():
-        #         sep: adsk.core.SeparatorControl = control
-        #         # futil.log(f'Separator = {sep.id} at index {sep.index}')
-        #     elif control.isVisible :
-        #         futil.log(f'marking menu = {control.id} ,{control.isVisible}')
         if ccLine:
             editCCLineMenuItem.isVisible = True
             editCCLineSep.isVisible = True
