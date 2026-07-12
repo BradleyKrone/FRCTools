@@ -2,7 +2,6 @@
 # This module serves as a way to share variables across different
 # modules (global variables).
 
-import os
 import adsk.core
 
 app = adsk.core.Application.get()
@@ -31,32 +30,17 @@ SKETCH_CREATE_ID = 'SketchCreatePanel'
 SKETCH_MODIFY_ID = 'SketchModifyPanel'
 FRC_TOOLS_DROPDOWN_ID = 'FRCToolsSubMenu'
 
-def get_sketch_create_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
+def _get_frc_submenu( panel_id: str ) -> adsk.core.ToolbarControl:
+    # Find the FRCTools submenu in the given panel of the workspace.
     workspace = ui.workspaces.itemById( WORKSPACE_ID )
-
-    # Get the sketch panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SKETCH_CREATE_ID )
-
-    # Find the the FRCTools submenu.
+    panel = workspace.toolbarPanels.itemById( panel_id )
     return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
+
+def get_sketch_create_submenu() -> adsk.core.ToolbarControl:
+    return _get_frc_submenu( SKETCH_CREATE_ID )
 
 def get_sketch_modify_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
-    workspace = ui.workspaces.itemById( WORKSPACE_ID )
-
-    # Get the sketch panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SKETCH_MODIFY_ID )
-
-    # Find the the FRCTools submenu.
-    return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
+    return _get_frc_submenu( SKETCH_MODIFY_ID )
 
 def get_solid_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
-    workspace = ui.workspaces.itemById( WORKSPACE_ID )
-
-    # Get the solid panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SOLID_CREATE_ID )
-
-    # Find the the FRCTools submenu.
-    return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
+    return _get_frc_submenu( SOLID_CREATE_ID )
