@@ -212,18 +212,6 @@ def _resolve_hole_diam_cm(inputs: adsk.core.CommandInputs) -> float:
     return HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
 
 
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker into a named group."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'{CMD_NAME}: failed to create timeline group "{group_name}"')
-
-
 # ===========================================================================
 # Hole row — seed hole + feature rectangular pattern
 # ===========================================================================
@@ -599,7 +587,7 @@ def _run(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     # Timeline grouping triggers a recompute and only matters for the committed
     # result — skip it during preview.
     if not is_preview:
-        _group_timeline_features(design, start_marker, CMD_NAME)
+        futil.group_timeline_features(design, start_marker, CMD_NAME)
 
     _dbg(f'{CMD_NAME}: run complete')
 

@@ -55,22 +55,6 @@ def _outer_diameter_cm(belt_pitch_mm: int, n_teeth: int) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Timeline grouping helper (duplicated from entry.py to avoid circular import)
-# ---------------------------------------------------------------------------
-
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker into a named group."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
-
-
-# ---------------------------------------------------------------------------
 # Flange helper — adds a disk flange on each side of the pulley body
 # ---------------------------------------------------------------------------
 
@@ -345,7 +329,7 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
     except Exception:
         futil.log('PartsGen: failed to save pulley attributes')
 
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)
 
 
 def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: float,
@@ -465,7 +449,7 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
         except Exception:
             futil.handle_error(f'PartsGen: joint for {comp_name}', show_message_box=True)
 
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)
 
 
 # ---------------------------------------------------------------------------

@@ -67,21 +67,6 @@ _chain_sync_handlers: list = []
 
 
 # ---------------------------------------------------------------------------
-# Timeline grouping helper (avoids circular import from entry.py)
-# ---------------------------------------------------------------------------
-
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
-
-
-# ---------------------------------------------------------------------------
 # Chain parameter lookup
 # ---------------------------------------------------------------------------
 
@@ -636,4 +621,4 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
             except Exception:
                 futil.handle_error(f'PartsGen: auto-sprocket {i+1} failed', show_message_box=True)
 
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)

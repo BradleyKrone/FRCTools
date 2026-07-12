@@ -38,22 +38,6 @@ _belt_sync_handlers: list = []  # keeps event handler alive (prevent GC)
 
 
 # ---------------------------------------------------------------------------
-# Timeline grouping helper (duplicated from entry.py to avoid circular import)
-# ---------------------------------------------------------------------------
-
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
-
-
-# ---------------------------------------------------------------------------
 # Belt-name-sync — registration and update logic
 # ---------------------------------------------------------------------------
 
@@ -225,7 +209,7 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
         # Wrap the delete + recreation into one named timeline group
         prefix   = 'Pulley_HTD_5mm' if belt_pitch_mm == 5 else 'Pulley_GT2_3mm'
         new_name = f'{prefix}-{new_n_teeth}Tx{width_mm}mm'
-        _group_timeline_features(design, rebuild_start, new_name)
+        futil.group_timeline_features(design, rebuild_start, new_name)
     except Exception:
         futil.log('PartsGen: _rebuild_pulley failed')
 
@@ -608,7 +592,7 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
                 futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
 
     # Group belt + all auto-generated pulleys into one timeline entry
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)
 
 
 # ---------------------------------------------------------------------------

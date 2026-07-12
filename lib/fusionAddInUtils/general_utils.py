@@ -165,3 +165,14 @@ def inchValue( inches: float ) -> adsk.core.ValueInput :
 
 def Value( number: float ) -> adsk.core.ValueInput :
     return adsk.core.ValueInput.createByReal( number )
+
+def group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
+    """Group all timeline items from start_marker to the current marker into a named group."""
+    try:
+        timeline = design.timeline
+        end_marker = timeline.markerPosition - 1
+        if end_marker > start_marker:
+            group = timeline.timelineGroups.add(start_marker, end_marker)
+            group.name = group_name
+    except Exception:
+        log(f'FRCTools: failed to create timeline group "{group_name}"')

@@ -12,7 +12,6 @@ import math
 from ...lib import fusionAddInUtils as futil
 from ... import config
 from .pulley_gen import (
-    _group_timeline_features,
     _engrave_label_face,
     HEX_BORE_FLATS_CM,
     LABEL_TEXT_HEIGHT_CM,
@@ -352,7 +351,7 @@ def _create_sprocket(inputs: adsk.core.CommandInputs):
     except Exception:
         futil.log('PartsGen: failed to save sprocket attributes')
 
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)
 
 
 # ---------------------------------------------------------------------------
@@ -465,4 +464,4 @@ def create_sprocket_for_chain(n_teeth: int, width_cm: float, chain_pitch_mm: flo
         except Exception:
             futil.handle_error(f'PartsGen: joint for {comp_name}', show_message_box=True)
 
-    _group_timeline_features(design, start_marker, comp_name)
+    futil.group_timeline_features(design, start_marker, comp_name)

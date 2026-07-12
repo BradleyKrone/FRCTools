@@ -109,18 +109,6 @@ def _extrude_one_side(comp: adsk.fusion.Component,
     return extrudes.add(extInput)
 
 
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker into a named group."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
-
-
 # ===========================================================================
 # Tube face holes — seed hole + feature rectangular pattern
 # ===========================================================================
@@ -521,4 +509,4 @@ def _create_tube(inputs: adsk.core.CommandInputs):
     except Exception:
         futil.log('PartsGen: failed to save tube attributes')
 
-    _group_timeline_features(design, start_marker, workingComp.name)
+    futil.group_timeline_features(design, start_marker, workingComp.name)
