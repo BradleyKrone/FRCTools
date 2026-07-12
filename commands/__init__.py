@@ -5,7 +5,6 @@
 from .BoltPattern import entry as BoltPattern
 from .CCDistance import entry as CCDistance
 from .FaceFillet import entry as FaceFillet
-from .FilletXpert import entry as FilletXpert
 from .Lighten import entry as Lighten
 from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
@@ -17,7 +16,6 @@ commands = [
     BoltPattern,
     CCDistance,
     FaceFillet,
-    FilletXpert,
     Lighten,
     QuickCircle,
     PartsGen,
