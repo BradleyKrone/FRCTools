@@ -22,20 +22,11 @@ def midPoint3D( pt1: adsk.core.Point3D, pt2: adsk.core.Point3D ) -> adsk.core.Po
 def offsetPoint3D( pt1: adsk.core.Point3D, x: float, y: float, z: float ) -> adsk.core.Point3D :
     return adsk.core.Point3D.create( pt1.x + x, pt1.y + y, pt1.z + z )
 
-def addPoint2D( pt1: adsk.core.Point2D, pt2: adsk.core.Point2D ) -> adsk.core.Point2D :
-    return adsk.core.Point2D.create( pt1.x + pt2.x, pt1.y + pt2.y )
-
 def addPoint2D( pt1: adsk.core.Point2D, v2: adsk.core.Vector2D ) -> adsk.core.Point2D :
     return adsk.core.Point2D.create( pt1.x + v2.x, pt1.y + v2.y )
 
-def offsetPoint2D( pt1: adsk.core.Point2D, x: float, y: float ) -> adsk.core.Point2D :
-    return adsk.core.Point2D.create( pt1.x + x, pt1.y + y )
-
 def toLine2D( l3d: adsk.core.Line3D ) -> adsk.core.Line2D :
     return adsk.core.Line2D.create( toPoint2D(l3d.startPoint), toPoint2D(l3d.endPoint) )
-
-def toVector2D( v: adsk.core.Vector3D ) -> adsk.core.Vector2D :
-    return adsk.core.Vector2D.create( v.x, v.y )
 
 def multVector2D( v: adsk.core.Vector2D, val: float ) -> adsk.core.Vector2D :
     return adsk.core.Vector2D.create( v.x * val, v.y * val )
@@ -67,9 +58,6 @@ def toTheRightOf( line: adsk.core.Line2D, pt: adsk.core.Point2D  ) -> bool :
     z_comp = lineUnitVec.x*startToPtVec.y - lineUnitVec.y*startToPtVec.x
 
     return z_comp < 0
-
-def lineNormal( line: adsk.core.Line2D ) -> adsk.core.Vector2D :
-    return lineNormal( line.startPoint, line.endPoint )
 
 def lineNormal( startPt: adsk.core.Point2D, endPt: adsk.core.Point2D ) -> adsk.core.Vector2D :
     norm_x = -(endPt.y - startPt.y)

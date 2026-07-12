@@ -9,7 +9,6 @@
 #  AUTODESK, INC. DOES NOT WARRANT THAT THE OPERATION OF THE PROGRAM WILL BE
 #  UNINTERRUPTED OR ERROR FREE.
 
-import os
 import traceback
 import adsk.core
 import adsk.fusion
@@ -76,30 +75,10 @@ def print_SketchObjectCollection( col: adsk.core.ObjectCollection ) :
         log(f'   isFixed({item.isFixed}), is2D({item.is2D}), isFullyConstr({item.isFullyConstrained}), isRef({item.isReference})')
         print_SketchCurve( item )
 
-def print_Selection( selections: adsk.core.SelectionCommandInput ) :
-    i = 0
-    log(f'Selection has {selections.selectionCount} items.')
-    while i < selections.selectionCount:
-        print_BaseObject( selections.selection(i).entity )
-        i += 1
-
-def print_BaseObject( object: adsk.core.Base ) :
-    log(f'item type = {object.objectType}, isValid={object.isValid}')
-
 def print_OrientedBB( orientedBB: adsk.core.OrientedBoundingBox3D ) :
     log(f'item type = {orientedBB.objectType}, isValid={orientedBB.isValid}')
     log(f'   height = {orientedBB.height}, length={orientedBB.length}, width={orientedBB.width}')
     print_Point3D( orientedBB.centerPoint, "   centerPt: ")
-
-def print_BBox( bbox: adsk.core.BoundingBox3D ) :
-    log(f'item type = {bbox.objectType}, isValid={bbox.isValid}')
-    log(f'   minPt = {format_Point3D(bbox.minPoint)}, maxPt={format_Point3D(bbox.maxPoint)}')
-
-def print_Point2D( pt: adsk.core.Point2D, prefix: str = "" ) :
-    log( f'{prefix} {format_Point2D( pt )}' )
-
-def format_Point2D( pt: adsk.core.Point2D ) :
-    return f'({pt.x:.4},{pt.y:.4})'
 
 def format_Vector2D( v: adsk.core.Vector2D ) :
     return f'({v.x:.4},{v.y:.4})'
@@ -134,26 +113,6 @@ def print_SketchCurve( curve: adsk.fusion.SketchCurve ) :
         log(f'print_SketchCurve() --> {curve.objectType} Not handled.')
     log(f'    is2D({curve.is2D}), isDeletable({curve.isDeletable}), isFixed({curve.isFixed}), isFullyConstrained({curve.isFullyConstrained})')
     log(f'    isLinked({curve.isLinked}), isReference({curve.isReference}), isValid({curve.isValid}), isVisible({curve.isVisible})')
-
-def print_Curve2D( curve: adsk.core.Curve2D ) :
-    if curve.objectType == adsk.core.Line2D.classType() :
-        line: adsk.core.Line2D = curve
-        log(f'Line2D: {format_Point2D(line.startPoint)} -- {format_Point2D(line.endPoint)}')
-    elif curve.objectType == adsk.core.Arc2D.classType() :
-        arc: adsk.core.Arc2D = curve
-        str = f'Arc2D: C{format_Point2D(arc.center)}, {format_Point2D(arc.startPoint)} -- {format_Point2D(arc.endPoint)}'
-        str += f', R={arc.radius:.4}'
-        log(str)
-    elif curve.objectType == adsk.core.Circle2D.classType() :
-        circle: adsk.core.Circle2D = curve
-        str = f'Circle2D: C{format_Point2D(circle.center)}, '
-        str += f'radius = {circle.radius:.4}'
-        log(str)
-    elif curve.objectType == adsk.core.Point2D.classType() :
-        pt: adsk.core.Point2D = curve
-        log(f'Point2D: {format_Point2D(pt)}')
-    else :
-        log(f'print_Curve2D() --> {curve.objectType} Not handled.')
 
 def print_Curve3D( curve: adsk.core.Curve3D ) :
     if curve.objectType == adsk.core.Line3D.classType() :
