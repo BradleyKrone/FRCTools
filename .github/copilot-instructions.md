@@ -79,6 +79,26 @@ There are **no automated tests** — tools are verified live in Fusion.
    `config.DEBUG = True`) for `futil.log` output and tracebacks.
 4. To ship, run the VS Code **"Create Installer and Zip Archive"** task (or `bash ./bundle.sh`).
 
+### Always test changes live via the Fusion MCP server
+
+Whenever the Fusion MCP tools (`fusion_mcp_execute`, `fusion_mcp_read`, `fusion_mcp_update`) are
+available, **develop and verify changes against a live Fusion session instead of only reading the
+code** — this is the closest thing this project has to automated testing:
+
+- After editing a command, reload the add-in (Stop → Run) and drive it end-to-end through the MCP
+  server: run the `script` feature type to invoke the command/API path being changed, or to poke at
+  the resulting geometry directly (e.g. `adsk.fusion` calls to inspect bodies/sketches/parameters).
+- Use the `read` tool's `screenshot` query to visually confirm the resulting geometry looks right,
+  and `apiDocumentation` to check exact signatures/enums before calling unfamiliar Fusion API
+  members instead of guessing.
+- Use `fusion_mcp_update` (`undo`/`redo`) to clean up test artifacts left in the open document after
+  a verification run, so exploratory testing doesn't pollute the user's design.
+- Prefer this live loop over "looks correct on inspection" — Fusion API behavior (units, parametric
+  feature ordering, sketch/timeline side effects) is full of gotchas that only show up at runtime;
+  see [LESSONS_LEARNED.md](../LESSONS_LEARNED.md).
+- If the MCP server isn't connected/available, fall back to the manual Scripts-and-Add-Ins workflow
+  above and say so rather than skipping testing.
+
 ## Lessons learned — keep this growing
 
 **[LESSONS_LEARNED.md](../LESSONS_LEARNED.md)** is a running knowledge base of Fusion-specific
