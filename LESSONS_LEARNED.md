@@ -23,6 +23,84 @@ session.
 
 ## Lessons
 
+### `AsBuiltJoint` has no `geometryOrOriginOne`/`Two` and its shared `geometry` can be `None`
+`adsk.fusion.AsBuiltJoint` is a distinct class from `adsk.fusion.Joint` (check with
+`joint.objectType == adsk.fusion.AsBuiltJoint.classType()`), found in a separate
+`Component.allAsBuiltJoints` collection (not `allJoints`) -- has to be unioned with `allJoints` to
+find every joint touching a body. It shares `occurrenceOne`/`occurrenceTwo` (same `_joint_occurrence`
+ground-handling applies), but instead of two per-side `geometryOrOriginOne`/`Two` it has one shared
+`geometry` (the joint's computed coordinate system, since an as-built joint is captured from parts
+already in position rather than assembled by picking two geometries) -- and confirmed live that
+`.geometry` can be `None` even on a real as-built joint between two solid bodies, so guard it. **Fix:**
+for as-built joints, highlight by washing every body in each side's occurrence (there's no per-side
+geometry entity to trace back to one specific body) and only draw the exact face/edge/marker when
+`.geometry` isn't `None`.
+`commands/JointInspector/entry.py` (`_draw_asbuilt_highlight`, `_occurrence_bodies`)
+
+### There is no API way to open Fusion's native "Edit Joint" dialog pre-loaded for an existing joint
+Selecting a `Joint` (`ui.activeSelections.add(joint)`) -- with or without first rolling the timeline
+to it via `joint.timelineObject.rollTo(False)` -- and then executing `EditJointAssembleCmd` (the
+built-in "Edit Joint " command definition) always opens the dialog blank, with both Component 1/2
+"Snap" pickers empty, exactly as if creating a brand new joint. Confirmed live repeatedly, with and
+without the timeline roll, and neither changed the result. Fusion's real double-click/right-click
+"Edit Joint" in the browser isn't exposed as an equivalent scriptable call -- Autodesk's own docs and
+forums only describe editing an existing joint's *values* directly through its API properties/methods
+(e.g. `joint.setAsRigidJointMotion()`), never popping the creation dialog pre-bound to it. **Fix:**
+don't try to auto-open it. The best an add-in can do is select and reveal the joint (roll the
+timeline to it, select it) and leave the actual dialog-opening double-click to the user.
+`commands/JointInspector/entry.py` (`_reveal_joint_for_edit`)
+
+### Don't script `timelineObject.rollTo()` immediately followed by executing a command definition
+Rolling the timeline then, in the same `fusion_mcp_execute` script, immediately capturing a
+`commandCreated` handler and enumerating the new command's `commandInputs` (`inputs.item(idx)`,
+`ci.selection(0).entity`, etc.) crashed the whole Fusion application once (native crash reporter, not
+a Python exception). Doing the same rollTo + select + execute sequence *without* that inputs
+enumeration afterward, or checking state via the `activeCommand` read query instead, did not
+reproduce it -- so the risky part looks like introspecting a freshly-created command's inputs from a
+script, not the rollTo/execute themselves. **Fix:** to inspect a live command's dialog from a script,
+use the `fusion_mcp_read` `activeCommand` query (safe, confirmed live) rather than walking
+`args.command.commandInputs` yourself in the script that created it.
+`commands/JointInspector/entry.py` (`_reveal_joint_for_edit`)
+
+### `Command.doExecute()` can't be called from inside that command's own event handler
+Calling `args.firingEvent.sender.doExecute(True)` directly inside an `inputChanged` handler (to close
+the dialog when a button is clicked) raises `RuntimeError: 3 : can not terminate command during a
+command event` -- confirmed live. Same family of restriction as `ui.terminateActiveCommand()`, which
+is explicitly documented as unsupported inside command-related events. **Fix:** defer it with a
+`CustomEvent`: `app.registerCustomEvent(id)` once at add-in `start()`, fire it with
+`app.fireCustomEvent(id)` from inside the input handler instead of calling `doExecute`/
+`terminateActiveCommand` directly, and do the actual termination + follow-up work in the custom
+event's handler -- per the API docs, a fired custom event is queued and only runs "when the
+application is idle", i.e. outside the original command event's call stack.
+`commands/JointInspector/entry.py` (`_EDIT_JOINT_EVENT_ID`, `_on_edit_joint_event`)
+
+### `fusion_mcp_execute` scripts can't drive a live interactive command dialog
+Opening a command via `ui.commandDefinitions.itemById(id).execute()` from an MCP `script`, then
+pumping `adsk.doEvents()` in a loop to interact with its `commandInputs` (select something, click a
+row, read a textbox), looks like it should work -- `commandCreated` fires and `args.command.isValid`
+is `True` at that instant -- but the command is torn down (`isValid` flips to `False`) within a
+couple of `doEvents()` calls, before any further interaction happens. Confirmed this is not specific
+to any one command: an untouched, unmodified command (`Team4698_FRCTools_TubifyDialog`) dies the
+same way. **Fix:** there isn't one from the script side -- treat this as a hard limitation of the
+MCP script harness and fall back to manual interactive testing (Scripts and Add-ins reload, then
+click through the command by hand) for anything that needs a dialog to stay open across more than
+one round of events. Live-testing *pure logic* (helper functions, geometry math) via a script is
+still fine; it's specifically a multi-step *interactive dialog* session that can't be automated
+this way.
+`commands/JointInspector/entry.py`
+
+### Single-select list in a dialog: `TableCommandInput` + one checkbox `BoolValueCommandInput` per row
+This codebase had no precedent for a persistently-visible, clickable list (every other command uses
+`DropDownCommandInput`/`TextListDropDownStyle`). Built one for Joint Inspector's joint list instead
+of a dropdown: `addTableCommandInput(id, name, 1, '1')`, then one
+`addBoolValueInput(f'row_{i}', label, True, '', i == 0)` per row placed via
+`table.addCommandInput(rowInput, i, 0)`. Checkboxes are independent by default -- nothing stops more
+than one being checked -- so `inputChanged` for a row that just got checked must manually set every
+other row's `.value = False` to fake single-select/radio behaviour. Guard that unchecking loop with a
+module-level re-entrancy flag in case Fusion re-fires `inputChanged` synchronously for each
+programmatic `.value` write it causes.
+`commands/JointInspector/entry.py` (`_set_selected_row`)
+
 ### Draw CustomGraphics from `executePreview`, never from `inputChanged`
 **This is the root cause of JointInspector's "only the first joint ever shows" bug** -- three earlier
 diagnoses below (missing `Viewport.refresh()`, solid-body occlusion, selection-highlight colour clash)

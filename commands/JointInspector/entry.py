@@ -21,8 +21,15 @@ IS_PROMOTED = False
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
 
 # Local list of event handlers used to maintain a reference so
-# they are not released and garbage collected.
+# they are not released and garbage collected. Cleared on every command_destroy
+# (rewired fresh in the next command_created), unlike _addin_handlers below.
 local_handlers = []
+
+# Handlers that must survive across multiple open/close cycles of the command
+# dialog -- currently just the custom-event handler wired once in start().
+# Kept separate from local_handlers, which command_destroy() clears every time
+# the dialog closes.
+_addin_handlers = []
 
 # (joint, matched_side) pairs for the currently selected target, rebuilt whenever
 # target_entity changes. matched_side is 0 or 1 -- which of occurrenceOne/
@@ -40,7 +47,7 @@ _target_ambiguous = False
 # (not local_handlers) since it isn't an event handler.
 _highlight_group = None
 
-# Index into _current_matches of the joint the dropdown currently shows, or -1.
+# Index into _current_matches of the joint the table currently shows selected, or -1.
 # The highlight is drawn from executePreview rather than straight from
 # inputChanged: Fusion tears down every CustomGraphicsGroup on the design each
 # time it rebuilds the command preview (confirmed live -- the group went
@@ -50,6 +57,40 @@ _highlight_group = None
 # the very next rebuild; executePreview is re-invoked after each rebuild, so
 # drawing there is what makes the highlight stick.
 _selected_idx = -1
+
+# Guards the loop in _set_selected_row() that unchecks every other row's
+# checkbox -- without this, each of those programmatic .value = False writes
+# would recurse straight back into _command_input_changed's 'joint_row_'
+# branch.
+_syncing_rows = False
+
+# The joint to select/reveal once this command finishes closing, or None. Set
+# when the user clicks 'edit_joint_btn'; Fusion cannot have two command
+# dialogs open at once, so the handoff happens from command_destroy(), after
+# this command has fully torn down.
+#
+# This only selects and reveals the joint (positions the timeline at it and
+# selects it, so the user's very next action -- double-clicking it in the
+# browser -- opens Fusion's real Edit Joint dialog). Confirmed live that there
+# is no way to make that dialog itself open pre-loaded with an existing
+# joint's data via the public API: selecting the Joint (with or without
+# rolling the timeline first) and executing 'EditJointAssembleCmd' -- the
+# built-in "Edit Joint " command definition -- always opened it blank, as if
+# creating a new joint, never bound to the one that was selected. Fusion's own
+# double-click-to-edit for a joint isn't exposed as a matching, scriptable API
+# call.
+_joint_to_edit = None
+
+# Custom event used to defer closing this command + selecting the joint until
+# *after* the button click that requests it has finished processing. Both
+# Command.doExecute() and ui.terminateActiveCommand() raise "can not terminate
+# command during a command event" when called directly from an input-changed
+# handler (confirmed live) -- firing a CustomEvent and doing the actual work
+# in its handler is the standard workaround, since a fired custom event is
+# queued and only runs once Fusion is idle, outside the original event's call
+# stack.
+_EDIT_JOINT_EVENT_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_JointInspectorEditJointEvent'
+_edit_joint_event = None
 
 _THIS_SIDE_COLOR = (0, 200, 60)
 # Deliberately NOT blue: Fusion paints the target body with its own blue
@@ -91,6 +132,17 @@ def start():
     control = submenu.controls.addCommand(cmd_def)
     control.isPromoted = IS_PROMOTED
 
+    global _edit_joint_event
+    # Guard against a leftover registration from a prior run/reload that
+    # didn't get a matching stop() (e.g. after a crash) -- registerCustomEvent
+    # returns None rather than raising if the id is already taken.
+    try:
+        app.unregisterCustomEvent(_EDIT_JOINT_EVENT_ID)
+    except Exception:
+        pass
+    _edit_joint_event = app.registerCustomEvent(_EDIT_JOINT_EVENT_ID)
+    futil.add_handler(_edit_joint_event, _on_edit_joint_event, local_handlers=_addin_handlers)
+
 
 # Executed when add-in is stopped.
 def stop():
@@ -105,8 +157,14 @@ def stop():
     if command_definition:
         command_definition.deleteMe()
 
-    global local_handlers
+    global local_handlers, _addin_handlers, _edit_joint_event
     local_handlers = []
+    _addin_handlers = []
+    try:
+        app.unregisterCustomEvent(_EDIT_JOINT_EVENT_ID)
+    except Exception:
+        pass
+    _edit_joint_event = None
 
 
 # Called when the user clicks the button -- builds the command dialog.
@@ -133,17 +191,24 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     inputs.addTextBoxCommandInput('target_info', '', 'Select a body.', 2, True)
 
-    jointListInp = inputs.addDropDownCommandInput(
-        'joint_list', 'Joints', adsk.core.DropDownStyles.TextListDropDownStyle
-    )
-    jointListInp.isEnabled = False
+    # A persistently visible, clickable list of joints instead of a dropdown --
+    # one row per joint, each a checkbox-styled button; _set_selected_row()
+    # enforces that only one is ever checked at a time. Rows are (re)built in
+    # _command_input_changed() once a target body resolves to some joints.
+    jointTableInp = inputs.addTableCommandInput('joint_table', 'Joints', 1, '1')
+    jointTableInp.isEnabled = False
 
     inputs.addTextBoxCommandInput('joint_info', '', 'No joint selected.', 8, True)
 
-    global _current_matches, _target_ambiguous, _selected_idx
+    editJointBtn = inputs.addBoolValueInput('edit_joint_btn', 'Edit Joint', False, '', False)
+    editJointBtn.isEnabled = False
+
+    global _current_matches, _target_ambiguous, _selected_idx, _joint_to_edit, _syncing_rows
     _current_matches = []
     _target_ambiguous = False
     _selected_idx = -1
+    _joint_to_edit = None
+    _syncing_rows = False
 
     # Wire up event handlers. Nothing here creates geometry, but executePreview
     # is still required: it is the only place custom graphics survive Fusion's
@@ -203,31 +268,68 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
 
         targetInfoInp.text = f'{target_label} -- {len(_current_matches)} joint(s) found.'
 
-        jointListInp: adsk.core.DropDownCommandInput = inputs.itemById('joint_list')
-        jointListInp.listItems.clear()
+        jointTableInp: adsk.core.TableCommandInput = inputs.itemById('joint_table')
+        jointTableInp.clear()
         for i, (joint, matched_side) in enumerate(_current_matches):
             other_occ = _other_side(joint, matched_side)
             other_label = other_occ.fullPathName if other_occ is not None else 'Ground'
-            jointListInp.listItems.add(f'{_joint_name(joint)}  ->  {other_label}', i == 0, '')
-        jointListInp.isEnabled = True
+            tag = ' [As-built]' if _is_as_built(joint) else ''
+            label = f'{_joint_name(joint)}{tag}  ->  {other_label}'
+            rowInp = inputs.addBoolValueInput(f'joint_row_{i}', label, True, '', i == 0)
+            jointTableInp.addCommandInput(rowInp, i, 0)
+        jointTableInp.isEnabled = True
 
         _render_joint_info(inputs, 0)
 
-    elif changed.id == 'joint_list':
-        jointListInp: adsk.core.DropDownCommandInput = inputs.itemById('joint_list')
-        sel = jointListInp.selectedItem
-        idx = sel.index if sel else -1
-        _render_joint_info(inputs, idx)
+    elif changed.id.startswith('joint_row_'):
+        idx = int(changed.id[len('joint_row_'):])
+        if changed.value:
+            _set_selected_row(inputs, idx)
+            _render_joint_info(inputs, idx)
+        elif _selected_idx == idx:
+            # The user unchecked the currently-active row -- nothing selected.
+            _render_joint_info(inputs, -1)
+
+    elif changed.id == 'edit_joint_btn':
+        global _joint_to_edit
+        if 0 <= _selected_idx < len(_current_matches):
+            _joint_to_edit = _current_matches[_selected_idx][0]
+            # Can't close this command from here directly -- doExecute()/
+            # terminateActiveCommand() both raise "can not terminate command
+            # during a command event" when called from inside inputChanged
+            # (confirmed live). Fire a custom event instead: Fusion queues it
+            # and runs the handler once idle, outside this event's call
+            # stack, where closing the command and selecting the joint is safe.
+            app.fireCustomEvent(_EDIT_JOINT_EVENT_ID)
+
+
+def _set_selected_row(inputs: adsk.core.CommandInputs, idx: int):
+    """Uncheck every joint_row_* checkbox except row `idx`, guarded against
+    re-entrantly firing _command_input_changed for each row it unchecks."""
+    global _syncing_rows
+    if _syncing_rows:
+        return
+    _syncing_rows = True
+    try:
+        for i in range(len(_current_matches)):
+            if i == idx:
+                continue
+            rowInp: adsk.core.BoolValueCommandInput = inputs.itemById(f'joint_row_{i}')
+            if rowInp is not None:
+                rowInp.value = False
+    finally:
+        _syncing_rows = False
 
 
 def _reset_joint_ui(inputs: adsk.core.CommandInputs):
     global _current_matches, _selected_idx
     _current_matches = []
     _selected_idx = -1
-    jointListInp: adsk.core.DropDownCommandInput = inputs.itemById('joint_list')
-    jointListInp.listItems.clear()
-    jointListInp.isEnabled = False
+    jointTableInp: adsk.core.TableCommandInput = inputs.itemById('joint_table')
+    jointTableInp.clear()
+    jointTableInp.isEnabled = False
     inputs.itemById('joint_info').text = 'No joint selected.'
+    inputs.itemById('edit_joint_btn').isEnabled = False
     _clear_highlight()
     _refresh_viewport()
 
@@ -240,22 +342,26 @@ def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
     """
     global _selected_idx
     jointInfoInp: adsk.core.TextBoxCommandInput = inputs.itemById('joint_info')
+    editJointBtn: adsk.core.BoolValueCommandInput = inputs.itemById('edit_joint_btn')
 
     if idx < 0 or idx >= len(_current_matches):
         _selected_idx = -1
         _clear_highlight()
         jointInfoInp.text = 'No joint selected.'
+        editJointBtn.isEnabled = False
         _refresh_viewport()
         return
 
     _selected_idx = idx
+    editJointBtn.isEnabled = True
 
     joint, matched_side = _current_matches[idx]
     other_occ = _other_side(joint, matched_side)
     other_label = other_occ.fullPathName if other_occ is not None else 'Ground / Root Component'
+    type_label = 'As-built joint' if _is_as_built(joint) else 'Joint'
 
     legend = (
-        f'<b>{_joint_name(joint)}</b><br>'
+        f'<b>{_joint_name(joint)}</b> ({type_label})<br>'
         f'Connects to: <b>{other_label}</b><br><br>'
         f'<span style="color:rgb{_OTHER_SIDE_COLOR}">&#9632;</span> <b>Orange</b> = the body this '
         f'joint connects to<br>'
@@ -302,10 +408,9 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 def command_execute(args: adsk.core.CommandEventArgs):
     try:
-        inputs = args.command.commandInputs
-        jointListInp: adsk.core.DropDownCommandInput = inputs.itemById('joint_list')
-        if jointListInp.selectedItem:
-            futil.log(f'{CMD_NAME}: last inspected "{jointListInp.selectedItem.name}"')
+        if 0 <= _selected_idx < len(_current_matches):
+            joint, _ = _current_matches[_selected_idx]
+            futil.log(f'{CMD_NAME}: last inspected "{_joint_name(joint)}"')
     except Exception:
         futil.handle_error(f'{CMD_NAME} command_execute', show_message_box=True)
 
@@ -317,6 +422,48 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     _target_ambiguous = False
     _selected_idx = -1
     _clear_highlight()
+
+
+def _on_edit_joint_event(args: adsk.core.CustomEventArgs):
+    """Runs once Fusion is idle, after the 'edit_joint_btn' click that fired
+    this event has finished processing -- see _EDIT_JOINT_EVENT_ID for why
+    this can't happen directly in that click's own inputChanged handler.
+    """
+    global _joint_to_edit
+    joint = _joint_to_edit
+    _joint_to_edit = None
+    if joint is None:
+        return
+
+    try:
+        ui.terminateActiveCommand()
+    except Exception:
+        futil.handle_error(f'{CMD_NAME}: closing Joint Inspector for edit', show_message_box=False)
+
+    _reveal_joint_for_edit(joint)
+
+
+def _reveal_joint_for_edit(joint):
+    """Position the timeline at `joint` and select it, so the user's very
+    next action -- double-clicking it in the browser -- opens Fusion's real
+    Edit Joint dialog for it.
+
+    Only called after Joint Inspector's own dialog has fully closed -- Fusion
+    can't show another command's dialog while this one is still open, and
+    mutating ui.activeSelections while target_entity's SelectionCommandInput
+    was still live was previously found to break that input's own
+    pick-gathering (see LESSONS_LEARNED.md).
+
+    This does NOT open the native Edit Joint dialog itself -- confirmed live
+    that there's no way to do that pre-loaded with an existing joint via the
+    public API (see the _joint_to_edit comment above for what was tried).
+    """
+    try:
+        joint.timelineObject.rollTo(False)
+        ui.activeSelections.clear()
+        ui.activeSelections.add(joint)
+    except Exception:
+        futil.handle_error(f'{CMD_NAME} reveal joint for edit', show_message_box=True)
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +557,13 @@ def _joint_name(joint):
         return '<unnamed joint>'
 
 
+def _is_as_built(joint) -> bool:
+    try:
+        return joint.objectType == adsk.fusion.AsBuiltJoint.classType()
+    except Exception:
+        return False
+
+
 def _side_matches(occ, target_occ) -> bool:
     if target_occ is None:
         return occ is None
@@ -421,7 +575,13 @@ def _side_matches(occ, target_occ) -> bool:
 def _find_joint_matches(target_occ):
     design = adsk.fusion.Design.cast(app.activeProduct)
     matches = []
-    for joint in design.rootComponent.allJoints:
+    # allJoints and allAsBuiltJoints are two separate flattened collections on
+    # Component (regular joints and as-built joints are different API classes
+    # -- adsk.fusion.Joint vs adsk.fusion.AsBuiltJoint -- with no single
+    # collection covering both), so both have to be walked to find every joint
+    # touching the target.
+    all_joints = list(design.rootComponent.allJoints) + list(design.rootComponent.allAsBuiltJoints)
+    for joint in all_joints:
         if _side_matches(_joint_occurrence(joint, 0), target_occ):
             matches.append((joint, 0))
         elif _side_matches(_joint_occurrence(joint, 1), target_occ):
@@ -587,6 +747,20 @@ def _clear_highlight():
         futil.log(f'{CMD_NAME}: failed to delete highlight graphics: {err}')
 
 
+def _occurrence_bodies(occ):
+    """All BRepBody in an occurrence, or in the root component for `occ` is
+    None (ground) -- used to wash an as-built joint's side, since an
+    AsBuiltJoint (unlike a regular Joint) has no per-side geometry entity to
+    trace back to a single body."""
+    try:
+        if occ is not None:
+            return list(occ.bRepBodies)
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        return list(design.rootComponent.bRepBodies)
+    except Exception:
+        return []
+
+
 def _draw_joint_highlight(joint, matched_side):
     global _highlight_group
     _clear_highlight()
@@ -594,12 +768,21 @@ def _draw_joint_highlight(joint, matched_side):
     design = adsk.fusion.Design.cast(app.activeProduct)
     group = design.rootComponent.customGraphicsGroups.add()
     # Take ownership of the group immediately, not after it's fully populated:
-    # if any of the _highlight_side() calls below raise, the caller swallows it
-    # and a group assigned only at the end would never be reachable by the next
+    # if any of the drawing calls below raise, the caller swallows it and a
+    # group assigned only at the end would never be reachable by the next
     # _clear_highlight() -- leaking a half-drawn highlight that then sticks in
     # the viewport on top of every later one.
     _highlight_group = group
 
+    if _is_as_built(joint):
+        _draw_asbuilt_highlight(group, joint, matched_side)
+    else:
+        _draw_regular_highlight(group, joint, matched_side)
+
+    _refresh_viewport()
+
+
+def _draw_regular_highlight(group, joint, matched_side):
     this_geom = _unwrap(joint.geometryOrOriginOne if matched_side == 0 else joint.geometryOrOriginTwo)
     other_geom = _unwrap(joint.geometryOrOriginTwo if matched_side == 0 else joint.geometryOrOriginOne)
 
@@ -619,7 +802,64 @@ def _draw_joint_highlight(joint, matched_side):
         except Exception:
             pass
 
-    _refresh_viewport()
+
+def _draw_asbuilt_highlight(group, joint, matched_side):
+    """An AsBuiltJoint has a single shared `geometry` (the joint's computed
+    coordinate system at its current, already-assembled position) instead of
+    a geometryOrOriginOne/Two pair -- there's no separate per-side attachment
+    geometry to highlight. Wash each side's whole occurrence instead (every
+    body in it, since we can't trace the shared geometry's entities back to
+    "this side" vs "other side" the way a regular joint's two geometries let
+    us), and mark the one shared origin.
+    """
+    this_occ = _joint_occurrence(joint, matched_side)
+    other_occ = _joint_occurrence(joint, 1 if matched_side == 0 else 0)
+
+    for body in _occurrence_bodies(this_occ):
+        _highlight_body(group, body, _THIS_SIDE_COLOR)
+    for body in _occurrence_bodies(other_occ):
+        _highlight_body(group, body, _OTHER_SIDE_COLOR)
+
+    try:
+        geom = _unwrap(joint.geometry)
+    except Exception:
+        geom = None
+
+    if geom is not None:
+        # The joint's exact attachment entities (face/edge/point), colored
+        # per side when the owning body tells us which side it's on -- falls
+        # back to "this side" green when that can't be determined (e.g. the
+        # entity's body isn't in either occurrence's own bRepBodies, which
+        # happens for a proxy body in a nested component).
+        this_bodies = _occurrence_bodies(this_occ)
+        other_bodies = _occurrence_bodies(other_occ)
+        for entity in (geom.entityOne, geom.entityTwo):
+            if entity is None:
+                continue
+            body = None
+            try:
+                body = entity.body
+            except Exception:
+                pass
+            color = _OTHER_SIDE_COLOR if body is not None and body in other_bodies and body not in this_bodies \
+                else _THIS_SIDE_COLOR
+            ot = entity.objectType
+            if ot == adsk.fusion.BRepFace.classType():
+                _highlight_face(group, entity, color)
+            elif ot == adsk.fusion.BRepEdge.classType():
+                _highlight_edge(group, entity, color)
+            else:
+                _add_marker(group, _point_from_entity(entity), color, _MARKER_PIXELS_THIS)
+
+        # Both sides share this one origin (the joint was captured from parts
+        # already in place, not assembled by picking two separate origins),
+        # so mark it once per side's colour/size for the same nested-crosshair
+        # look a coincident regular-joint origin gets.
+        try:
+            _add_marker(group, geom.origin, _THIS_SIDE_COLOR, _MARKER_PIXELS_THIS)
+            _add_marker(group, geom.origin, _OTHER_SIDE_COLOR, _MARKER_PIXELS_OTHER)
+        except Exception:
+            pass
 
 
 def _refresh_viewport():
