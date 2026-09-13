@@ -23,6 +23,164 @@ session.
 
 ## Lessons
 
+### Draw CustomGraphics from `executePreview`, never from `inputChanged`
+**This is the root cause of JointInspector's "only the first joint ever shows" bug** -- three earlier
+diagnoses below (missing `Viewport.refresh()`, solid-body occlusion, selection-highlight colour clash)
+were all real defects but none of them were it. Fusion destroys every `CustomGraphicsGroup` on the
+design each time it rebuilds a command's preview. Proven live by logging state from `validateInputs`:
+right after a draw the group was `isValid=True, count=7, cgGroups=1`, and on the very next
+`validateInputs` it was `isValid=False, cgGroups=0` -- with no `_clear_highlight()` of ours in between.
+Graphics drawn from `inputChanged` therefore flash up and are wiped on the next rebuild (the user's
+report of "a very fast flicker of the correct faces, then it goes away" was the whole diagnosis).
+**Fix:** have `inputChanged` record *what* should be shown (an index) and add an `executePreview`
+handler that does the drawing -- Fusion re-invokes it after every rebuild, so the highlight is
+re-created as fast as it is destroyed. Set `args.isValidResult = False` since nothing is being built.
+A read-only command still needs `executePreview`; "creates no geometry" is not a reason to skip it.
+`commands/JointInspector/entry.py` (`command_preview`, `_selected_idx`)
+
+### Diagnose "it flickers" as a lifetime problem, not a drawing problem
+Chasing JointInspector's invisible highlight, several rounds went into *how* it was drawn (colour,
+opacity, depth, occlusion, camera) because a script that called the draw helpers directly always
+produced correct output. The giveaway was the user saying the right thing appeared for a split second
+first -- that rules out every drawing theory at once and means something is deleting the graphics
+afterwards. **Fix:** when output is briefly correct then disappears, stop tuning the renderer and
+instrument *lifetime* instead -- log object `isValid`/collection counts from a handler that fires
+repeatedly (`validateInputs` is ideal) and dump `traceback.extract_stack()` in the teardown path to
+prove whether your own code or Fusion is doing the deleting.
+`commands/JointInspector/entry.py`
+
+### Fusion's own selection highlight swamps translucent CustomGraphics -- never highlight in blue
+Another real defect found while chasing the same symptom, but not its root cause either (see the
+executePreview entry above). A `SelectionCommandInput` keeps the picked body selected for as long as
+the dialog is open, and Fusion paints that body with its blue selection highlight *over* custom
+graphics. A green "this side" wash at 0.35 opacity vanished under it and a blue "other side" wash was
+indistinguishable from it. This only reproduces with a live selection -- driving the draw helpers from
+a script looked perfect, which is what made it so slippery. **Fix:** reproduce the real condition in a
+test script with `ui.activeSelections.add(body)` before screenshotting (safe when no command dialog is
+open -- see the `activeSelections` entry below for why it is *not* safe while one is), pick colours
+that cannot collide with selection blue (orange reads unambiguously), and push body-wash opacity to
+~0.65.
+`commands/JointInspector/entry.py` (`_OTHER_SIDE_COLOR`, `_BODY_OPACITY`)
+
+### Don't swallow draw errors in a command's redraw path
+`_draw_joint_highlight` failures were routed to `handle_error(show_message_box=False)` with no other
+trace, which made a genuinely broken highlight indistinguishable from a correctly-drawn-but-invisible
+one -- and sent several rounds of debugging after rendering theories instead. **Fix:** keep the modal
+off (it would fire on every preview rebuild) but always route through `futil.handle_error`, which
+writes the traceback to the Text Command window and the Fusion log. Note the draw now happens in
+`executePreview`, so the error can't be written into a command input from there -- the log is the
+channel. When a highlight misbehaves, read the Text Command window first.
+`commands/JointInspector/entry.py` (`command_preview`)
+
+### CustomGraphics are depth-tested against solids -- there is no "draw on top"
+A real defect found while chasing that symptom, though not its root cause (see the executePreview
+entry above). A joint highlight can be drawn at perfectly correct world coordinates and still be
+completely invisible, because it is buried inside the solid bodies: geometry attached to a face or
+edge pointing away from the camera renders hidden, while a camera-facing face looks fine. Proven by
+re-rendering the hidden edge from the opposite camera, where it appeared in full. The whole
+`CustomGraphicsEntity` API is
+`deleteMe`/`get|setOpacity`/`isVisible`/`isSelectable`/`depthPriority`/`viewScale`/`viewPlacement` --
+`depthPriority` only orders custom graphics against **each other**, not against model geometry, so it
+cannot rescue an occluded highlight. **Fix:** don't rely on exact geometry being visible -- give each
+side a translucent whole-body wash (`body.meshManager.displayMeshes.bestMesh` -> `addMesh`) that is
+too big to hide, and size point markers with `CustomGraphicsViewScale.create(pixels, anchor)` so they
+stay a constant on-screen size instead of shrinking to a speck (a fixed 0.6cm crosshair was ~8px on an
+assembly).
+`commands/JointInspector/entry.py` (`_highlight_body`, `_add_marker`, `_highlight_side`)
+
+### `Joint.occurrenceOne`/`occurrenceTwo` raise instead of returning None for a grounded side
+Reading either property throws `RuntimeError: 2 : InternalValidationError : jointOcc` when that side of
+the joint is attached to the root component rather than to an occurrence. Unguarded it aborted the
+whole `target_entity` handler, so `_current_matches = _find_joint_matches(...)` never assigned and the
+joint dropdown stayed empty for that pick **and every pick after it**. **Fix:** read both through one
+helper that catches and returns `None` -- "attached to the root" is exactly the ground case the rest of
+the code already means by `None`.
+`commands/JointInspector/entry.py` (`_joint_occurrence`)
+
+### CustomGraphics edits need an explicit `Viewport.refresh()` -- and only one per redraw
+JointInspector's viewport highlight (see the entry below) worked the first time a joint was picked but
+never updated when switching to a different joint in the dropdown -- no error, the graphics were
+provably being rebuilt correctly (confirmed live: `design.rootComponent.customGraphicsGroups.count`
+and each group's `.count` matched expectations after every switch), they just weren't being repainted.
+The first draw happened to get painted for free because picking the body itself causes Fusion to
+repaint the view (selection highlight changes); a pure dropdown change doesn't touch selection, so
+nothing told the viewport to repaint the new custom graphics. **Fix:** call
+`app.activeViewport.refresh()` once after every redraw. Two traps found doing this: (1) calling
+`refresh()` from inside `_clear_highlight()` *and* again at the end of the draw that immediately
+follows it triggered an exception on the delete call often enough to matter, which a bare
+`except: pass` then swallowed -- the deleted group's Python reference was already nulled out before the
+exception, so the group silently leaked (confirmed live: `customGraphicsGroups.count` stayed at 1
+after a `_clear_highlight()` call that should have brought it to 0). Refresh **once**, only after the
+new group is fully built, not once per intermediate step. (2) Null out the module's group reference
+*before* calling `deleteMe()` (not after, and not only on success) so a delete that raises can't leave
+a stale reference in the way of the next redraw -- log the exception text instead of silently passing.
+`commands/JointInspector/entry.py` (`_refresh_viewport`, `_clear_highlight`)
+
+### `CustomGraphics` is the right way to show "what a joint connects to" -- not `ui.activeSelections` or text
+JointInspector originally described a joint's attachment geometry (face/edge/point on each side) as an
+HTML text block, because an earlier attempt to highlight it via `ui.activeSelections` was abandoned (see
+the entry below). `CustomGraphicsGroup` on `design.rootComponent` sidesteps that whole problem -- it's a
+separate display layer that never touches `ui.activeSelections` or the undo stack, so it's safe to draw
+from inside `command_input_changed` even while `target_entity`'s `SelectionCommandInput` is still on
+screen. Recipe per entity type: `BRepFace` -> `face.meshManager.displayMeshes.bestMesh` gives an
+already-computed `TriangleMesh` (`nodeCoordinatesAsDouble`/`nodeIndices`/`normalVectorsAsDouble`) to feed
+straight into `group.addMesh(...)`, no new tessellation needed; `BRepEdge` -> `group.addCurve(edge.geometry)`;
+a bare point (`BRepVertex`/`ConstructionPoint`/`SketchPoint.worldGeometry`) -> a small 3D crosshair built
+from `group.addLines(...)`, which (unlike a screen-facing point-image marker) reads correctly from any
+camera angle. Gotchas confirmed live via the Fusion MCP script executor: (1) `CustomGraphicsGroups.add()`
+raises `RuntimeError: 3 : Cannot modify the design from a read-only context` if the calling script/handler
+context is read-only -- a real command handler is never read-only, so this only bites ad hoc test scripts,
+not the shipped feature; (2) `CustomGraphicsMesh.setOpacity(value, isOverride)` takes **two** required
+positional args, not one. Always `group.deleteMe()` the whole group (not each entity) to tear the highlight
+down in one call -- do it on every joint-selection change and in `command_destroy`, mirroring how the
+`_current_matches` list itself is reset.
+`commands/JointInspector/entry.py` (`_draw_joint_highlight`, `_highlight_face`, `_highlight_edge`, `_add_marker`)
+
+### `ui.activeSelections.clear()`/`.add()` fights a live `SelectionCommandInput`
+JointInspector called `ui.activeSelections.clear()` (to reset a "highlight the connected geometry"
+feature) from inside its own `target_entity` input's `inputChanged` handler, at the very top before
+even reading the new selection. `ui.activeSelections` turned out to be the same underlying store a
+focused `SelectionCommandInput` is reading from while it gathers a pick — clearing it there wiped
+out the very click that triggered the event, so nothing could ever be selected (confirmed live: an
+otherwise-identical command with no `activeSelections` calls, e.g. Tubify, selected the same body
+fine). **Fix:** don't mutate `ui.activeSelections` at all while a command's own `SelectionCommandInput`
+is still active/gathering picks — there's no known-safe sequencing for it, so the viewport-highlight
+feature was dropped rather than chased further.
+`commands/JointInspector/entry.py`
+
+### An overlooked one-line side effect can look like an intractable Fusion/environment bug
+Debugging JointInspector's "clicking never selects anything," a real-but-irrelevant Fusion quirk
+(`ui.activeCommand` reports the generic `SelectCommand` while any `SelectionCommandInput` is actively
+armed, not the actual running custom command) led several rounds of live MCP diagnosis toward "this
+must be environment/session-wide," including a full Fusion restart, before a plain side-by-side
+against a known-working command (Tubify, same filter, same fresh document) isolated it back down to
+one line of JointInspector's own code (see the `activeSelections` entry above). **Fix:** when a
+custom command misbehaves, A/B it against another already-working command on the exact same input
+before trusting an environment-level theory — it's a five-minute check that rules out a whole class
+of wrong turns.
+`commands/JointInspector/entry.py`
+
+### Fusion MCP `fusion_mcp_execute` script mutations don't persist across separate calls
+Building a test assembly in one `fusion_mcp_execute` script call, then reading it back in a
+following call, consistently showed 0 occurrences/joints even though the first call's own prints
+showed the objects existed and worked. **Fix:** each script execution appears to run in its own
+disposable context — do setup *and* assertions inside a single script call when verifying Fusion
+API behavior via MCP; don't rely on state created by one call being visible to the next.
+`commands/JointInspector/entry.py`
+
+### Joint API: `allJoints`, ground sides, and JointOrigin vs. JointGeometry
+`design.rootComponent.allJoints` (not `.joints`, which only returns joints owned directly by that
+component) flattens every joint in the whole tree as proxies — the one call needed to enumerate all
+joints from the root. `Joint.occurrenceOne`/`occurrenceTwo` can legitimately be `None` (the joint is
+grounded to the root component, not another occurrence) — guard for it. `Joint.geometryOrOriginOne`/
+`Two` can be either a plain `JointGeometry` or a `JointOrigin` wrapping one — always unwrap via
+`JointOrigin.geometry` before touching `.entityOne`/`.entityTwo`/`.origin`. To identify which
+occurrence a joint side refers to, compare `.fullPathName` strings rather than `.entityToken`
+(Autodesk's own docs warn against treating token equality as an identity check) — verified live
+against a real two-component rigid joint plus a duplicate occurrence instance of one of the
+components (to confirm same-component-different-instance doesn't false-positive-match).
+`commands/JointInspector/entry.py`
+
 ### `executePreview` calls the same creation code as `execute`, with no validity gate
 PartsGen's `command_preview` handled Shaft/Tube/Pulley/Sprocket by just calling
 `command_execute(args)` and then hardcoding `args.isValidResult = True` — regardless of whether
