@@ -1,10 +1,9 @@
-=== AutoHole run 2026-08-23T21:58:21 (preview=True) ===
-AutoHole: edge.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OMQ7CMAxFuQFXsFhRJNsxIQxswMLOWqVNi9gQ4gIcg5GBY8CBOAMDTtoBWhxLef7+so3AgPpIf2qJvRKBJMUBXumyHK8et/f09bxvJ+pgsA4aEi+egplXno1QIOObkk1J4hZldGJjlb06Y9SLvA8hrxOwwKSFVSTQnOU2IbWQT+srMlDct4JQx31dnOrqcKyLGM4B1uDBUJcMGy0xYYJO27UW+6eZgBOk2T8+O/Bh5/sA6+CfVVsBAAA=, has_anchor=True, follow_outer=True, hole_diam_cm=0.7541, edge_offset_cm=1.2700, is_fill=True, custom_count=0, spacing_cm=2.5400
-AutoHole: --- outer edge loop trace ---
-AutoHole: loop-trace seed edge.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OMQ7CMAxFuQFXsFhRJNsxIQxswMLOWqVNi9gQ4gIcg5GBY8CBOAMDTtoBWhxLef7+so3AgPpIf2qJvRKBJMUBXumyHK8et/f09bxvJ+pgsA4aEi+egplXno1QIOObkk1J4hZldGJjlb06Y9SLvA8hrxOwwKSFVSTQnOU2IbWQT+srMlDct4JQx31dnOrqcKyLGM4B1uDBUJcMGy0xYYJO27UW+6eZgBOk2T8+O/Bh5/sA6+CfVVsBAAA=
-AutoHole:   offset went outward, flipping direction
-AutoHole:   loop has 4 edges, total_length_in=75.6718, is_fill=True, custom_count=0 spacing_cm=2.5400 -> count=75
-AutoHole:   anchored loop start at dist_cm=96.1032 (of 192.2063 total)
-AutoHole:   loop seed cut OK
-AutoHole:   loop pattern OK, 75 holes
+=== AutoHole run 2026-09-12T22:33:30 (preview=False) ===
+AutoHole: edge.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OMU4EMQxFOYorukhO4nGcGkFFTbtMiEF0CO0ttqWh3moLRMcVuAVnwfEODCAiS/7+efo2QoIImeEWk2hhCVR7DoRcQ6V5Dk2xqKj02CugsYPHoZKYikDDYTh7+jjdXl++vz7v8tv+5WBEGrldGmNtNcRepkBNSmjCbGukJI4kldVZyzj583wfgq8jyJAszxqZazX5NyFZz+CXrYafNsap1F+jHCk/fMXd4B8GgvY73Tzqzf2Dbvq8neEcBEJcKsGFjTjkEIt3dUTy6g2RvoTjI/t/7jstL9wnMSgl+50BAAA=, has_anchor=True, follow_outer=False, hole_diam_cm=0.2540, edge_offset_cm=0.2540, is_fill=True, custom_count=0, spacing_cm=2.5400
+AutoHole: --- single edge row ---
+AutoHole: single-edge row edge.entityToken=/v4BAAAARlJLZXkAH4sIAAAAAAAA/22OMU4EMQxFOYorukhO4nGcGkFFTbtMiEF0CO0ttqWh3moLRMcVuAVnwfEODCAiS/7+efo2QoIImeEWk2hhCVR7DoRcQ6V5Dk2xqKj02CugsYPHoZKYikDDYTh7+jjdXl++vz7v8tv+5WBEGrldGmNtNcRepkBNSmjCbGukJI4kldVZyzj583wfgq8jyJAszxqZazX5NyFZz+CXrYafNsap1F+jHCk/fMXd4B8GgvY73Tzqzf2Dbvq8neEcBEJcKsGFjTjkEIt3dUTy6g2RvoTjI/t/7jstL9wnMSgl+50BAAA=
+AutoHole: corner=(38.1,38.1,0.0), length_in=30.0000, anchor_is_curve_start=True
+AutoHole:   _build_edge_row_line_fill length_in=30.0000 spacing_cm=2.5400 -> count=29, start_offset_cm=1.2700
+AutoHole:   seed cut OK
+AutoHole:   row pattern OK, 29 holes
 AutoHole: run complete

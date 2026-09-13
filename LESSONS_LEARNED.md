@@ -23,6 +23,62 @@ session.
 
 ## Lessons
 
+### A bounding-box center is not a reliable stand-in for "inside the body"
+FaceFillet's convex/concave edge test (`_edge_is_convex`) decided which side of an edge's
+face-normal bisector was "inside the body" by comparing against the body's *bounding-box*
+center. That only works for roughly box-shaped, symmetric solids — confirmed wrong live on
+a "staple" shape (a wide short base with two long thin prongs, gap between them): the
+bbox center sits out in the open gap between the prongs, and the two corners where the
+base meets each prong were misclassified as concave when they're actually convex
+(independently confirmed via the polygon's own winding direction). **Fix:** use the body's
+real mass centroid (`body.physicalProperties.centerOfMass`) instead, computed once per
+call and passed down rather than recomputed per edge (it was previously recomputed from
+scratch inside the per-edge function). Note this bug is easy to *miss* with test geometry:
+a simple symmetric L-bracket did **not** reproduce it — for a shape symmetric about a
+diagonal, the bbox center and mass centroid end up on the same side of every corner's
+test plane regardless of the approximation error, so proving the fix required an
+intentionally lopsided body and comparing against the pre-fix heuristic directly.
+`commands/FaceFillet/entry.py` (`_edge_is_convex`, `_body_centroid`), regression test at
+`commands/FaceFillet/dev_scripts/regression_test.py` (`_test_asymmetric_convexity`)
+
+### A rolling-ball tangent-chain fillet is far more forgiving than "radius <= face width"
+Tried to force FaceFillet's all-at-once fillet attempt to fail on just *some* edges (to
+test the per-edge fallback) by making one edge's adjacent face much narrower than the
+requested radius (a 0.05in-wide tab with a 1.0in radius, filleted as part of one
+`addConstantRadiusEdgeSet` call with `isRollingBallCorner=True`/`isTangentChain=True`
+covering all edges at once) — it still succeeded every time. A single multi-edge rolling-
+ball fillet call is evidently able to blend away geometry far more aggressively than a
+naive "radius must fit within the adjacent face" model predicts. **Fix, if you need a
+guaranteed partial failure for testing:** don't try to construct a geometrically-tight
+face; instead just request a radius larger than a plain symmetric box's own half-width
+(e.g. a 2x2x2in box with a 3in radius) — confirmed live and deterministic across repeated
+runs that the all-at-once attempt fails and the per-edge fallback then succeeds for 2 of
+the 4 corners and fails the other 2, which is enough to exercise the fallback path without
+needing exotic geometry.
+`commands/FaceFillet/entry.py` (`_apply_fillet`), regression test at
+`commands/FaceFillet/dev_scripts/regression_test.py` (`_test_fillet_partial_fallback`)
+
+### A copy-pasted range check silently stops validating the second variable
+`command_validate_input`'s cog-teeth range check in CCDistance's create/edit dialogs tested
+`cog1Teeth.value < 100` twice instead of checking `cog2Teeth.value`'s upper bound — invisible in
+normal use because the integer spinner UI itself hard-clamps to 6-100, so it only bites if that
+range ever changes or the value is set another way. **Fix:** when a validation condition has the
+same shape repeated for two inputs, grep for the second variable name in your own check afterward;
+don't trust that "it looks right" once is enough. Caught by directly calling
+`command_validate_input`/`edit_command_validate_input` with duck-typed stub inputs (`.value`,
+`.itemById()`, `.areInputsValid`) — no real Fusion UI needed to unit-test a validate-handler.
+`commands/CCDistance/create_cmd.py`, `commands/CCDistance/edit_cmd.py`
+
+### Regression-test an inverse formula against the equation it solves, not a re-typed copy of itself
+CCDistance derives belt/chain center distance by solving a physical equation (belt pitch-length,
+chain link-count) for the center distance via a closed-form quadratic. Re-deriving the same
+closed-form by hand in a test is easy to get subtly wrong, and re-typing the identical formula
+just checks the code against itself. **Fix:** plug the function's returned value back into the
+*original* defining equation (e.g. `2*C + pi*(D1+D2)/2 + (D1-D2)**2/(4*C) - beltPitchLengthIN`) and
+assert the residual is ~0 — this catches a broken derivation (wrong sign, dropped term, wrong
+constant) that a tautological re-implementation would miss.
+`commands/CCDistance/dev_scripts/regression_test.py`
+
 ### Fill mode's straight-edge row count must subtract the start offset in *both* places it's computed, or it bites a crescent notch off the part
 `_build_edge_row_line_fill`'s Fill count was computed from the raw edge length (`length_in / spacing_in`)
 instead of the *usable* length after the fixed 0.5" start offset — unlike its sibling

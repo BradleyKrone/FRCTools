@@ -84,7 +84,29 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def _edge_is_convex(edge: adsk.fusion.BRepEdge) -> bool:
+def _body_centroid(body: adsk.fusion.BRepBody) -> adsk.core.Point3D:
+    """
+    Best-effort approximation of "the inside of the body" used by
+    _edge_is_convex's convex/concave test.
+
+    Prefers the real mass centroid (accurate even for asymmetric bodies like
+    an L-bracket, where the bounding-box center can fall outside the material
+    entirely). Falls back to the bounding-box center if physicalProperties
+    can't be computed for some reason.
+    """
+    try:
+        return body.physicalProperties.centerOfMass
+    except Exception:
+        futil.log(f'{CMD_NAME} _body_centroid: physicalProperties failed, falling back to bbox center:\n{traceback.format_exc()}')
+        bb = body.boundingBox
+        return adsk.core.Point3D.create(
+            (bb.minPoint.x + bb.maxPoint.x) / 2.0,
+            (bb.minPoint.y + bb.maxPoint.y) / 2.0,
+            (bb.minPoint.z + bb.maxPoint.z) / 2.0,
+        )
+
+
+def _edge_is_convex(edge: adsk.fusion.BRepEdge, body_centroid: adsk.core.Point3D) -> bool:
     """
     Returns True if the edge is a convex (external) corner,
     False if it is a concave (internal) corner.
@@ -113,15 +135,10 @@ def _edge_is_convex(edge: adsk.fusion.BRepEdge) -> bool:
         if b_len < 1e-10:
             return True
 
-        # Approximate body centre via bounding box
-        body = face1.body
-        bb = body.boundingBox
-        cx = (bb.minPoint.x + bb.maxPoint.x) / 2.0
-        cy = (bb.minPoint.y + bb.maxPoint.y) / 2.0
-        cz = (bb.minPoint.z + bb.maxPoint.z) / 2.0
-
         # Vector from body centre to edge midpoint
-        tx, ty, tz = mid_pt.x - cx, mid_pt.y - cy, mid_pt.z - cz
+        tx = mid_pt.x - body_centroid.x
+        ty = mid_pt.y - body_centroid.y
+        tz = mid_pt.z - body_centroid.z
 
         # Positive dot → bisector points away from centre → convex (external)
         return (bx*tx + by*ty + bz*tz) > 0
@@ -133,7 +150,8 @@ def _edge_is_convex(edge: adsk.fusion.BRepEdge) -> bool:
 
 def _collect_perp_edges(face: adsk.fusion.BRepFace,
                         want_external: bool,
-                        want_internal: bool) -> list:
+                        want_internal: bool,
+                        body_centroid: adsk.core.Point3D) -> list:
     """
     Returns a list of BRepEdge objects that are perpendicular to *face* (i.e.
     whose direction ≈ face normal) and pass the convexity filter.
@@ -163,10 +181,13 @@ def _collect_perp_edges(face: adsk.fusion.BRepFace,
             if not (angle < ANGLE_TOL or abs(angle - math.pi) < ANGLE_TOL):
                 continue
 
-            is_convex = _edge_is_convex(edge)
+            # Mark as seen now (not only when it qualifies below) so an edge
+            # reached again from its other vertex isn't reclassified twice.
+            seen_tokens.add(token)
+
+            is_convex = _edge_is_convex(edge, body_centroid)
             if (is_convex and want_external) or (not is_convex and want_internal):
                 result.append(edge)
-                seen_tokens.add(token)
 
     return result
 
@@ -201,63 +222,71 @@ def _apply_fillet(inputs: adsk.core.CommandInputs,
          (Skipped only during execute; preview always uses attempt-all.)
 
     Returns (any_success: bool, skipped_count: int).
+
+    Only failures intrinsic to a specific edge/fillet attempt are caught here
+    (an edge too short for the requested radius, etc.) — those are expected
+    and reported back as a skipped-edge count. Anything else (a genuine bug)
+    is allowed to propagate so callers can tell "nothing to fillet" apart
+    from "something went wrong".
     """
-    try:
-        faceSelInput = inputs.itemById('face_selection')
-        radiusInput  = inputs.itemById('fillet_radius')
-        extCheck     = inputs.itemById('external_edges')
-        intCheck     = inputs.itemById('internal_edges')
+    faceSelInput = inputs.itemById('face_selection')
+    radiusInput  = inputs.itemById('fillet_radius')
+    extCheck     = inputs.itemById('external_edges')
+    intCheck     = inputs.itemById('internal_edges')
 
-        face: adsk.fusion.BRepFace = faceSelInput.selection(0).entity
-        radius_cm: float = radiusInput.value
-        want_ext: bool = extCheck.value
-        want_int: bool = intCheck.value
+    face: adsk.fusion.BRepFace = faceSelInput.selection(0).entity
+    radius_cm: float = radiusInput.value
+    want_ext: bool = extCheck.value
+    want_int: bool = intCheck.value
 
-        edges = _collect_perp_edges(face, want_ext, want_int)
-        if not edges:
-            return False, 0
-
-        comp = face.body.parentComponent
-
-        # Build full collection and attempt a single fillet
-        all_coll = adsk.core.ObjectCollection.create()
-        for e in edges:
-            all_coll.add(e)
-
-        try:
-            _make_fillet(comp, all_coll, radius_cm)
-            return True, 0
-        except Exception:
-            futil.log(f'{CMD_NAME} all-at-once fillet failed, falling back to per-edge')
-
-        # Preview mode — don't create partial features; just report failure
-        if is_preview:
-            return False, 0
-
-        # Execute mode — fillet each edge individually, skip failures
-        skipped = 0
-        succeeded = 0
-        for edge in edges:
-            single = adsk.core.ObjectCollection.create()
-            single.add(edge)
-            try:
-                _make_fillet(comp, single, radius_cm)
-                succeeded += 1
-            except Exception:
-                skipped += 1
-
-        return succeeded > 0, skipped
-
-    except Exception:
-        futil.log(f'{CMD_NAME} _apply_fillet failed:\n{traceback.format_exc()}')
+    body_centroid = _body_centroid(face.body)
+    edges = _collect_perp_edges(face, want_ext, want_int, body_centroid)
+    if not edges:
         return False, 0
+
+    comp = face.body.parentComponent
+
+    # Build full collection and attempt a single fillet
+    all_coll = adsk.core.ObjectCollection.create()
+    for e in edges:
+        all_coll.add(e)
+
+    try:
+        _make_fillet(comp, all_coll, radius_cm)
+        return True, 0
+    except Exception:
+        futil.log(f'{CMD_NAME} all-at-once fillet failed, falling back to per-edge')
+
+    # Preview mode — don't create partial features; just report failure
+    if is_preview:
+        return False, 0
+
+    # Execute mode — fillet each edge individually, skip failures
+    skipped = 0
+    succeeded = 0
+    for edge in edges:
+        single = adsk.core.ObjectCollection.create()
+        single.add(edge)
+        try:
+            _make_fillet(comp, single, radius_cm)
+            succeeded += 1
+        except Exception:
+            skipped += 1
+
+    return succeeded > 0, skipped
 
 
 # Called when the user clicks OK.
 def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Execute Event')
 
-    success, skipped = _apply_fillet(args.command.commandInputs, is_preview=False)
+    try:
+        success, skipped = _apply_fillet(args.command.commandInputs, is_preview=False)
+    except Exception:
+        futil.handle_error(CMD_NAME, show_message_box=True)
+        args.executeFailed = True
+        args.executeFailedMessage = 'FaceFillet: an unexpected error occurred. See the Text Command window / log for details.'
+        return
 
     if not success:
         args.executeFailed = True
@@ -280,7 +309,12 @@ def command_execute(args: adsk.core.CommandEventArgs):
 def command_preview(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Preview Event')
 
-    success, _ = _apply_fillet(args.command.commandInputs, is_preview=True)
+    try:
+        success, _ = _apply_fillet(args.command.commandInputs, is_preview=True)
+    except Exception:
+        futil.handle_error(CMD_NAME, show_message_box=False)
+        return
+
     if success:
         args.isValidResult = True
 

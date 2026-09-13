@@ -899,6 +899,9 @@ def _build_edge_row_line_fill(sketch: adsk.fusion.Sketch,
         adsk.core.ValueInput.createByString(f'{spacing_cm} cm'),
         adsk.fusion.PatternDistanceType.SpacingPatternDistanceType,
     )
+    # AdjustPatternCompute (the default) scales terribly with count -- see
+    # LESSONS_LEARNED.md ("patternComputeOption default scales terribly with count").
+    patInput.patternComputeOption = adsk.fusion.PatternComputeOptions.OptimizedPatternCompute
     try:
         pattern = pat_feats.add(patInput)
     except RuntimeError as err:
