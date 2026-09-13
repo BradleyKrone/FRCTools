@@ -23,6 +23,123 @@ session.
 
 ## Lessons
 
+### There is no per-occurrence opacity at all -- `Occurrence.isLightBulbOn` is the only genuinely per-instance display control
+Chasing "Joint Inspector ghosts the entire model": `Component.opacity` is the **only** settable
+opacity in the API. `Occurrence.visibleOpacity` is read-only and its own doc says so outright ("To set
+the opacity use the opacity property of the Component object"), and `Occurrence.appearance` -- the one
+thing that *could* dim a single instance -- is unusable near a live dialog (entry below).
+`Occurrence.isIsolated` is no help either: only one occurrence can be isolated at a time. That leaves
+`Occurrence.isLightBulbOn`, confirmed live to be genuinely independent per instance (hid
+`Thunder Hex 0.375 v7:1` of 4; `:2`/`:3`/`:4` stayed visible, `Component.opacity` still 1.0, explicit
+restore came back clean). **Consequence for any "dim everything except X" feature:** a per-*component*
+ghost rule is unusable in a real FRC assembly -- 132 of that design's 194 occurrences belong to
+multi-instance components, so "ghost if any occurrence is unrelated" ghosted both sides of the joint
+too and washed out the whole model, while "keep if any occurrence is related" left every instance of a
+shared part lit. **Fix:** decide per component in three cases, not two -- all occurrences related ->
+leave lit; none related -> dim via `Component.opacity` (keeps context); **mixed** -> leave the
+component lit and hide only its unrelated occurrences via `isLightBulbOn`. Track hidden ones by
+`Occurrence.fullPathName` and restore explicitly.
+`commands/JointInspector/entry.py` (`_apply_ghosting`, `_collect_component_keep_status`, `_hide_occurrence`)
+
+### `adsk.fusion.Component` objects can't be dict keys or set members, and `entityToken` is unsafe too
+`Component` overrides `==` (two separate `occ.component` accesses for the same underlying component
+compare equal) but has no matching `__hash__`, so Python makes it unhashable -- `some_dict[comp] = x`
+raises `TypeError: unhashable type: 'Component'` at runtime, confirmed live. The obvious fix, keying
+by `comp.entityToken` instead, is **also broken**: confirmed live in a real 194-occurrence assembly
+that `Component.entityToken` collides constantly across totally unrelated components (57 collisions,
+e.g. "44x v9" and "4inch_Fairline v2" reporting the identical token) -- silently breaking any
+"already handled this one" check keyed by it. `Occurrence.entityToken` *is* reliably unique (0
+collisions, same assembly), but keying by it doesn't help either when the goal is deduplicating by
+*component*. **Fix:** `Occurrence.fullPathName` (a plain string) is a reliable, hashable identity for
+per-occurrence tracking -- see the ghosting entries below, which key off it instead of any
+Component/Occurrence object or token.
+`commands/JointInspector/entry.py` (`_hidden_occurrences`)
+
+### `Component.opacity`/`BRepBody.opacity` are shared per shared definition, not per occurrence -- the API doc's wording for `BRepBody.opacity` is misleading
+Setting `Component.opacity` dims every occurrence that references it *and* everything nested inside
+those. Confirmed live via the Fusion MCP server that `BRepBody.opacity`, even read/written through an
+occurrence-scoped `occ.bRepBodies.item(i)` proxy, behaves the same way: setting it on one occurrence's
+proxy also changed the opacity read back from a *different* occurrence's proxy of the same body --
+both for two sibling occurrences under the same parent and for two occurrences of the same component
+nested under entirely different top-level parents. This directly contradicts the literal
+`BRepBody.opacity` API doc text ("different instances of the same body can display using different
+opacity levels") -- **do not trust that wording without live-testing it first**. Practical
+consequence: an FRC assembly reuses the same bearing/spacer/fastener/pulley `Component` at many
+occurrences, so no opacity-based mechanism (`Component` or `BRepBody`) can tell occurrences of the
+same shared part apart -- ghosting one unrelated instance either also ghosts every other instance
+(including a joint's own occurrence, if it happens to be one of them), or has to exempt the whole
+component from ghosting, leaving every instance lit up together (a real reported bug: selecting one
+of four `Thunder Hex 0.375` instances kept all four un-ghosted; later, ghosting a joint whose own side
+was a 10-instance pulley dimmed that side too). Neither is acceptable when a joint's own part is a
+shared/patterned component, which is common in an FRC assembly (gears, pulleys, spacers). **Fix:**
+`Occurrence.appearance` was tried next and turned out to be unusable too (next entry). What actually
+works is splitting the decision three ways and hiding -- not dimming -- the unrelated instances of a
+shared part via `Occurrence.isLightBulbOn`; see the top entry of this file.
+`commands/JointInspector/entry.py`
+
+### `Occurrence.appearance` is genuinely independent per occurrence, but is unsafe to write anywhere near this command's live dialog -- even deferred
+An appearance *override* set via `occ.appearance = someAppearance` is confirmed live to be genuinely
+independent per occurrence (an override on one sibling occurrence of a shared Component does not
+affect another occurrence of it, even across different top-level parents) while still cascading down
+to every body nested inside that occurrence's subtree -- exactly the per-occurrence granularity
+`Component.opacity` can't provide (previous entry). That part works -- **but only from a plain script
+outside any command, or once Fusion is idle with no command open.** Two attempts to use it for
+ghosting while Joint Inspector's dialog is open were each confirmed live to break something different:
+1. Calling it *directly* from `command_input_changed`/`command_destroy` throws `RuntimeError: 3 :
+   Cannot modify the design from a read-only context` -- silently leaving the ghost appearance stuck
+   on every previously-ghosted occurrence forever (the tracking dict resets on the next
+   `command_created`, orphaning them).
+2. Deferring it to a `CustomEvent` handler (mirroring `_EDIT_JOINT_EVENT_ID`'s already-proven pattern
+   for a *different* "can't do X from inside this event" restriction -- there, `ui.
+   terminateActiveCommand()` raising "can not terminate command during a command event") escapes error
+   #1, but introduces a worse problem: the write still happens while Joint Inspector's dialog is open,
+   and doing so destabilizes the still-live `target_entity` `SelectionCommandInput` -- confirmed live
+   (reported by the user, reproduced from their screenshots) that the selection browser shows the pick
+   succeeding for a moment ("1 joint(s) found") and then reverts to "Select a body" a second later, as
+   if the selection were silently cleared.
+**Conclusion:** don't write `Occurrence.appearance` from anywhere reachable while this command's
+dialog is open, deferred or not -- use `Component.opacity` plus per-occurrence `isLightBulbOn` for
+ghosting instead (top entry of this file). Before trusting *any* property write inside an interactive
+command handler, verify it live in that *exact* context if at all possible -- a script run outside a
+command, or a direct call to the same function bypassing the dialog entirely, proves nothing about
+what's allowed while a command's dialog is actually open, and this bug shipped twice in a row because
+of exactly that gap in testing.
+`commands/JointInspector/entry.py`
+
+### `importlib.reload()` on a live add-in module doesn't remove functions/globals the new source deleted
+Confirmed live via the Fusion MCP server: after editing `entry.py` to delete a function (`_get_ghost_
+appearance`) and reload the already-imported module with `importlib.reload(mod)`, `hasattr(mod, '_get_
+ghost_appearance')` still returned `True` -- the stale function object from the previous version was
+still bound in the module's namespace, since `reload()` only re-executes the module's top-level code
+and overwrites/adds names the new source defines, it doesn't clear names that are simply absent from
+it now. **Fix:** don't trust `importlib.reload()` plus `hasattr`/behavior checks as proof that old code
+is gone -- a full add-in **Stop -> Run** does a fresh import and is the only way to get a truly clean
+module state matching the current file on disk.
+`commands/JointInspector/entry.py`
+
+### Driving Fusion's UI via script (opening a real command with `cmdDef.execute()`) can crash the app -- don't do it for live verification
+Tried, while debugging the entry above, to open a real command dialog via `ui.commandDefinitions.
+itemById(CMD_ID).execute()` from an MCP script (to get a genuine `command_input_changed` context to
+test property writes in) and then kept issuing further script calls into Fusion while that dialog sat
+open. This left the Fusion MCP server unresponsive and Fusion itself crashed shortly after, confirmed
+by the user's own Fusion crash-reporter dialog. **Fix:** never call `.execute()` on a command
+definition from a script for verification purposes, and never issue additional script calls while any
+command dialog might be open as a result of a prior script -- there is no safe way found yet to
+reproduce a real interactive-command context from outside Fusion's own UI thread. When a fix depends
+on behavior that only manifests inside a live command's event handlers, ship the change based on
+sound reasoning from already-proven patterns in the codebase, then ask the user to test it themselves
+through the normal UI rather than trying to script-drive the dialog.
+`commands/JointInspector/entry.py`
+
+### Live MCP script writes to `.opacity`/`.appearance` aren't reliably reverted by the Fusion MCP server's `undo`
+Confirmed live: setting `BRepBody.opacity` via a script, then calling the Fusion MCP server's `undo`
+feature (even twice in a row), left the value unchanged -- unlike `Component.opacity`, which a
+previous test confirmed IS undo-stack tracked (one undo reverted it). **Fix:** when a live-testing
+script mutates opacity/appearance for verification, explicitly write the property back to its
+original value in a follow-up script rather than trusting `undo` to clean up after it, and read the
+value back afterward to confirm the design is actually clean before moving on.
+`commands/JointInspector/entry.py`
+
 ### `AsBuiltJoint` has no `geometryOrOriginOne`/`Two` and its shared `geometry` can be `None`
 `adsk.fusion.AsBuiltJoint` is a distinct class from `adsk.fusion.Joint` (check with
 `joint.objectType == adsk.fusion.AsBuiltJoint.classType()`), found in a separate

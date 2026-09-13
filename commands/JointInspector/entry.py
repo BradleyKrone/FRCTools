@@ -64,6 +64,54 @@ _selected_idx = -1
 # branch.
 _syncing_rows = False
 
+# [(component, its original .opacity), ...] for every component this session
+# has ghosted via the 'ghost_others' checkbox, and
+# {fullPathName: (occurrence, its original .isLightBulbOn), ...} for every
+# individual occurrence it has hidden outright. Two mechanisms, because
+# neither alone can express "show only what this joint connects" in a real
+# FRC assembly:
+#
+# * Component.opacity is the ONLY settable opacity in the API
+#   (Occurrence.visibleOpacity is the read-only *effective* value, and its own
+#   doc says "To set the opacity use the opacity property of the Component
+#   object"). It dims every occurrence referencing that component *and*
+#   everything nested inside those, so it cannot tell two instances of a
+#   shared part apart. Ghosting a component whenever *any* of its occurrences
+#   was unrelated is what shipped first, and it ghosted the user's entire
+#   194-occurrence shooter assembly: the picked part (Thunder Hex 0.375 v7, 4
+#   occurrences) and the part its joint connected to (Side_Plate, 2
+#   occurrences) are both multi-instance, so both sides of the joint dimmed
+#   along with everything else. 132 of that design's 194 occurrences belong to
+#   multi-instance components, so almost nothing survived the rule.
+# * Occurrence.isLightBulbOn is genuinely per-occurrence -- it is the browser
+#   light bulb beside each individual instance -- but it hides rather than
+#   dims, losing the surrounding context a ghost preserves.
+#
+# So each is used where it is right (see _apply_ghosting): opacity dims whole
+# components that are entirely unrelated, isLightBulbOn hides only the
+# unrelated instances of a component that is *also* on the joint somewhere.
+#
+# Occurrence.appearance is deliberately NOT used, even though it is the one
+# mechanism that could genuinely dim a single occurrence: both a direct write
+# from inside this command's event handlers, and the same write deferred to a
+# CustomEvent handler (the escape hatch _EDIT_JOINT_EVENT_ID uses for a
+# different "can't do X from inside this event" restriction), were confirmed
+# live to break things -- the direct write throws "Cannot modify the design
+# from a read-only context", and even the deferred version destabilizes the
+# still-open target_entity SelectionCommandInput, causing it to lose its
+# selection a moment after being set (confirmed live, reported by the user).
+#
+# Identity: hidden occurrences are keyed by Occurrence.fullPathName, a plain
+# reliable string. Ghosted components can't be keyed at all -- Component has
+# no usable hash, and its entityToken collides constantly (57 collisions
+# across unrelated components in the same 194-occurrence assembly, e.g.
+# "44x v9" and "4inch_Fairline v2" reporting the identical token) -- but its
+# `==` is reliable, so that list is searched with a linear `==` scan (see
+# _find_ghosted()). Assemblies this tool deals with (tens to a few hundred
+# occurrences) make the O(n) scan negligible for a UI action.
+_ghosted_components = []
+_hidden_occurrences = {}
+
 # The joint to select/reveal once this command finishes closing, or None. Set
 # when the user clicks 'edit_joint_btn'; Fusion cannot have two command
 # dialogs open at once, so the handoff happens from command_destroy(), after
@@ -122,6 +170,11 @@ _DEPTH_BODY = 1
 _DEPTH_EXACT = 10
 _DEPTH_MARKER = 100
 
+# How transparent a ghosted (non-participating) component becomes. Not 0.0:
+# fully invisible would hide context (e.g. what a ghosted part would collide
+# with), a faint wash is enough to make the highlighted pair pop.
+_GHOST_OPACITY = 0.1
+
 
 # Executed when add-in is run.
 def start():
@@ -165,6 +218,13 @@ def stop():
     except Exception:
         pass
     _edit_joint_event = None
+    # Best-effort cleanup of a custom event a previous version of this file
+    # registered (an appearance-based ghosting approach, since reverted --
+    # see LESSONS_LEARNED.md); harmless no-op once nothing has it registered.
+    try:
+        app.unregisterCustomEvent(f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_JointInspectorGhostingEvent')
+    except Exception:
+        pass
 
 
 # Called when the user clicks the button -- builds the command dialog.
@@ -191,6 +251,20 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     inputs.addTextBoxCommandInput('target_info', '', 'Select a body.', 2, True)
 
+    ghostInp = inputs.addBoolValueInput(
+        'ghost_others', 'Ghost unrelated components', True,
+        '', True
+    )
+    # Worth spelling out, because the hidden instances are the surprising half:
+    # only opacity can ghost, and opacity is shared by every instance of a
+    # component (see the _ghosted_components comment), so a part that is on the
+    # joint at one instance has to have its other instances hidden outright.
+    ghostInp.tooltip = (
+        'Dim everything the selected joint does not connect. Other instances of a part '
+        'that the joint does use are hidden rather than dimmed -- Fusion shares one opacity '
+        'across every instance of a component, so dimming them would dim the joint\'s own part too.'
+    )
+
     # A persistently visible, clickable list of joints instead of a dropdown --
     # one row per joint, each a checkbox-styled button; _set_selected_row()
     # enforces that only one is ever checked at a time. Rows are (re)built in
@@ -204,11 +278,14 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     editJointBtn.isEnabled = False
 
     global _current_matches, _target_ambiguous, _selected_idx, _joint_to_edit, _syncing_rows
+    global _ghosted_components, _hidden_occurrences
     _current_matches = []
     _target_ambiguous = False
     _selected_idx = -1
     _joint_to_edit = None
     _syncing_rows = False
+    _ghosted_components = []
+    _hidden_occurrences = {}
 
     # Wire up event handlers. Nothing here creates geometry, but executePreview
     # is still required: it is the only place custom graphics survive Fusion's
@@ -290,6 +367,9 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             # The user unchecked the currently-active row -- nothing selected.
             _render_joint_info(inputs, -1)
 
+    elif changed.id == 'ghost_others':
+        _update_ghosting(inputs)
+
     elif changed.id == 'edit_joint_btn':
         global _joint_to_edit
         if 0 <= _selected_idx < len(_current_matches):
@@ -331,6 +411,7 @@ def _reset_joint_ui(inputs: adsk.core.CommandInputs):
     inputs.itemById('joint_info').text = 'No joint selected.'
     inputs.itemById('edit_joint_btn').isEnabled = False
     _clear_highlight()
+    _clear_ghosting()
     _refresh_viewport()
 
 
@@ -347,6 +428,7 @@ def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
     if idx < 0 or idx >= len(_current_matches):
         _selected_idx = -1
         _clear_highlight()
+        _clear_ghosting()
         jointInfoInp.text = 'No joint selected.'
         editJointBtn.isEnabled = False
         _refresh_viewport()
@@ -370,6 +452,7 @@ def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
     )
 
     jointInfoInp.formattedText = legend
+    _update_ghosting(inputs)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
@@ -422,6 +505,7 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     _target_ambiguous = False
     _selected_idx = -1
     _clear_highlight()
+    _clear_ghosting()
 
 
 def _on_edit_joint_event(args: adsk.core.CustomEventArgs):
@@ -591,6 +675,225 @@ def _find_joint_matches(target_occ):
 
 def _other_side(joint, matched_side):
     return _joint_occurrence(joint, 1 if matched_side == 0 else 0)
+
+
+# ---------------------------------------------------------------------------
+# Ghosting -- dim every component not part of the selected joint
+# ---------------------------------------------------------------------------
+#
+# Component.opacity is inherited by every occurrence that references it *and*
+# every occurrence nested inside those -- so a Component cannot be lit for one
+# of its occurrences and dim for another; whichever state it's set to applies
+# to every occurrence sharing it, everywhere in the tree, simultaneously. See
+# the module-level `_ghosted_components` comment for why that is the only
+# opacity there is, and why Occurrence.appearance can't be used to work around
+# it here.
+#
+# So the occurrence tree is walked once and every distinct Component sorted
+# into one of three cases by how its occurrences relate to the joint (an
+# occurrence "participates" when it is one of the joint's two sides, an
+# ancestor of one, or nested inside one -- see _is_kept):
+#
+#   every occurrence participates  -> leave the component fully lit.
+#   no occurrence participates     -> dim the whole component via
+#                                     Component.opacity. Context is preserved:
+#                                     a ghost is faint, not invisible.
+#   mixed                          -> the component is on the joint at one
+#                                     instance and off it at others (an FRC
+#                                     assembly reuses the same tube/bearing/
+#                                     spacer/pulley Component everywhere).
+#                                     Dimming it would dim the joint's own
+#                                     part, so instead leave the component lit
+#                                     and hide just the unrelated occurrences
+#                                     via Occurrence.isLightBulbOn, which is
+#                                     genuinely per-instance.
+#
+# The mixed case is the whole point: without it, a joint between two instances
+# of a shared part ghosts both of its own sides, which in a real assembly
+# (where most components are multi-instance) washes out the entire model.
+# If the isLightBulbOn write is ever rejected it is logged and skipped, and
+# that component simply stays lit -- degraded, but never washed out.
+
+def _ancestor_paths(occ):
+    """fullPathName of `occ` and every occurrence it's nested under, up to
+    (not including) the root component. Empty for `occ is None` (the
+    ground/root side of a joint has no occurrence to build a path from)."""
+    paths = set()
+    while occ is not None:
+        paths.add(occ.fullPathName)
+        occ = occ.assemblyContext
+    return paths
+
+
+def _is_kept(full_path, keep_paths, leaf_paths):
+    """True if `full_path` is a participating occurrence, one of its
+    ancestors, or nested inside one of the two participating occurrences."""
+    if full_path in keep_paths:
+        return True
+    return any(full_path.startswith(leaf + '+') for leaf in leaf_paths)
+
+
+def _collect_component_keep_status(occurrences, keep_paths, leaf_paths, groups):
+    """Recursively visit every occurrence in the design, recording for each
+    distinct Component (compared via `==`, since Component has no usable
+    hash -- see `_ghosted_components` above) how its occurrences relate to the
+    joint. `groups` is a list of `[component, any_kept, all_kept,
+    unrelated_occurrences]` entries, mutated in place; a linear `==` scan is
+    used to find each occurrence's entry for the same reason
+    `_ghosted_components` is a list rather than a dict.
+
+    `any_kept`/`all_kept` are what separate the three cases in `_apply_ghosting`;
+    `unrelated_occurrences` carries the specific instances to hide when a
+    component turns out to be mixed."""
+    for occ in occurrences:
+        comp = occ.component
+        kept = _is_kept(occ.fullPathName, keep_paths, leaf_paths)
+        entry = None
+        for g in groups:
+            if g[0] == comp:
+                entry = g
+                break
+        if entry is None:
+            entry = [comp, False, True, []]
+            groups.append(entry)
+        if kept:
+            entry[1] = True
+        else:
+            entry[2] = False
+            entry[3].append(occ)
+        _collect_component_keep_status(occ.childOccurrences, keep_paths, leaf_paths, groups)
+
+
+def _find_ghosted(comp):
+    """Index of `comp` in `_ghosted_components`, or -1. See the module-level
+    `_ghosted_components` comment for why this is a linear `==` scan rather
+    than a dict lookup keyed by some token."""
+    for i, (comp2, _original) in enumerate(_ghosted_components):
+        if comp2 == comp:
+            return i
+    return -1
+
+
+def _restore_if_ghosted(comp):
+    idx = _find_ghosted(comp)
+    if idx < 0:
+        return
+    comp2, original_opacity = _ghosted_components.pop(idx)
+    try:
+        comp2.opacity = original_opacity
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not restore opacity for "{comp2.name}": {err}')
+
+
+def _ghost_component(comp):
+    if _find_ghosted(comp) >= 0:
+        return
+    try:
+        original_opacity = comp.opacity
+        comp.opacity = _GHOST_OPACITY
+        _ghosted_components.append((comp, original_opacity))
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not ghost "{comp.name}": {err}')
+
+
+def _hide_occurrence(path, occ):
+    """Switch one occurrence's browser light bulb off, remembering its original
+    state. Unlike opacity this really is per-instance, so it is what lets a
+    shared part be hidden at one occurrence while the joint's own instance of
+    that same component stays lit."""
+    if path in _hidden_occurrences:
+        return
+    try:
+        original = occ.isLightBulbOn
+        occ.isLightBulbOn = False
+        _hidden_occurrences[path] = (occ, original)
+    except Exception as err:
+        # Never silent: if this ever gets rejected the way an
+        # Occurrence.appearance write does, the Text Command window is how we
+        # find out -- the component just stays lit instead.
+        futil.log(f'{CMD_NAME}: could not hide "{path}": {err}')
+
+
+def _unhide_occurrence(path):
+    entry = _hidden_occurrences.pop(path, None)
+    if entry is None:
+        return
+    occ, original = entry
+    try:
+        occ.isLightBulbOn = original
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not restore visibility for "{path}": {err}')
+
+
+def _apply_ghosting(target_occ, other_occ):
+    """Make only the joint's two sides (and whatever they're nested inside)
+    stand out: dim whole components that have nothing to do with the joint,
+    and hide the individual unrelated instances of components that do. Safe to
+    call repeatedly as the joint selection changes -- already-ghosted
+    components and already-hidden occurrences are left alone (not re-saved over
+    their own ghost/hidden value) and anything no longer excluded is restored."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return
+    root = design.rootComponent
+
+    keep_paths = _ancestor_paths(target_occ) | _ancestor_paths(other_occ)
+    leaf_paths = {occ.fullPathName for occ in (target_occ, other_occ) if occ is not None}
+
+    groups = []
+    _collect_component_keep_status(root.occurrences, keep_paths, leaf_paths, groups)
+
+    desired_hidden = {}
+    for comp, any_kept, all_kept, unrelated in groups:
+        if all_kept:
+            _restore_if_ghosted(comp)
+        elif not any_kept:
+            # Nothing about this component touches the joint -- dim the whole
+            # thing, which keeps it on screen as context.
+            _ghost_component(comp)
+        else:
+            # Mixed: dimming would take the joint's own part down with it, so
+            # keep the component lit and drop just the other instances.
+            _restore_if_ghosted(comp)
+            for occ in unrelated:
+                desired_hidden[occ.fullPathName] = occ
+
+    # Reconcile rather than clear-and-rebuild, so switching joints doesn't
+    # flash every previously-hidden occurrence back on and off again.
+    for path in list(_hidden_occurrences.keys()):
+        if path not in desired_hidden:
+            _unhide_occurrence(path)
+    for path, occ in desired_hidden.items():
+        _hide_occurrence(path, occ)
+
+    _refresh_viewport()
+
+
+def _clear_ghosting():
+    for comp, original_opacity in _ghosted_components:
+        try:
+            comp.opacity = original_opacity
+        except Exception as err:
+            futil.log(f'{CMD_NAME}: could not restore opacity for "{comp.name}": {err}')
+    _ghosted_components.clear()
+
+    for path in list(_hidden_occurrences.keys()):
+        _unhide_occurrence(path)
+
+    _refresh_viewport()
+
+
+def _update_ghosting(inputs: adsk.core.CommandInputs):
+    ghostInp: adsk.core.BoolValueCommandInput = inputs.itemById('ghost_others')
+    if ghostInp is None or not ghostInp.value:
+        _clear_ghosting()
+        return
+
+    if 0 <= _selected_idx < len(_current_matches):
+        joint, matched_side = _current_matches[_selected_idx]
+        _apply_ghosting(_joint_occurrence(joint, matched_side), _other_side(joint, matched_side))
+    else:
+        _clear_ghosting()
 
 
 # ---------------------------------------------------------------------------
