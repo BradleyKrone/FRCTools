@@ -466,133 +466,153 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         return
     workingComp = workingOcc.component
 
-    sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
-    sketch.name = 'TimingBelt'
-
-    if beltTypeInp.selectedItem.index == 0:
-        beltPitchLength = 5
-        beltThickness   = 0.174
-    else:
-        beltPitchLength = 3
-        beltThickness   = 0.126
-
-    # Belt only supports two directly-selected SketchCircles
-    if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
-        futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
-        workingOcc.deleteMe()
-        return
-
-    projList1 = sketch.include(userSelections[0])
-    projList2 = sketch.include(userSelections[1])
-    circle1_proj = projList1.item(0)
-    circle2_proj = projList2.item(0)
-
-    PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
-
-    pathCurves = adsk.core.ObjectCollection.create()
-    for curve in PitchLoop:
-        pathCurves.add(curve)          # native SketchCurve — keeps parametric link alive
-
-    curveLength = sum(curve.length for curve in PitchLoop)
-    toothCount  = int(curveLength * 10 / beltPitchLength + 0.5)
-    futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
-
-    if beltPitchLength == 5:
-        comp_name = f'Belt_HTD_5mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
-    else:
-        comp_name = f'Belt_GT2_3mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
-    workingComp.name = comp_name
-
-    # Build the belt thickness offset around the pitch loop
-    half_belt_thickness = adsk.core.ValueInput.createByReal(beltThickness / 2)
-    geoConstraints      = sketch.geometricConstraints
-    curves              = list(PitchLoop)
-
-    offsetInput = geoConstraints.createOffsetInput(curves, half_belt_thickness)
-    geoConstraints.addTwoSidesOffset(offsetInput, True)
-
-    futil.log(f'Belt offset created {sketch.profiles.count} profiles')
-    if sketch.profiles.count < 2:
-        futil.popup_error('Parts Gen: belt offset profiles not created correctly.')
-        workingOcc.deleteMe()
-        return
-
-    # Find the annular belt profile (neither the smallest nor the largest area)
-    maxArea = max(sketch.profiles.item(i).areaProperties().area for i in range(sketch.profiles.count))
-    insideLoop = None
-    for i in range(sketch.profiles.count):
-        profile = sketch.profiles.item(i)
-        if profile.areaProperties().area == maxArea:
-            insideLoop = profile.profileLoops.item(0)
-            break
-
-    if insideLoop is None:
-        futil.popup_error('Parts Gen: could not find belt inside loop.')
-        workingOcc.deleteMe()
-        return
-
-    (lineCurve, lineNormal, toothAnchorPoint) = findToothAnchor(insideLoop)
-
-    if beltPitchLength == 5:
-        baseLine = createHTD_5mmProfile(sketch)
-    else:
-        baseLine = createGT2_3mmProfile(sketch)
-
-    geoConstraints.addCoincident(baseLine.startSketchPoint, toothAnchorPoint)
-    angleDim = sketch.sketchDimensions.addAngularDimension(
-        baseLine, lineCurve, baseLine.startSketchPoint.geometry)
-    angleDim.value = 0.1
-    angleDim.deleteMe()
-    geoConstraints.addCollinear(baseLine, lineCurve)
-
-    # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
-    if is_preview and not (suppressTeethInp and suppressTeethInp.value):
-        extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
-        return
-
-    # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
-    if suppressTeethInp and suppressTeethInp.value:
-        extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
-    else:
-        extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
-
-    # Save attributes so the right-click Edit command can restore the dialog
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
-        attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
-        attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
-        attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
-        attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
-        attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
-        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
-        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+        sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
+        sketch.name = 'TimingBelt'
+
+        if beltTypeInp.selectedItem.index == 0:
+            beltPitchLength = 5
+            beltThickness   = 0.174
+        else:
+            beltPitchLength = 3
+            beltThickness   = 0.126
+
+        # Belt only supports two directly-selected SketchCircles
+        if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
+            futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
+            workingOcc.deleteMe()
+            return
+
+        projList1 = sketch.include(userSelections[0])
+        projList2 = sketch.include(userSelections[1])
+        circle1_proj = projList1.item(0)
+        circle2_proj = projList2.item(0)
+
+        # Guard against coincident/near-coincident pitch circles — _buildPitchLoop divides
+        # by the center-to-center distance, so this must be checked before it runs (mirrors
+        # the same check already used on rebuild in _update_belt_name).
+        p1_c, p2_c = circle1_proj.centerSketchPoint.geometry, circle2_proj.centerSketchPoint.geometry
+        cc_dist = math.sqrt((p2_c.x - p1_c.x) ** 2 + (p2_c.y - p1_c.y) ** 2)
+        if cc_dist < abs(circle1_proj.radius - circle2_proj.radius) + 1e-6:
+            futil.popup_error(
+                'Parts Gen: the two selected pitch circles are coincident or one is '
+                'inside the other — cannot build a belt loop.'
+            )
+            workingOcc.deleteMe()
+            return
+
+        PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
+
+        pathCurves = adsk.core.ObjectCollection.create()
+        for curve in PitchLoop:
+            pathCurves.add(curve)          # native SketchCurve — keeps parametric link alive
+
+        curveLength = sum(curve.length for curve in PitchLoop)
+        toothCount  = int(curveLength * 10 / beltPitchLength + 0.5)
+        futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
+
+        if beltPitchLength == 5:
+            comp_name = f'Belt_HTD_5mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
+        else:
+            comp_name = f'Belt_GT2_3mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
+        workingComp.name = comp_name
+
+        # Build the belt thickness offset around the pitch loop
+        half_belt_thickness = adsk.core.ValueInput.createByReal(beltThickness / 2)
+        geoConstraints      = sketch.geometricConstraints
+        curves              = list(PitchLoop)
+
+        offsetInput = geoConstraints.createOffsetInput(curves, half_belt_thickness)
+        geoConstraints.addTwoSidesOffset(offsetInput, True)
+
+        futil.log(f'Belt offset created {sketch.profiles.count} profiles')
+        if sketch.profiles.count < 2:
+            futil.popup_error('Parts Gen: belt offset profiles not created correctly.')
+            workingOcc.deleteMe()
+            return
+
+        # Find the annular belt profile (neither the smallest nor the largest area)
+        maxArea = max(sketch.profiles.item(i).areaProperties().area for i in range(sketch.profiles.count))
+        insideLoop = None
+        for i in range(sketch.profiles.count):
+            profile = sketch.profiles.item(i)
+            if profile.areaProperties().area == maxArea:
+                insideLoop = profile.profileLoops.item(0)
+                break
+
+        if insideLoop is None:
+            futil.popup_error('Parts Gen: could not find belt inside loop.')
+            workingOcc.deleteMe()
+            return
+
+        (lineCurve, lineNormal, toothAnchorPoint) = findToothAnchor(insideLoop)
+
+        if beltPitchLength == 5:
+            baseLine = createHTD_5mmProfile(sketch)
+        else:
+            baseLine = createGT2_3mmProfile(sketch)
+
+        geoConstraints.addCoincident(baseLine.startSketchPoint, toothAnchorPoint)
+        angleDim = sketch.sketchDimensions.addAngularDimension(
+            baseLine, lineCurve, baseLine.startSketchPoint.geometry)
+        angleDim.value = 0.1
+        angleDim.deleteMe()
+        geoConstraints.addCollinear(baseLine, lineCurve)
+
+        # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
+        if is_preview and not (suppressTeethInp and suppressTeethInp.value):
+            extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
+            return
+
+        # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
+        if suppressTeethInp and suppressTeethInp.value:
+            extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
+        else:
+            extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
+
+        # Save attributes so the right-click Edit command can restore the dialog
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
+            attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
+            attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
+            attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
+            attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
+            attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
+            attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+        except Exception:
+            futil.log('PartsGen: failed to save belt attributes')
+
+        # Auto-generate matching pulleys for both pitch circles (optional).
+        gen_pulleys    = genPulleysInp  is not None and genPulleysInp.value
+        pulley_teeth   = pulleyTeethInp is not None and pulleyTeethInp.value
+        if gen_pulleys:
+            # proj_circles are the projected SketchCircles inside the belt sketch — they
+            # are live parametric references so the pulleys follow when C-C distance changes.
+            proj_circles = [circle1_proj, circle2_proj]
+            for i, circle in enumerate(userSelections[:2]):
+                try:
+                    n_pulley_teeth = int(circle.radius * 20 * math.pi / beltPitchLength + 0.5)
+                    futil.log(f'Belt: auto-pulley {i+1} — radius={circle.radius:.4f} cm, teeth={n_pulley_teeth}')
+                    if n_pulley_teeth < 8:
+                        futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
+                        continue
+                    pulley_width_cm = pulleyWidthInp.value if pulleyWidthInp is not None else beltWidthInp.value
+                    create_pulley_for_belt(beltPitchLength, n_pulley_teeth, pulley_width_cm,
+                                           workingOcc, proj_circles[i], pulley_teeth,
+                                           circle_index=i, parent_comp=workingComp)
+                except Exception:
+                    futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
+
+        # Group belt + all auto-generated pulleys into one timeline entry
+        futil.group_timeline_features(design, start_marker, comp_name)
     except Exception:
-        futil.log('PartsGen: failed to save belt attributes')
-
-    # Auto-generate matching pulleys for both pitch circles (optional).
-    gen_pulleys    = genPulleysInp  is not None and genPulleysInp.value
-    pulley_teeth   = pulleyTeethInp is not None and pulleyTeethInp.value
-    if gen_pulleys:
-        # proj_circles are the projected SketchCircles inside the belt sketch — they
-        # are live parametric references so the pulleys follow when C-C distance changes.
-        proj_circles = [circle1_proj, circle2_proj]
-        for i, circle in enumerate(userSelections[:2]):
-            try:
-                n_pulley_teeth = int(circle.radius * 20 * math.pi / beltPitchLength + 0.5)
-                futil.log(f'Belt: auto-pulley {i+1} — radius={circle.radius:.4f} cm, teeth={n_pulley_teeth}')
-                if n_pulley_teeth < 8:
-                    futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
-                    continue
-                pulley_width_cm = pulleyWidthInp.value if pulleyWidthInp is not None else beltWidthInp.value
-                create_pulley_for_belt(beltPitchLength, n_pulley_teeth, pulley_width_cm,
-                                       workingOcc, proj_circles[i], pulley_teeth,
-                                       circle_index=i, parent_comp=workingComp)
-            except Exception:
-                futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
-
-    # Group belt + all auto-generated pulleys into one timeline entry
-    futil.group_timeline_features(design, start_marker, comp_name)
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_belt', show_message_box=True)
 
 
 # ---------------------------------------------------------------------------

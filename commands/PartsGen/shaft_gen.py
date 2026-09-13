@@ -127,6 +127,16 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
     shaft_type = shaftTypeInp.selectedItem.name
     len_type   = lenTypeInp.selectedItem.name
 
+    # Defensive guard — command_validate_input already blocks these values from the
+    # dialog's OK button, but executePreview can call this function with a transient
+    # or momentarily-invalid value while the user is still typing.
+    if shaft_type == SHAFT_CUSTOM:
+        od_check = customOD.value
+        id_check = customID.value
+        if od_check <= 0 or id_check <= 0 or id_check >= od_check:
+            futil.log('PartsGen _create_shaft: invalid OD/ID, skipping')
+            return
+
     design       = adsk.fusion.Design.cast(app.activeProduct)
     rootComp     = design.rootComponent
     start_marker = design.timeline.markerPosition
@@ -142,105 +152,114 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
         return
     workingComp  = workingOcc.component
 
-    if len_type == LEN_FACES:
-        face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
-        face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
-        centroid1       = _bbox_center(face1)
-        centroid2       = _bbox_center(face2)
-        ext_dir         = _extrude_direction(face1, centroid1, centroid2)
-        sketch_plane    = face1
-        face2_target    = face2
-        custom_len_expr = None
-    else:
-        face1           = None
-        face2_target    = None
-        centroid1       = adsk.core.Point3D.create(0, 0, 0)
-        ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
-        custom_len_expr = customLenInp.expression
-        sketch_plane    = rootComp.xYConstructionPlane
-
-    sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    sketch.name = 'ShaftProfile'
-
-    c1_sk  = sketch.modelToSketchSpace(centroid1)
-    center = adsk.core.Point3D.create(c1_sk.x, c1_sk.y, 0.0)
-
-    # --- Draw outer profile -------------------------------------------------
-    if shaft_type == SHAFT_HALF_HEX:
-        workingComp.name = 'Shaft_HalfInchHex'
-        _draw_hex(sketch, center, SHAFT_HALF_HEX_CR_CM)
-    elif shaft_type == SHAFT_THREE_EIGHTH_HEX:
-        workingComp.name = 'Shaft_ThreeEighthHex'
-        _draw_hex(sketch, center, SHAFT_THREE_EIGHTH_HEX_CR_CM)
-    else:
-        od_cm = customOD.value
-        od_in = od_cm / IN_TO_CM
-        workingComp.name = f'Shaft_Custom_{od_in:.4g}in'
-        sketch.sketchCurves.sketchCircles.addByCenterRadius(center, od_cm / 2.0)
-
-    if sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create a valid outer sketch profile.')
-        return
-
-    outer_profile = _largest_profile(sketch)
-
-    # --- Extrude outer body -------------------------------------------------
-    outer_feat = _extrude_one_side(
-        workingComp, outer_profile,
-        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        face2_target, custom_len_expr, ext_dir
-    )
-    body = outer_feat.bodies.item(0)
-
-    # --- Cut bore -----------------------------------------------------------
-    bore_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    bore_sketch.name = 'BoreProfile'
-
-    if shaft_type in (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX):
-        bore_r = SHAFT_BORE_RADIUS_CM
-    else:
-        bore_r = customID.value / 2.0
-
-    bore_sketch.sketchCurves.sketchCircles.addByCenterRadius(center, bore_r)
-
-    if bore_sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create bore profile.')
-        return
-
-    bore_profile = bore_sketch.profiles.item(0)
-
-    bore_extrudes = workingComp.features.extrudeFeatures
-    bore_input = bore_extrudes.createInput(
-        bore_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
-    )
-    if face2_target is not None:
-        bore_extent = adsk.fusion.ToEntityExtentDefinition.create(face2_target, False)
-    else:
-        bore_extent = adsk.fusion.DistanceExtentDefinition.create(
-            adsk.core.ValueInput.createByString(custom_len_expr)
-        )
-    bore_input.setOneSideExtent(bore_extent, ext_dir)
-    bore_input.participantBodies = [body]
-    bore_extrudes.add(bore_input)
-
-    # --- Save PartsGen attributes for right-click edit ----------------------
     try:
-        comp_attrs = workingComp.attributes
-        comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,  PART_SHAFT)
-        comp_attrs.add(ATTR_GROUP, ATTR_SHAFT_TYPE, shaftTypeInp.selectedItem.name)
-        if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
-            comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
-            comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_ID, customID.expression)
         if len_type == LEN_FACES:
-            d = math.sqrt(
-                (centroid2.x - centroid1.x) ** 2 +
-                (centroid2.y - centroid1.y) ** 2 +
-                (centroid2.z - centroid1.z) ** 2
-            )
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
+            face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
+            centroid1       = _bbox_center(face1)
+            centroid2       = _bbox_center(face2)
+            ext_dir         = _extrude_direction(face1, centroid1, centroid2)
+            sketch_plane    = face1
+            face2_target    = face2
+            custom_len_expr = None
         else:
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
-    except Exception:
-        futil.log('PartsGen: failed to save shaft attributes')
+            face1           = None
+            face2_target    = None
+            centroid1       = adsk.core.Point3D.create(0, 0, 0)
+            ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
+            custom_len_expr = customLenInp.expression
+            sketch_plane    = rootComp.xYConstructionPlane
 
-    futil.group_timeline_features(design, start_marker, workingComp.name)
+        sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
+        sketch.name = 'ShaftProfile'
+
+        c1_sk  = sketch.modelToSketchSpace(centroid1)
+        center = adsk.core.Point3D.create(c1_sk.x, c1_sk.y, 0.0)
+
+        # --- Draw outer profile -------------------------------------------------
+        if shaft_type == SHAFT_HALF_HEX:
+            workingComp.name = 'Shaft_HalfInchHex'
+            _draw_hex(sketch, center, SHAFT_HALF_HEX_CR_CM)
+        elif shaft_type == SHAFT_THREE_EIGHTH_HEX:
+            workingComp.name = 'Shaft_ThreeEighthHex'
+            _draw_hex(sketch, center, SHAFT_THREE_EIGHTH_HEX_CR_CM)
+        else:
+            od_cm = customOD.value
+            od_in = od_cm / IN_TO_CM
+            workingComp.name = f'Shaft_Custom_{od_in:.4g}in'
+            sketch.sketchCurves.sketchCircles.addByCenterRadius(center, od_cm / 2.0)
+
+        if sketch.profiles.count < 1:
+            futil.popup_error('Parts Gen: could not create a valid outer sketch profile.')
+            workingOcc.deleteMe()
+            return
+
+        outer_profile = _largest_profile(sketch)
+
+        # --- Extrude outer body -------------------------------------------------
+        outer_feat = _extrude_one_side(
+            workingComp, outer_profile,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            face2_target, custom_len_expr, ext_dir
+        )
+        body = outer_feat.bodies.item(0)
+
+        # --- Cut bore -----------------------------------------------------------
+        bore_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
+        bore_sketch.name = 'BoreProfile'
+
+        if shaft_type in (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX):
+            bore_r = SHAFT_BORE_RADIUS_CM
+        else:
+            bore_r = customID.value / 2.0
+
+        bore_sketch.sketchCurves.sketchCircles.addByCenterRadius(center, bore_r)
+
+        if bore_sketch.profiles.count < 1:
+            futil.popup_error('Parts Gen: could not create bore profile.')
+            workingOcc.deleteMe()
+            return
+
+        bore_profile = bore_sketch.profiles.item(0)
+
+        bore_extrudes = workingComp.features.extrudeFeatures
+        bore_input = bore_extrudes.createInput(
+            bore_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
+        )
+        if face2_target is not None:
+            bore_extent = adsk.fusion.ToEntityExtentDefinition.create(face2_target, False)
+        else:
+            bore_extent = adsk.fusion.DistanceExtentDefinition.create(
+                adsk.core.ValueInput.createByString(custom_len_expr)
+            )
+        bore_input.setOneSideExtent(bore_extent, ext_dir)
+        bore_input.participantBodies = [body]
+        bore_extrudes.add(bore_input)
+
+        # --- Save PartsGen attributes for right-click edit ----------------------
+        try:
+            comp_attrs = workingComp.attributes
+            comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,  PART_SHAFT)
+            comp_attrs.add(ATTR_GROUP, ATTR_SHAFT_TYPE, shaftTypeInp.selectedItem.name)
+            if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_ID, customID.expression)
+            if len_type == LEN_FACES:
+                d = math.sqrt(
+                    (centroid2.x - centroid1.x) ** 2 +
+                    (centroid2.y - centroid1.y) ** 2 +
+                    (centroid2.z - centroid1.z) ** 2
+                )
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            else:
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+        except Exception:
+            futil.log('PartsGen: failed to save shaft attributes')
+
+        futil.group_timeline_features(design, start_marker, workingComp.name)
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_shaft', show_message_box=True)

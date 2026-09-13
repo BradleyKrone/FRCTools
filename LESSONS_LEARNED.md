@@ -23,6 +23,45 @@ session.
 
 ## Lessons
 
+### `executePreview` calls the same creation code as `execute`, with no validity gate
+PartsGen's `command_preview` handled Shaft/Tube/Pulley/Sprocket by just calling
+`command_execute(args)` and then hardcoding `args.isValidResult = True` — regardless of whether
+creation actually succeeded. `executePreview` fires continuously as the user types/drags, including
+on transient states `command_validate_input` would reject (e.g. a tooth-count field mid-edit), and
+the underlying `_create_*` functions already show a blocking `ui.messageBox` on failure via
+`futil.handle_error(show_message_box=True)` — so a bad transient value produced a message box on
+every preview tick while still reporting success. **Fix:** factor the dispatch into a helper that
+returns success/failure and takes a `show_message_box` flag; `command_preview` passes `False` (log
+only) and sets `isValidResult` to the real result, `command_execute` keeps `True`. Also add cheap
+guard clauses at the top of each `_create_*` function (tooth count, OD/ID, wall thickness) that
+silently `return` rather than raise, since preview can call them with values the dialog itself would
+never allow through the OK button.
+`commands/PartsGen/entry.py` (`_run_part_creation`, `command_preview`)
+
+### A fixed-size feature must be checked against the part's own computed size, not just a tooth-count floor
+PartsGen's timing-pulley and sprocket hex bore is always cut at a fixed 0.5in across-flats,
+regardless of tooth count. `command_validate_input` only floors the tooth count (pulley ≥8, sprocket
+≥9) to keep the *tooth profile itself* from degenerating — it says nothing about whether the
+resulting tooth-OD circle is actually bigger than the hex bore. A low but "valid" tooth count (e.g.
+an 8-tooth GT2 pulley) has a tooth diameter smaller than the hex bore's circumradius, so the cut
+would self-intersect the outer profile. **Fix:** compare the hex bore's circumradius against the
+part's own computed outer/tip diameter right before cutting, and skip the cut with a clear message
+instead of attempting invalid geometry.
+`commands/PartsGen/pulley_gen.py` (`_add_hex_bore`), `commands/PartsGen/sprocket_gen.py`
+(`_add_hex_bore_sprocket`)
+
+### Zero-length-vector guards belong in the shared helper, not re-derived at every call site
+`geom_utils.twoPointUnitVector`/`lineNormal` divided by the vector's magnitude with no zero check.
+PartsGen's belt/chain pitch-loop construction (`_buildPitchLoop`) is reachable from the *initial
+creation* path with no distinct-circles check, even though the *rebuild* path (triggered when a CC
+distance is edited) already guards the equivalent condition (`cc < abs(r1 - r2)`) — an easy
+inconsistency to introduce when a feature grows a "rebuild on edit" path after the fact. **Fix:**
+raise a clear `ValueError` in the shared helper itself (so any future caller is protected for free),
+and additionally add the same explicit `cc`-distance check used on rebuild right before the initial
+build call, so the user gets a clean `popup_error` instead of an unhandled exception.
+`lib/fusionAddInUtils/geom_utils.py` (`twoPointUnitVector`, `lineNormal`),
+`commands/PartsGen/belt_gen.py`/`chain_gen.py` (`_create_belt`/`_create_chain`)
+
 ### A bounding-box center is not a reliable stand-in for "inside the body"
 FaceFillet's convex/concave edge test (`_edge_is_convex`) decided which side of an edge's
 face-normal bisector was "inside the body" by comparing against the body's *bounding-box*

@@ -545,80 +545,100 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         return
     workingComp = workingOcc.component
 
-    sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
-    sketch.name = sketch_name
-
-    if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
-        futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
-        workingOcc.deleteMe()
-        return
-
-    projList1 = sketch.include(userSelections[0])
-    projList2 = sketch.include(userSelections[1])
-    circle1_proj = projList1.item(0)
-    circle2_proj = projList2.item(0)
-
-    PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
-
-    curveLength = sum(curve.length for curve in PitchLoop)
-    link_count  = int(curveLength * 10 / pitch_mm + 0.5)
-    futil.log(f'Chain {chain_label}: loop length={curveLength:.4f} cm, links={link_count}')
-
-    width_mm = round(widthInp.value * 10)
-    comp_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
-    workingComp.name = comp_name
-
-    # Build offset profiles around the pitch loop for the chain body cross-section
-    half_thickness = adsk.core.ValueInput.createByReal(link_height_cm / 2)
-    geoConstraints = sketch.geometricConstraints
-    curves         = list(PitchLoop)
-
-    offsetInput = geoConstraints.createOffsetInput(curves, half_thickness)
-    geoConstraints.addTwoSidesOffset(offsetInput, True)
-
-    futil.log(f'Chain offset created {sketch.profiles.count} profiles')
-    if sketch.profiles.count < 2:
-        futil.popup_error('Parts Gen: chain offset profiles not created correctly.')
-        workingOcc.deleteMe()
-        return
-
-    if is_preview:
-        extrudeChain(sketch, widthInp.value)
-        return
-
-    extrudeChain(sketch, widthInp.value)
-
-    # Save attributes
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Chain')
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_TYPE,           chain_type_str)
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_WIDTH, widthInp.expression)
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_GEN_SPROCKETS,  str(genSprocketsInp.value if genSprocketsInp else True))
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_TEETH, str(sprTeethInp.value if sprTeethInp else False))
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH,    str(round(curveLength, 8)))
+        sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
+        sketch.name = sketch_name
+
+        if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
+            futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
+            workingOcc.deleteMe()
+            return
+
+        projList1 = sketch.include(userSelections[0])
+        projList2 = sketch.include(userSelections[1])
+        circle1_proj = projList1.item(0)
+        circle2_proj = projList2.item(0)
+
+        # Guard against coincident/near-coincident pitch circles — _buildPitchLoop divides
+        # by the center-to-center distance, so this must be checked before it runs (mirrors
+        # the same check already used on rebuild in _update_chain_name).
+        p1_c, p2_c = circle1_proj.centerSketchPoint.geometry, circle2_proj.centerSketchPoint.geometry
+        cc_dist = math.sqrt((p2_c.x - p1_c.x) ** 2 + (p2_c.y - p1_c.y) ** 2)
+        if cc_dist < abs(circle1_proj.radius - circle2_proj.radius) + 1e-6:
+            futil.popup_error(
+                'Parts Gen: the two selected pitch circles are coincident or one is '
+                'inside the other — cannot build a chain loop.'
+            )
+            workingOcc.deleteMe()
+            return
+
+        PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
+
+        curveLength = sum(curve.length for curve in PitchLoop)
+        link_count  = int(curveLength * 10 / pitch_mm + 0.5)
+        futil.log(f'Chain {chain_label}: loop length={curveLength:.4f} cm, links={link_count}')
+
+        width_mm = round(widthInp.value * 10)
+        comp_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
+        workingComp.name = comp_name
+
+        # Build offset profiles around the pitch loop for the chain body cross-section
+        half_thickness = adsk.core.ValueInput.createByReal(link_height_cm / 2)
+        geoConstraints = sketch.geometricConstraints
+        curves         = list(PitchLoop)
+
+        offsetInput = geoConstraints.createOffsetInput(curves, half_thickness)
+        geoConstraints.addTwoSidesOffset(offsetInput, True)
+
+        futil.log(f'Chain offset created {sketch.profiles.count} profiles')
+        if sketch.profiles.count < 2:
+            futil.popup_error('Parts Gen: chain offset profiles not created correctly.')
+            workingOcc.deleteMe()
+            return
+
+        if is_preview:
+            extrudeChain(sketch, widthInp.value)
+            return
+
+        extrudeChain(sketch, widthInp.value)
+
+        # Save attributes
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Chain')
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_TYPE,           chain_type_str)
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_WIDTH, widthInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_GEN_SPROCKETS,  str(genSprocketsInp.value if genSprocketsInp else True))
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_TEETH, str(sprTeethInp.value if sprTeethInp else False))
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH,    str(round(curveLength, 8)))
+        except Exception:
+            futil.log('PartsGen: failed to save chain attributes')
+
+        # Auto-generate sprockets
+        gen_sprockets = genSprocketsInp is not None and genSprocketsInp.value
+        show_teeth    = sprTeethInp    is not None and sprTeethInp.value
+
+        if gen_sprockets:
+            proj_circles = [circle1_proj, circle2_proj]
+            for i, circle in enumerate(userSelections[:2]):
+                try:
+                    n_teeth = _n_teeth_from_radius(circle.radius, pitch_mm)
+                    futil.log(f'Chain {chain_label}: auto-sprocket {i+1} — radius={circle.radius:.4f} cm, teeth={n_teeth}')
+                    if n_teeth < 9:
+                        futil.log(f'Chain: skipping auto-sprocket {i+1} — tooth count {n_teeth} too small')
+                        continue
+                    create_sprocket_for_chain(
+                        n_teeth, widthInp.value, pitch_mm,
+                        workingOcc, proj_circles[i], show_teeth,
+                        circle_index=i, parent_comp=workingComp,
+                    )
+                except Exception:
+                    futil.handle_error(f'PartsGen: auto-sprocket {i+1} failed', show_message_box=True)
+
+        futil.group_timeline_features(design, start_marker, comp_name)
     except Exception:
-        futil.log('PartsGen: failed to save chain attributes')
-
-    # Auto-generate sprockets
-    gen_sprockets = genSprocketsInp is not None and genSprocketsInp.value
-    show_teeth    = sprTeethInp    is not None and sprTeethInp.value
-
-    if gen_sprockets:
-        proj_circles = [circle1_proj, circle2_proj]
-        for i, circle in enumerate(userSelections[:2]):
-            try:
-                n_teeth = _n_teeth_from_radius(circle.radius, pitch_mm)
-                futil.log(f'Chain {chain_label}: auto-sprocket {i+1} — radius={circle.radius:.4f} cm, teeth={n_teeth}')
-                if n_teeth < 9:
-                    futil.log(f'Chain: skipping auto-sprocket {i+1} — tooth count {n_teeth} too small')
-                    continue
-                create_sprocket_for_chain(
-                    n_teeth, widthInp.value, pitch_mm,
-                    workingOcc, proj_circles[i], show_teeth,
-                    circle_index=i, parent_comp=workingComp,
-                )
-            except Exception:
-                futil.handle_error(f'PartsGen: auto-sprocket {i+1} failed', show_message_box=True)
-
-    futil.group_timeline_features(design, start_marker, comp_name)
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_chain', show_message_box=True)

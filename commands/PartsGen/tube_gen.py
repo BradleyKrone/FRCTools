@@ -352,6 +352,13 @@ def _create_tube(inputs: adsk.core.CommandInputs):
     else:
         t_cm = THICKNESS_MAP[tubeThickInp.selectedItem.name]
 
+    # Defensive guard — command_validate_input already blocks these values from the
+    # dialog's OK button, but executePreview can call this function with a transient
+    # or momentarily-invalid value while the user is still typing.
+    if w_cm <= 0 or h_cm <= 0 or t_cm <= 0 or t_cm >= min(w_cm, h_cm) / 2.0:
+        futil.log('PartsGen _create_tube: invalid dimensions, skipping')
+        return
+
     len_type = lenTypeInp.selectedItem.name
 
     design       = adsk.fusion.Design.cast(app.activeProduct)
@@ -369,144 +376,153 @@ def _create_tube(inputs: adsk.core.CommandInputs):
         return
     workingComp  = workingOcc.component
 
-    w_in = w_cm / IN_TO_CM
-    h_in = h_cm / IN_TO_CM
-    t_in = t_cm / IN_TO_CM
-    workingComp.name = f'Tube_{w_in:.4g}x{h_in:.4g}_T{t_in:.4g}in'
-
-    if len_type == LEN_FACES:
-        face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
-        face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
-        centroid1       = _bbox_center(face1)
-        centroid2       = _bbox_center(face2)
-        ext_dir         = _extrude_direction(face1, centroid1, centroid2)
-        sketch_plane    = face1
-        face2_target    = face2
-        custom_len_expr = None
-        _, face1_normal = face1.evaluator.getNormalAtPoint(face1.pointOnFace)
-        extrusion_axis  = face1_normal
-    else:
-        face1           = None
-        face2_target    = None
-        centroid1       = adsk.core.Point3D.create(0, 0, 0)
-        ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
-        custom_len_expr = customLenInp.expression
-        sketch_plane    = rootComp.xYConstructionPlane
-        extrusion_axis  = adsk.core.Vector3D.create(0, 0, 1)
-
-    # --- Outer rectangle sketch ---------------------------------------------
-    outer_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    outer_sketch.name = 'TubeOuterProfile'
-
-    c_sk   = outer_sketch.modelToSketchSpace(centroid1)
-    cx, cy = c_sk.x, c_sk.y
-
-    hw = w_cm / 2.0
-    hh = h_cm / 2.0
-
-    lines = outer_sketch.sketchCurves.sketchLines
-    corners_outer = [
-        adsk.core.Point3D.create(cx - hw, cy - hh, 0),
-        adsk.core.Point3D.create(cx + hw, cy - hh, 0),
-        adsk.core.Point3D.create(cx + hw, cy + hh, 0),
-        adsk.core.Point3D.create(cx - hw, cy + hh, 0),
-    ]
-    for i in range(4):
-        lines.addByTwoPoints(corners_outer[i], corners_outer[(i + 1) % 4])
-
-    if outer_sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create outer tube profile.')
-        return
-
-    outer_profile = _largest_profile(outer_sketch)
-
-    # --- Extrude outer solid ------------------------------------------------
-    outer_feat = _extrude_one_side(
-        workingComp, outer_profile,
-        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        face2_target, custom_len_expr, ext_dir
-    )
-    body = outer_feat.bodies.item(0)
-
-    # --- Inner rectangle (cut) sketch ---------------------------------------
-    inner_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    inner_sketch.name = 'TubeInnerProfile'
-
-    ihw = (w_cm - 2 * t_cm) / 2.0
-    ihh = (h_cm - 2 * t_cm) / 2.0
-    corners_inner = [
-        adsk.core.Point3D.create(cx - ihw, cy - ihh, 0),
-        adsk.core.Point3D.create(cx + ihw, cy - ihh, 0),
-        adsk.core.Point3D.create(cx + ihw, cy + ihh, 0),
-        adsk.core.Point3D.create(cx - ihw, cy + ihh, 0),
-    ]
-    inner_lines = inner_sketch.sketchCurves.sketchLines
-    for i in range(4):
-        inner_lines.addByTwoPoints(corners_inner[i], corners_inner[(i + 1) % 4])
-
-    if inner_sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create inner tube profile.')
-        return
-
-    inner_profile = _largest_profile(inner_sketch)
-
-    cut_extrudes = workingComp.features.extrudeFeatures
-    cut_input    = cut_extrudes.createInput(
-        inner_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
-    )
-    if face2_target is not None:
-        cut_extent = adsk.fusion.ToEntityExtentDefinition.create(face2_target, False)
-    else:
-        cut_extent = adsk.fusion.DistanceExtentDefinition.create(
-            adsk.core.ValueInput.createByString(custom_len_expr)
-        )
-    cut_input.setOneSideExtent(cut_extent, ext_dir)
-    cut_input.participantBodies = [body]
-    cut_extrudes.add(cut_input)
-
-    # --- Holes on each outer face --------------------------------------------
     try:
-        tubeHolesInp: adsk.core.BoolValueCommandInput = inputs.itemById('tube_add_holes')
-        if tubeHolesInp is not None and tubeHolesInp.value:
-            holeSizeInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
-            if holeSizeInp.selectedItem.name == HOLE_CUSTOM:
-                hole_diam_cm = inputs.itemById('hole_diameter').value
-            else:
-                hole_diam_cm = HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
-            _add_face_holes(workingComp, body, t_cm, hole_diam_cm, extrusion_axis, custom_len_expr)
-    except Exception:
-        futil.handle_error('PartsGen _add_face_holes', show_message_box=True)
+        w_in = w_cm / IN_TO_CM
+        h_in = h_cm / IN_TO_CM
+        t_in = t_cm / IN_TO_CM
+        workingComp.name = f'Tube_{w_in:.4g}x{h_in:.4g}_T{t_in:.4g}in'
 
-    # --- Save PartsGen attributes for right-click edit ----------------------
-    try:
-        comp_attrs = workingComp.attributes
-        comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,   PART_TUBE)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_WIDTH,  tubeWidthInp.expression)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_HEIGHT, tubeHeightInp.expression)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_THICK,  tubeThickInp.selectedItem.name)
-        if tubeThickInp.selectedItem.name == THICK_CUSTOM:
-            comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_THICK, customThickInp.expression)
-        _ahi = inputs.itemById('tube_add_holes')
-        _add = _ahi.value if _ahi else False
-        comp_attrs.add(ATTR_GROUP, ATTR_ADD_HOLES, str(_add))
-        if _add:
-            _hsi = inputs.itemById('hole_size')
-            if _hsi:
-                comp_attrs.add(ATTR_GROUP, ATTR_HOLE_SIZE, _hsi.selectedItem.name)
-                if _hsi.selectedItem.name == HOLE_CUSTOM:
-                    _hdi = inputs.itemById('hole_diameter')
-                    if _hdi:
-                        comp_attrs.add(ATTR_GROUP, ATTR_HOLE_DIAM, _hdi.expression)
         if len_type == LEN_FACES:
-            d = math.sqrt(
-                (centroid2.x - centroid1.x) ** 2 +
-                (centroid2.y - centroid1.y) ** 2 +
-                (centroid2.z - centroid1.z) ** 2
-            )
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
+            face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
+            centroid1       = _bbox_center(face1)
+            centroid2       = _bbox_center(face2)
+            ext_dir         = _extrude_direction(face1, centroid1, centroid2)
+            sketch_plane    = face1
+            face2_target    = face2
+            custom_len_expr = None
+            _, face1_normal = face1.evaluator.getNormalAtPoint(face1.pointOnFace)
+            extrusion_axis  = face1_normal
         else:
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
-    except Exception:
-        futil.log('PartsGen: failed to save tube attributes')
+            face1           = None
+            face2_target    = None
+            centroid1       = adsk.core.Point3D.create(0, 0, 0)
+            ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
+            custom_len_expr = customLenInp.expression
+            sketch_plane    = rootComp.xYConstructionPlane
+            extrusion_axis  = adsk.core.Vector3D.create(0, 0, 1)
 
-    futil.group_timeline_features(design, start_marker, workingComp.name)
+        # --- Outer rectangle sketch ---------------------------------------------
+        outer_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
+        outer_sketch.name = 'TubeOuterProfile'
+
+        c_sk   = outer_sketch.modelToSketchSpace(centroid1)
+        cx, cy = c_sk.x, c_sk.y
+
+        hw = w_cm / 2.0
+        hh = h_cm / 2.0
+
+        lines = outer_sketch.sketchCurves.sketchLines
+        corners_outer = [
+            adsk.core.Point3D.create(cx - hw, cy - hh, 0),
+            adsk.core.Point3D.create(cx + hw, cy - hh, 0),
+            adsk.core.Point3D.create(cx + hw, cy + hh, 0),
+            adsk.core.Point3D.create(cx - hw, cy + hh, 0),
+        ]
+        for i in range(4):
+            lines.addByTwoPoints(corners_outer[i], corners_outer[(i + 1) % 4])
+
+        if outer_sketch.profiles.count < 1:
+            futil.popup_error('Parts Gen: could not create outer tube profile.')
+            workingOcc.deleteMe()
+            return
+
+        outer_profile = _largest_profile(outer_sketch)
+
+        # --- Extrude outer solid ------------------------------------------------
+        outer_feat = _extrude_one_side(
+            workingComp, outer_profile,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            face2_target, custom_len_expr, ext_dir
+        )
+        body = outer_feat.bodies.item(0)
+
+        # --- Inner rectangle (cut) sketch ---------------------------------------
+        inner_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
+        inner_sketch.name = 'TubeInnerProfile'
+
+        ihw = (w_cm - 2 * t_cm) / 2.0
+        ihh = (h_cm - 2 * t_cm) / 2.0
+        corners_inner = [
+            adsk.core.Point3D.create(cx - ihw, cy - ihh, 0),
+            adsk.core.Point3D.create(cx + ihw, cy - ihh, 0),
+            adsk.core.Point3D.create(cx + ihw, cy + ihh, 0),
+            adsk.core.Point3D.create(cx - ihw, cy + ihh, 0),
+        ]
+        inner_lines = inner_sketch.sketchCurves.sketchLines
+        for i in range(4):
+            inner_lines.addByTwoPoints(corners_inner[i], corners_inner[(i + 1) % 4])
+
+        if inner_sketch.profiles.count < 1:
+            futil.popup_error('Parts Gen: could not create inner tube profile.')
+            workingOcc.deleteMe()
+            return
+
+        inner_profile = _largest_profile(inner_sketch)
+
+        cut_extrudes = workingComp.features.extrudeFeatures
+        cut_input    = cut_extrudes.createInput(
+            inner_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
+        )
+        if face2_target is not None:
+            cut_extent = adsk.fusion.ToEntityExtentDefinition.create(face2_target, False)
+        else:
+            cut_extent = adsk.fusion.DistanceExtentDefinition.create(
+                adsk.core.ValueInput.createByString(custom_len_expr)
+            )
+        cut_input.setOneSideExtent(cut_extent, ext_dir)
+        cut_input.participantBodies = [body]
+        cut_extrudes.add(cut_input)
+
+        # --- Holes on each outer face --------------------------------------------
+        try:
+            tubeHolesInp: adsk.core.BoolValueCommandInput = inputs.itemById('tube_add_holes')
+            if tubeHolesInp is not None and tubeHolesInp.value:
+                holeSizeInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
+                if holeSizeInp.selectedItem.name == HOLE_CUSTOM:
+                    hole_diam_cm = inputs.itemById('hole_diameter').value
+                else:
+                    hole_diam_cm = HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
+                _add_face_holes(workingComp, body, t_cm, hole_diam_cm, extrusion_axis, custom_len_expr)
+        except Exception:
+            futil.handle_error('PartsGen _add_face_holes', show_message_box=True)
+
+        # --- Save PartsGen attributes for right-click edit ----------------------
+        try:
+            comp_attrs = workingComp.attributes
+            comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,   PART_TUBE)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_WIDTH,  tubeWidthInp.expression)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_HEIGHT, tubeHeightInp.expression)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_THICK,  tubeThickInp.selectedItem.name)
+            if tubeThickInp.selectedItem.name == THICK_CUSTOM:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_THICK, customThickInp.expression)
+            _ahi = inputs.itemById('tube_add_holes')
+            _add = _ahi.value if _ahi else False
+            comp_attrs.add(ATTR_GROUP, ATTR_ADD_HOLES, str(_add))
+            if _add:
+                _hsi = inputs.itemById('hole_size')
+                if _hsi:
+                    comp_attrs.add(ATTR_GROUP, ATTR_HOLE_SIZE, _hsi.selectedItem.name)
+                    if _hsi.selectedItem.name == HOLE_CUSTOM:
+                        _hdi = inputs.itemById('hole_diameter')
+                        if _hdi:
+                            comp_attrs.add(ATTR_GROUP, ATTR_HOLE_DIAM, _hdi.expression)
+            if len_type == LEN_FACES:
+                d = math.sqrt(
+                    (centroid2.x - centroid1.x) ** 2 +
+                    (centroid2.y - centroid1.y) ** 2 +
+                    (centroid2.z - centroid1.z) ** 2
+                )
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            else:
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+        except Exception:
+            futil.log('PartsGen: failed to save tube attributes')
+
+        futil.group_timeline_features(design, start_marker, workingComp.name)
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_tube', show_message_box=True)

@@ -35,6 +35,8 @@ def twoPointUnitVector( startPt: adsk.core.Point2D, endPt: adsk.core.Point2D  ) 
     vec_x = endPt.x - startPt.x
     vec_y = endPt.y - startPt.y
     mag = math.hypot( vec_x, vec_y )
+    if mag < 1e-9:
+        raise ValueError('twoPointUnitVector: start and end points are coincident')
     return adsk.core.Vector2D.create( vec_x / mag, vec_y / mag )
 
 def sketchLineUnitVec( line: adsk.fusion.SketchLine ) -> adsk.core.Vector2D :
@@ -63,6 +65,8 @@ def lineNormal( startPt: adsk.core.Point2D, endPt: adsk.core.Point2D ) -> adsk.c
     norm_x = -(endPt.y - startPt.y)
     norm_y = endPt.x - startPt.x
     mag = math.hypot( norm_x, norm_y )
+    if mag < 1e-9:
+        raise ValueError('lineNormal: start and end points are coincident')
 
     return adsk.core.Vector2D.create( norm_x / mag, norm_y / mag )
 

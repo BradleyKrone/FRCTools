@@ -69,8 +69,18 @@ def _sprocket_tip_radius_cm(n_teeth: int, pitch_mm: float = CHAIN_25_PITCH_MM,
 # Hex bore (sprocket has no flanges — simple straight-through cut)
 # ---------------------------------------------------------------------------
 
-def _add_hex_bore_sprocket(comp: adsk.fusion.Component, width_cm: float):
+def _add_hex_bore_sprocket(comp: adsk.fusion.Component, width_cm: float, tip_od_cm: float):
     circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
+
+    # A small tooth count can make the sprocket body narrower than the fixed 0.5in
+    # hex bore, which would otherwise self-intersect the outer profile. Skip the
+    # cut rather than risk invalid geometry or a Fusion exception.
+    if circumradius >= tip_od_cm / 2:
+        futil.popup_error(
+            f'PartsGen: sprocket tip diameter ({tip_od_cm * 10:.1f} mm) is too small '
+            f'for the 0.5in hex bore — skipping the bore cut. Choose a larger tooth count.'
+        )
+        return
 
     sk    = comp.sketches.add(comp.xYConstructionPlane)
     lines = sk.sketchCurves.sketchLines
@@ -269,6 +279,13 @@ def _create_sprocket(inputs: adsk.core.CommandInputs):
     width_cm   = sprocket_width.value
     show_teeth = sprocket_show_teeth.value if sprocket_show_teeth is not None else False
 
+    # Defensive guard — command_validate_input already blocks tooth counts below 9
+    # from the dialog's OK button, but executePreview can call this function with a
+    # transient/momentarily-invalid value while the user is still typing.
+    if n_teeth < 3:
+        futil.log('PartsGen _create_sprocket: invalid tooth count, skipping')
+        return
+
     # Determine chain type from dropdown (default #25 if input absent)
     is_35 = (chain_type_inp is not None and '#35' in chain_type_inp.selectedItem.name)
     if is_35:
@@ -300,58 +317,66 @@ def _create_sprocket(inputs: adsk.core.CommandInputs):
         return
 
     workingComp = workingOcc.component
-    width_mm    = round(width_cm * 10)
-    comp_name   = f'{chain_prefix}-{n_teeth}Tx{width_mm}mm'
-    workingComp.name = comp_name
-
-    extrudes   = workingComp.features.extrudeFeatures
-    widthValue = adsk.core.ValueInput.createByReal(width_cm)
-
-    if show_teeth:
-        sketch = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
-        outer_diameter_cm = _createSprocketGeometry(sketch, n_teeth, pitch_mm,
-                                                     roller_diam_mm, seat_radius_mm)
-
-        if sketch.profiles.count != 1:
-            futil.popup_error(
-                f'PartsGen: Sprocket sketch has {sketch.profiles.count} profiles '
-                f'(expected 1). The tooth geometry may not have closed correctly.'
-            )
-            workingOcc.deleteMe()
-            return
-
-        extrudes.addSimple(
-            sketch.profiles.item(0),
-            widthValue,
-            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        )
-    else:
-        tip_r_cm = _sprocket_tip_radius_cm(n_teeth, pitch_mm, roller_diam_mm)
-        outer_diameter_cm = tip_r_cm * 2
-        sk_cyl = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
-        sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
-            adsk.core.Point3D.create(0, 0, 0), tip_r_cm
-        )
-        extrudes.addSimple(
-            sk_cyl.profiles.item(0),
-            widthValue,
-            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        )
-
-    _add_hex_bore_sprocket(workingComp, width_cm)
-    _add_sprocket_label(workingComp, width_cm, n_teeth)
 
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Sprocket')
-        attrs.add(ATTR_GROUP, ATTR_SPROCKET_TOOTH_COUNT, str(n_teeth))
-        attrs.add(ATTR_GROUP, ATTR_SPROCKET_WIDTH,       sprocket_width.expression)
-        attrs.add(ATTR_GROUP, ATTR_SPROCKET_SHOW_TEETH,  str(show_teeth))
-        attrs.add(ATTR_GROUP, ATTR_SPROCKET_CHAIN_TYPE,  chain_type_str)
-    except Exception:
-        futil.log('PartsGen: failed to save sprocket attributes')
+        width_mm    = round(width_cm * 10)
+        comp_name   = f'{chain_prefix}-{n_teeth}Tx{width_mm}mm'
+        workingComp.name = comp_name
 
-    futil.group_timeline_features(design, start_marker, comp_name)
+        extrudes   = workingComp.features.extrudeFeatures
+        widthValue = adsk.core.ValueInput.createByReal(width_cm)
+
+        if show_teeth:
+            sketch = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
+            outer_diameter_cm = _createSprocketGeometry(sketch, n_teeth, pitch_mm,
+                                                         roller_diam_mm, seat_radius_mm)
+
+            if sketch.profiles.count != 1:
+                futil.popup_error(
+                    f'PartsGen: Sprocket sketch has {sketch.profiles.count} profiles '
+                    f'(expected 1). The tooth geometry may not have closed correctly.'
+                )
+                workingOcc.deleteMe()
+                return
+
+            extrudes.addSimple(
+                sketch.profiles.item(0),
+                widthValue,
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            )
+        else:
+            tip_r_cm = _sprocket_tip_radius_cm(n_teeth, pitch_mm, roller_diam_mm)
+            outer_diameter_cm = tip_r_cm * 2
+            sk_cyl = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
+            sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
+                adsk.core.Point3D.create(0, 0, 0), tip_r_cm
+            )
+            extrudes.addSimple(
+                sk_cyl.profiles.item(0),
+                widthValue,
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            )
+
+        _add_hex_bore_sprocket(workingComp, width_cm, outer_diameter_cm)
+        _add_sprocket_label(workingComp, width_cm, n_teeth)
+
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Sprocket')
+            attrs.add(ATTR_GROUP, ATTR_SPROCKET_TOOTH_COUNT, str(n_teeth))
+            attrs.add(ATTR_GROUP, ATTR_SPROCKET_WIDTH,       sprocket_width.expression)
+            attrs.add(ATTR_GROUP, ATTR_SPROCKET_SHOW_TEETH,  str(show_teeth))
+            attrs.add(ATTR_GROUP, ATTR_SPROCKET_CHAIN_TYPE,  chain_type_str)
+        except Exception:
+            futil.log('PartsGen: failed to save sprocket attributes')
+
+        futil.group_timeline_features(design, start_marker, comp_name)
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_sprocket', show_message_box=True)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +454,7 @@ def create_sprocket_for_chain(n_teeth: int, width_cm: float, chain_pitch_mm: flo
                            adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
         joint_circle = sk_cyl.sketchCurves.sketchCircles.item(0)
 
-    _add_hex_bore_sprocket(workingComp, width_cm)
+    _add_hex_bore_sprocket(workingComp, width_cm, outer_diameter_cm)
     _add_sprocket_label(workingComp, width_cm, n_teeth)
 
     try:

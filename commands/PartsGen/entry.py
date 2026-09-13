@@ -561,8 +561,13 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 # execute / preview
 # ===========================================================================
 
-def command_execute(args: adsk.core.CommandEventArgs):
-    inputs = args.command.commandInputs
+def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool) -> bool:
+    """Dispatch to the selected part type's creation function.
+
+    Returns True on success, False if an exception was caught — used by
+    command_preview to report an honest isValidResult instead of always True,
+    and to keep preview-time failures out of a blocking message box.
+    """
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     try:
@@ -578,8 +583,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
             _create_chain(inputs)
         else:
             _create_belt(inputs)
+        return True
     except Exception:
-        futil.handle_error('PartsGen command_execute', show_message_box=True)
+        futil.handle_error('PartsGen command_execute', show_message_box=show_message_box)
+        return False
+
+
+def command_execute(args: adsk.core.CommandEventArgs):
+    _run_part_creation(args.command.commandInputs, show_message_box=True)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
@@ -594,8 +605,10 @@ def command_preview(args: adsk.core.CommandEventArgs):
     elif part_type == PART_CHAIN:
         _create_chain(inputs, is_preview=True)
     else:
-        command_execute(args)
-        args.isValidResult = True
+        # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
+        # a value) — don't pop a blocking message box on every tick, and report failure
+        # honestly instead of always claiming success (previously masked here).
+        args.isValidResult = _run_part_creation(inputs, show_message_box=False)
 
 
 # ===========================================================================

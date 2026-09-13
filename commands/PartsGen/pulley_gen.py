@@ -98,10 +98,20 @@ def _add_flanges(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm:
     )
 
 
-def _add_hex_bore(comp: adsk.fusion.Component, belt_width_cm: float):
+def _add_hex_bore(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm: float):
     """Cut a 0.5 in hex bore through the entire pulley (flanges + belt body)."""
     # Circumscribed radius (center to corner) from across-flats dimension
     circumradius = (HEX_BORE_FLATS_CM / 2) / math.cos(math.radians(30))
+
+    # A small tooth count can make the tooth body narrower than the fixed 0.5in hex
+    # bore, which would otherwise self-intersect the outer profile. Skip the cut
+    # rather than risk an invalid/self-intersecting geometry or a Fusion exception.
+    if circumradius >= tooth_od_cm / 2:
+        futil.popup_error(
+            f'PartsGen: pulley tooth diameter ({tooth_od_cm * 10:.1f} mm) is too small '
+            f'for the 0.5in hex bore — skipping the bore cut. Choose a larger tooth count.'
+        )
+        return
 
     # Sketch on a plane at the bottom of the lower flange
     planes      = comp.constructionPlanes
@@ -250,6 +260,14 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
 
     show_teeth = showTeethInp.value if showTeethInp is not None else False
 
+    n_teeth = int(toothCount.value)
+    # Defensive guard — command_validate_input already blocks tooth counts below 8
+    # from the dialog's OK button, but executePreview can call this function with a
+    # transient/momentarily-invalid value while the user is still typing.
+    if n_teeth < 3:
+        futil.log('PartsGen _create_pulley: invalid tooth count, skipping')
+        return
+
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
@@ -265,71 +283,77 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
         return
     workingComp = workingOcc.component
 
-    n_teeth  = int(toothCount.value)
-    width_mm = int(beltWidth.value * 10)   # value is in cm; *10 gives mm
-
-    if beltType.selectedItem.index == 0:
-        comp_name   = f'Pulley_HTD_5mm-{n_teeth}Tx{width_mm}mm'
-        belt_pitch  = 5
-        geometry_fn = createHTDPulleyGeometry
-    else:
-        comp_name   = f'Pulley_GT2_3mm-{n_teeth}Tx{width_mm}mm'
-        belt_pitch  = 3
-        geometry_fn = createGT2PulleyGeometry
-
-    workingComp.name = comp_name
-
-    extrudes   = workingComp.features.extrudeFeatures
-    widthValue = adsk.core.ValueInput.createByReal(beltWidth.value)
-
-    if show_teeth:
-        # Full toothed profile
-        sketchPlane = rootComp.xYConstructionPlane
-        sketch = workingComp.sketches.add(sketchPlane, workingOcc)
-        outer_diameter_cm = geometry_fn(sketch, belt_pitch, n_teeth)
-
-        if sketch.profiles.count != 1:
-            futil.popup_error(
-                f'Parts Gen: Timing Pulley sketch has {sketch.profiles.count} profiles '
-                f'(expected 1).  The tooth geometry may not have closed correctly.'
-            )
-            workingOcc.deleteMe()
-            return
-
-        extrudes.addSimple(
-            sketch.profiles.item(0),
-            widthValue,
-            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        )
-    else:
-        # Smooth cylinder — diameter equals the tooth outer diameter
-        outer_diameter_cm = _outer_diameter_cm(belt_pitch, n_teeth)
-        sk_cyl = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
-        sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
-            adsk.core.Point3D.create(0, 0, 0), outer_diameter_cm / 2
-        )
-        extrudes.addSimple(
-            sk_cyl.profiles.item(0),
-            widthValue,
-            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        )
-
-    _add_flanges(workingComp, beltWidth.value, outer_diameter_cm)
-    _add_hex_bore(workingComp, beltWidth.value)
-    _add_label(workingComp, beltWidth.value, n_teeth)
-
-    # Save attributes so the right-click Edit command can restore the dialog
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,           'Timing Pulley')
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE,    beltType.selectedItem.name)
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT,  str(n_teeth))
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,   beltWidth.expression)
-        attrs.add(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH,   str(show_teeth))
-    except Exception:
-        futil.log('PartsGen: failed to save pulley attributes')
+        width_mm = int(beltWidth.value * 10)   # value is in cm; *10 gives mm
 
-    futil.group_timeline_features(design, start_marker, comp_name)
+        if beltType.selectedItem.index == 0:
+            comp_name   = f'Pulley_HTD_5mm-{n_teeth}Tx{width_mm}mm'
+            belt_pitch  = 5
+            geometry_fn = createHTDPulleyGeometry
+        else:
+            comp_name   = f'Pulley_GT2_3mm-{n_teeth}Tx{width_mm}mm'
+            belt_pitch  = 3
+            geometry_fn = createGT2PulleyGeometry
+
+        workingComp.name = comp_name
+
+        extrudes   = workingComp.features.extrudeFeatures
+        widthValue = adsk.core.ValueInput.createByReal(beltWidth.value)
+
+        if show_teeth:
+            # Full toothed profile
+            sketchPlane = rootComp.xYConstructionPlane
+            sketch = workingComp.sketches.add(sketchPlane, workingOcc)
+            outer_diameter_cm = geometry_fn(sketch, belt_pitch, n_teeth)
+
+            if sketch.profiles.count != 1:
+                futil.popup_error(
+                    f'Parts Gen: Timing Pulley sketch has {sketch.profiles.count} profiles '
+                    f'(expected 1).  The tooth geometry may not have closed correctly.'
+                )
+                workingOcc.deleteMe()
+                return
+
+            extrudes.addSimple(
+                sketch.profiles.item(0),
+                widthValue,
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            )
+        else:
+            # Smooth cylinder — diameter equals the tooth outer diameter
+            outer_diameter_cm = _outer_diameter_cm(belt_pitch, n_teeth)
+            sk_cyl = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
+            sk_cyl.sketchCurves.sketchCircles.addByCenterRadius(
+                adsk.core.Point3D.create(0, 0, 0), outer_diameter_cm / 2
+            )
+            extrudes.addSimple(
+                sk_cyl.profiles.item(0),
+                widthValue,
+                adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            )
+
+        _add_flanges(workingComp, beltWidth.value, outer_diameter_cm)
+        _add_hex_bore(workingComp, beltWidth.value, outer_diameter_cm)
+        _add_label(workingComp, beltWidth.value, n_teeth)
+
+        # Save attributes so the right-click Edit command can restore the dialog
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,           'Timing Pulley')
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE,    beltType.selectedItem.name)
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT,  str(n_teeth))
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,   beltWidth.expression)
+            attrs.add(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH,   str(show_teeth))
+        except Exception:
+            futil.log('PartsGen: failed to save pulley attributes')
+
+        futil.group_timeline_features(design, start_marker, comp_name)
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_pulley', show_message_box=True)
 
 
 def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: float,
@@ -407,7 +431,7 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
         joint_circle = sk_cyl.sketchCurves.sketchCircles.item(0)
 
     _add_flanges(workingComp, belt_width_cm, outer_diameter_cm)
-    _add_hex_bore(workingComp, belt_width_cm)
+    _add_hex_bore(workingComp, belt_width_cm, outer_diameter_cm)
     _add_label(workingComp, belt_width_cm, n_teeth)
 
     try:
