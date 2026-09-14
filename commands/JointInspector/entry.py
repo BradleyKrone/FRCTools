@@ -192,6 +192,15 @@ _EXACT_OPACITY = 0.9
 _MARKER_PIXELS_THIS = 22.0
 _MARKER_PIXELS_OTHER = 13.0
 
+# Ceiling on how many bodies one side of an as-built joint may wash (see
+# _occurrence_bodies). A side is often a whole sub-assembly -- a linked
+# component especially, now that _resolve_target rolls picks up to one -- and
+# every washed body is another CustomGraphics mesh rebuilt on every single
+# preview pass. A few hundred is already enough to make switching rows in the
+# joint list crawl, and the wash is only there to say "this side, roughly";
+# past this many bodies it says that just as well.
+_MAX_WASH_BODIES = 150
+
 # Relative draw order *within* the highlight group: body wash at the bottom,
 # then the exact face/edge, then the origin markers on top.
 _DEPTH_BODY = 1
@@ -360,7 +369,7 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             return
 
         entity = targetInp.selection(0).entity
-        target_occ, ambiguous = _resolve_target(entity)
+        target_occ, ambiguous, rolled_up_from = _resolve_target(entity)
         _target_ambiguous = ambiguous
 
         if ambiguous:
@@ -372,13 +381,22 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             return
 
         target_label = target_occ.fullPathName if target_occ is not None else 'Ground / Root Component'
-        _current_matches = _find_joint_matches(target_occ)
+        # The pick was inside a linked component and got rolled up to it, so say
+        # so: otherwise "no joints found" on a part that visibly has joints
+        # inside the link reads as a bug, rather than as the answer to the
+        # different (and more useful) question being asked. See _linked_root.
+        linked_note = (' (Linked component: showing the joints that connect it to the rest of '
+                       'the design, not the joints inside it.)') if rolled_up_from is not None else ''
+        if rolled_up_from is not None:
+            _current_matches = _find_boundary_joint_matches(target_occ)
+        else:
+            _current_matches = _find_joint_matches(target_occ)
 
         if not _current_matches:
-            targetInfoInp.text = f'{target_label} -- no joints found.'
+            targetInfoInp.text = f'{target_label} -- no joints found.{linked_note}'
             return
 
-        targetInfoInp.text = f'{target_label} -- {len(_current_matches)} joint(s) found.'
+        targetInfoInp.text = f'{target_label} -- {len(_current_matches)} joint(s) found.{linked_note}'
 
         jointTableInp: adsk.core.TableCommandInput = inputs.itemById('joint_table')
         jointTableInp.clear()
@@ -709,7 +727,53 @@ def _get_entity_component(entity) -> adsk.fusion.Component:
     return None
 
 
+def _linked_root(occ):
+    """The outermost occurrence in `occ`'s own ancestry that references an
+    external component (the chain-link icon in the browser), or None when
+    nothing in the chain is a linked reference.
+
+    Picking a body deep inside a linked component should answer "what joins
+    this linked assembly into my design?", not "what joints exist inside the
+    linked document's own tree" -- the latter belong to a file this design
+    didn't author and are noise here. The whole ancestor chain is walked
+    rather than stopping at the first hit, so a link nested inside another
+    link still resolves out to the outer one.
+    """
+    outermost = None
+    while occ is not None:
+        try:
+            if occ.isReferencedComponent:
+                outermost = occ
+        except Exception:
+            pass
+        try:
+            occ = occ.assemblyContext
+        except Exception:
+            break
+    return outermost
+
+
 def _resolve_target(entity):
+    """Resolve the user's pick to the Occurrence whose joints should be listed.
+
+    Returns (occurrence_or_None, ambiguous_bool, rolled_up_from_or_None). The
+    first two are exactly what _resolve_picked_occurrence gives back; the third
+    is the deeper occurrence actually picked, in the case where that pick landed
+    inside a linked component and was rolled up to it (None otherwise). The
+    dialog uses it only to explain in `target_info` why the joints listed are
+    not the ones inside the link -- see _linked_root.
+    """
+    occ, ambiguous = _resolve_picked_occurrence(entity)
+    if ambiguous or occ is None:
+        return occ, ambiguous, None
+
+    linked = _linked_root(occ)
+    if linked is None or linked.fullPathName == occ.fullPathName:
+        return occ, False, None
+    return linked, False, occ
+
+
+def _resolve_picked_occurrence(entity):
     """Resolve whatever the user picked to the Occurrence it belongs to.
 
     Returns (occurrence_or_None, ambiguous_bool). occurrence is None when the
@@ -811,18 +875,111 @@ def _side_matches(occ, target_occ) -> bool:
 def _find_joint_matches(target_occ):
     design = adsk.fusion.Design.cast(app.activeProduct)
     matches = []
-    # allJoints and allAsBuiltJoints are two separate flattened collections on
-    # Component (regular joints and as-built joints are different API classes
-    # -- adsk.fusion.Joint vs adsk.fusion.AsBuiltJoint -- with no single
-    # collection covering both), so both have to be walked to find every joint
-    # touching the target.
-    all_joints = list(design.rootComponent.allJoints) + list(design.rootComponent.allAsBuiltJoints)
-    for joint in all_joints:
+    for joint in _all_joints_flat(design):
         if _side_matches(_joint_occurrence(joint, 0), target_occ):
             matches.append((joint, 0))
         elif _side_matches(_joint_occurrence(joint, 1), target_occ):
             matches.append((joint, 1))
     return matches
+
+
+def _in_subtree(occ, root_path) -> bool:
+    """True when `occ` is the occurrence at `root_path` or anything nested
+    inside it. Ground (None) is never in anyone's subtree."""
+    if occ is None:
+        return False
+    path = occ.fullPathName
+    return path == root_path or path.startswith(root_path + '+')
+
+
+def _find_boundary_joint_matches(root_occ):
+    """Every joint that crosses the boundary of `root_occ`'s subtree -- exactly
+    one of its two sides is `root_occ` or something nested inside it. Used for a
+    pick that landed inside a linked component, where the question is "what
+    mounts this link into my design?" rather than "what is jointed inside it".
+
+    Deliberately NOT `_find_joint_matches(root_occ)`. Matching the container
+    occurrence exactly is both wrong ways round, confirmed live on the user's
+    1206-occurrence robot:
+
+    * It misses the real answer. The one joint mounting "Spindex v177:1" to the
+      chassis hangs off a child of the link ("Spindex v177:1+Swerve_Base_mk5n_
+      2026_Belly_Pan v1:1" <-> "Swerve_Base_mk5n_2026 v56:1"), not off the link
+      occurrence. "FOV Off v6:3" is worse -- zero joints touch the container
+      occurrence, yet it is mounted to the frame rail through its Camera_Mount
+      child, so an exact match reports "no joints found" for a part that is
+      visibly jointed.
+    * It adds joints nobody asked for. The three joints whose side *is*
+      "Spindex v177:1" exactly all have their other side inside the link: they
+      are the linked document's own internal joints to that document's root
+      component, which proxy into this context as the container occurrence.
+
+    matched_side is the side *inside* the subtree, so the rest of the command
+    keeps treating the link as "this side" (green) and whatever it is mounted
+    to as "the other side" (orange).
+    """
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    root_path = root_occ.fullPathName
+    matches = []
+    for joint in _all_joints_flat(design):
+        in_one = _in_subtree(_joint_occurrence(joint, 0), root_path)
+        in_two = _in_subtree(_joint_occurrence(joint, 1), root_path)
+        if in_one != in_two:
+            matches.append((joint, 0 if in_one else 1))
+    return matches
+
+
+def _all_joints_flat(design):
+    """Every joint (regular + as-built) in the design, flattened and proxied to
+    the root context -- normally just `design.rootComponent.allJoints` plus
+    `.allAsBuiltJoints` (two separate collections: adsk.fusion.Joint vs.
+    AsBuiltJoint, no single collection covers both).
+
+    Confirmed live: that direct call raises `RuntimeError: 3 : object does not
+    belong to the occurrence's component` -- and aborts outright, dropping
+    every joint in the design, not just the offending one -- as soon as the
+    assembly contains a linked/external-reference component (the chain-link
+    icon in the browser). Fall back to building the same flattened list by
+    hand, one occurrence at a time, so a joint that can't be proxied through a
+    linked component is skipped individually instead of taking down the whole
+    list.
+    """
+    try:
+        return list(design.rootComponent.allJoints) + list(design.rootComponent.allAsBuiltJoints)
+    except RuntimeError as err:
+        futil.log(f'{CMD_NAME}: allJoints/allAsBuiltJoints failed ({err}), '
+                  f'falling back to a per-occurrence walk')
+
+    root = design.rootComponent
+    joints = []
+    try:
+        joints.extend(root.joints)
+        joints.extend(root.asBuiltJoints)
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: root component joints unreadable ({err})')
+
+    try:
+        occurrences = list(root.allOccurrences)
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: allOccurrences unreadable ({err})')
+        return joints
+
+    for occ in occurrences:
+        try:
+            comp = occ.component
+            native_joints = list(comp.joints) + list(comp.asBuiltJoints)
+        except Exception:
+            continue
+        for joint in native_joints:
+            try:
+                proxy = joint.createForAssemblyContext(occ)
+            except Exception as err:
+                futil.log(f'{CMD_NAME}: joint "{_joint_name(joint)}" could not be '
+                          f'proxied through {occ.fullPathName} ({err}), skipping')
+                continue
+            if proxy is not None:
+                joints.append(proxy)
+    return joints
 
 
 def _other_side(joint, matched_side):
@@ -1306,19 +1463,49 @@ def _clear_highlight():
 
 
 def _occurrence_bodies(occ):
-    """All BRepBody in an occurrence, or in the root component for `occ` is
-    None (ground) -- used to wash an as-built joint's side, since an
-    AsBuiltJoint (unlike a regular Joint) has no per-side geometry entity to
-    trace back to a single body."""
-    try:
-        if occ is not None:
-            if not _is_live(occ):
-                return []
-            return list(occ.bRepBodies)
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        return list(design.rootComponent.bRepBodies)
-    except Exception:
-        return []
+    """Every BRepBody in an occurrence *and everything nested inside it*, or in
+    the root component when `occ` is None (ground) -- used to wash an as-built
+    joint's side, since an AsBuiltJoint (unlike a regular Joint) has no per-side
+    geometry entity to trace back to a single body.
+
+    The recursion is the point: `Occurrence.bRepBodies` lists only the bodies
+    that occurrence's own component owns directly, and a joint side is very
+    often a sub-assembly owning none of its own -- every body it shows belongs
+    to some child occurrence. That is the normal case for a linked component,
+    which _resolve_target now rolls picks up to, so without this walk an
+    as-built joint on one would highlight nothing at all.
+
+    Truncated at _MAX_WASH_BODIES; a partial list means _draw_asbuilt_highlight
+    may fail to recognise an entity's body as belonging to the other side and
+    colour it as "this side" instead, which is a far better outcome than
+    stalling the viewport.
+    """
+    if occ is None:
+        try:
+            design = adsk.fusion.Design.cast(app.activeProduct)
+            return list(design.rootComponent.bRepBodies)
+        except Exception:
+            return []
+
+    bodies = []
+    pending = [occ]
+    while pending and len(bodies) < _MAX_WASH_BODIES:
+        current = pending.pop()
+        if not _is_live(current):
+            continue
+        try:
+            bodies.extend(current.bRepBodies)
+        except Exception as err:
+            futil.log(f'{CMD_NAME}: bodies unreadable for an occurrence: {err}')
+        try:
+            pending.extend(current.childOccurrences)
+        except Exception as err:
+            futil.log(f'{CMD_NAME}: child occurrences unreadable: {err}')
+    if len(bodies) > _MAX_WASH_BODIES:
+        futil.log(f'{CMD_NAME}: as-built side has {len(bodies)}+ bodies, washing the '
+                  f'first {_MAX_WASH_BODIES}')
+        del bodies[_MAX_WASH_BODIES:]
+    return bodies
 
 
 def _draw_joint_highlight(joint, matched_side):

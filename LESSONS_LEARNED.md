@@ -23,6 +23,57 @@ session.
 
 ## Lessons
 
+### "Joints on this linked component" means boundary-crossing joints, not joints whose side *is* it
+A pick inside a linked/external-reference component should answer "what mounts this link into my
+design?", so Joint Inspector rolls the target up to the outermost ancestor with
+`Occurrence.isReferencedComponent` True. Matching joints against that container occurrence exactly is
+wrong both ways: the real mount usually hangs off a *child* of the link (confirmed live -- "FOV Off
+v6:3" has **zero** joints on the container yet is jointed to a frame rail through its Camera_Mount
+child), while joints whose side *is* the container are the linked document's own internal joints to
+that document's root component, proxied into this context. **Fix:** match joints where exactly one
+side is in the link's subtree (`fullPathName == root or startswith(root + '+')`) and take the inside
+side as "this side".
+`commands/JointInspector/entry.py` (`_linked_root`, `_find_boundary_joint_matches`)
+
+### `Occurrence.bRepBodies` is not recursive -- a sub-assembly occurrence usually reports zero bodies
+Every top-level linked sub-assembly in the user's robot reports `bRepBodies.count == 0`; all its
+geometry belongs to child occurrences. Code that washes/inspects "the bodies of an occurrence" gets
+nothing for exactly the assemblies it matters most for. **Fix:** walk `Occurrence.childOccurrences`
+recursively and collect `bRepBodies` at each level -- and cap the result, since one CustomGraphics
+mesh per body over a few hundred bodies stalls the viewport on every preview rebuild.
+`commands/JointInspector/entry.py` (`_occurrence_bodies`)
+
+### `Component.allJoints`/`allAsBuiltJoints` throws outright -- for the *whole design* -- once a linked/external-reference component is in the tree
+Selecting a body inside a linked component (the chain-link icon in the browser, e.g. an "Insert
+linked" reference to another document) made Joint Inspector's `_find_joint_matches` crash with
+`RuntimeError: 3 : object does not belong to the occurrence's component`, raised directly from
+Fusion's own `Component__get_allJoints` getter -- confirmed live via the Fusion MCP script tool that
+`list(design.rootComponent.allJoints)` fails this way on a real 1206-occurrence assembly containing
+such a link, with **zero** joints returned, not just the ones touching the link. The bug isn't
+target-specific: it reproduces for *any* selection once the design contains such a component, because
+the failure is in flattening the whole design's joints, not in matching a particular occurrence.
+**Fix:** don't rely on the bulk `allJoints`/`allAsBuiltJoints` properties alone. Try them first (fast
+path, works for every design without a link), and on `RuntimeError` fall back to building the same
+flattened, root-proxied list by hand: walk `root.allOccurrences`, read each occurrence's *native*
+`comp.joints`/`comp.asBuiltJoints`, and proxy each one individually via
+`joint.createForAssemblyContext(occ)` inside its own try/except -- a joint that can't be proxied
+through one bad occurrence is just skipped and logged, instead of taking down every other joint in the
+design with it. Confirmed live on the same assembly: the fallback recovered 734 of 747 joints (13 more
+came straight off the root component), with only the 59 genuinely unproxyable ones skipped.
+`commands/JointInspector/entry.py` (`_all_joints_flat`)
+
+### Don't drive `DcEditJointAssembleCmd` (or terminate it) from a script -- it crashed Fusion
+Tried, with a joint selected, to invoke the internal "double-click edit joint" command definition
+(`ui.commandDefinitions.itemById('DcEditJointAssembleCmd')`) via the MCP script tool to see if it
+would open the real Edit Joint dialog pre-bound to that joint (hoping it behaved differently than
+`EditJointAssembleCmd`, which was already confirmed to open blank -- see `_joint_to_edit` in
+`commands/JointInspector/entry.py`). It did open a dialog, but bound to nothing (same blank/new-joint
+state, confirmed via screenshot), and calling `ui.terminateActiveCommand()` on it right after crashed
+Fusion outright. **Fix: don't.** There is no known API path to open the native Edit Joint dialog
+pre-loaded with an existing joint -- stick with select + `FindInBrowser` (previous entry) and let the
+user double-click it themselves.
+`commands/JointInspector/entry.py`
+
 ### Selecting an entity doesn't expand its collapsed browser ancestors -- run `FindInBrowser` too
 `ui.activeSelections.add(entity)` highlights the entity in the browser tree only if its parent
 folders (component, Joints folder, etc.) are already expanded; if they're collapsed nothing visibly
