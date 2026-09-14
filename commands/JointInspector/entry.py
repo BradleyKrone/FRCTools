@@ -145,12 +145,12 @@ _hidden_occurrences = {}
 # dialogs open at once, so the handoff happens from command_destroy(), after
 # this command has fully torn down.
 #
-# This only selects and reveals the joint (positions the timeline at it and
-# selects it, so the user's very next action -- double-clicking it in the
-# browser -- opens Fusion's real Edit Joint dialog). Confirmed live that there
-# is no way to make that dialog itself open pre-loaded with an existing
-# joint's data via the public API: selecting the Joint (with or without
-# rolling the timeline first) and executing 'EditJointAssembleCmd' -- the
+# This only selects and reveals the joint (highlights it in the browser tree,
+# so the user's very next action -- double-clicking it in the browser --
+# opens Fusion's real Edit Joint dialog). Confirmed live that there is no way
+# to make that dialog itself open pre-loaded with an existing joint's data via
+# the public API: selecting the Joint (with or without rolling the timeline
+# first) and executing 'EditJointAssembleCmd' -- the
 # built-in "Edit Joint " command definition -- always opened it blank, as if
 # creating a new joint, never bound to the one that was selected. Fusion's own
 # double-click-to-edit for a joint isn't exposed as a matching, scriptable API
@@ -651,9 +651,22 @@ def _on_edit_joint_event(args: adsk.core.CustomEventArgs):
 
 
 def _reveal_joint_for_edit(joint):
-    """Position the timeline at `joint` and select it, so the user's very
-    next action -- double-clicking it in the browser -- opens Fusion's real
-    Edit Joint dialog for it.
+    """Select `joint` and run Fusion's built-in 'FindInBrowser' command on it,
+    so it's highlighted in the browser tree with every collapsed ancestor
+    folder expanded -- the same thing right-click > Find in Browser does --
+    and the user's very next action -- double-clicking it in the browser --
+    opens Fusion's real Edit Joint dialog for it.
+
+    Plain ui.activeSelections.add() alone (tried first) selects the joint but
+    does *not* expand collapsed browser folders to reveal it, which is the
+    whole point here -- confirmed live via the 'FindInBrowser' command
+    definition (ui.commandDefinitions.itemById('FindInBrowser')), which does
+    expand ancestors, is what the native right-click menu item runs, and
+    requires the target already be the active selection when it executes.
+
+    Deliberately does NOT roll the timeline to the joint -- that was the
+    previous behavior and was found to be an unwanted side effect (it leaves
+    the design rolled back after just inspecting a joint).
 
     Only called after Joint Inspector's own dialog has fully closed -- Fusion
     can't show another command's dialog while this one is still open, and
@@ -666,9 +679,11 @@ def _reveal_joint_for_edit(joint):
     public API (see the _joint_to_edit comment above for what was tried).
     """
     try:
-        joint.timelineObject.rollTo(False)
         ui.activeSelections.clear()
         ui.activeSelections.add(joint)
+        find_in_browser = ui.commandDefinitions.itemById('FindInBrowser')
+        if find_in_browser:
+            find_in_browser.execute()
     except Exception:
         futil.handle_error(f'{CMD_NAME} reveal joint for edit', show_message_box=True)
 

@@ -23,6 +23,15 @@ session.
 
 ## Lessons
 
+### Selecting an entity doesn't expand its collapsed browser ancestors -- run `FindInBrowser` too
+`ui.activeSelections.add(entity)` highlights the entity in the browser tree only if its parent
+folders (component, Joints folder, etc.) are already expanded; if they're collapsed nothing visibly
+happens. **Fix:** select the entity first, then execute the built-in command definition
+`ui.commandDefinitions.itemById('FindInBrowser')` -- this is exactly what right-click > "Find in
+Browser" runs, and it expands every collapsed ancestor and highlights the item. It acts on the
+current selection, so the select-then-execute order matters.
+`commands/JointInspector/entry.py`
+
 ### `activeViewport.refresh()` inside a command event can crash Fusion
 `refresh()` pumps Fusion's message loop, so calling it from `executePreview`/`inputChanged` lets a
 queued event run **re-entrantly** on top of the design writes the current pass is still holding --
