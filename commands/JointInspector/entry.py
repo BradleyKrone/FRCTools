@@ -41,6 +41,17 @@ _current_matches = []
 # actually picked -- OK is disabled rather than silently guessing.
 _target_ambiguous = False
 
+# Current state of the 'ghost_others' checkbox. inputChanged only records it
+# here; command_preview is what actually applies or clears the ghosting. See
+# command_preview for why no design write may happen from inputChanged.
+_ghost_enabled = True
+
+# (ghost_enabled, selected_idx) of the last ghosting state successfully applied,
+# so a preview rebuild that changes nothing doesn't re-walk the whole occurrence
+# tree. Paired with _ghosting_still_applied(), which catches the case where
+# Fusion rolled our preview-time writes back underneath us.
+_applied_ghost_key = None
+
 # CustomGraphicsGroup drawn on the root component to show the currently
 # selected joint's connection -- rebuilt every time the joint selection
 # changes, torn down in command_destroy. Kept as a plain module global
@@ -63,6 +74,23 @@ _selected_idx = -1
 # would recurse straight back into _command_input_changed's 'joint_row_'
 # branch.
 _syncing_rows = False
+
+# Re-entrancy guard for command_preview. executePreview both modifies the design
+# (the ghosting) and builds custom graphics; if Fusion ever re-enters it while a
+# previous call is still running, the second pass writes opacity/visibility on
+# top of a half-applied first pass and rebuilds graphics the first pass is still
+# holding -- which is a hard crash, not a Python exception. Cheap insurance.
+_in_preview = False
+
+# Bumped every time the joint table is repopulated, and baked into each row's
+# input id. TableCommandInput.clear() only detaches the rows from the table --
+# the BoolValue/TextBox inputs themselves stay alive in the CommandInputs
+# collection that created them -- so reusing 'joint_row_0' for a second target
+# selection collides with the still-live input from the first one. Fusion does
+# not reject the duplicate id; itemById() then resolves to the stale input while
+# the events arrive from the new one, so _set_selected_row() silently unchecks
+# nothing and the widget list grows without bound for the life of the dialog.
+_row_generation = 0
 
 # [(component, its original .opacity), ...] for every component this session
 # has ghosted via the 'ghost_others' checkbox, and
@@ -283,9 +311,11 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     editJointBtn.isEnabled = False
 
     global _current_matches, _target_ambiguous, _selected_idx, _joint_to_edit, _syncing_rows
-    global _ghosted_components, _hidden_occurrences
+    global _ghosted_components, _hidden_occurrences, _ghost_enabled, _applied_ghost_key
     _current_matches = []
     _target_ambiguous = False
+    _ghost_enabled = True
+    _applied_ghost_key = None
     _selected_idx = -1
     _joint_to_edit = None
     _syncing_rows = False
@@ -316,7 +346,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 def _command_input_changed(args: adsk.core.InputChangedEventArgs):
     changed = args.input
     inputs = args.inputs
-    global _current_matches, _target_ambiguous
+    global _current_matches, _target_ambiguous, _ghost_enabled
 
     if changed.id == 'target_entity':
         _reset_joint_ui(inputs)
@@ -352,13 +382,22 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
 
         jointTableInp: adsk.core.TableCommandInput = inputs.itemById('joint_table')
         jointTableInp.clear()
+        # Rows are created from the *table's own* CommandInputs collection, not
+        # the dialog's top-level one: that is the collection TableCommandInput
+        # owns, and the pattern Autodesk's own table sample uses. Building them
+        # from `inputs` leaves every row permanently parented to the dialog,
+        # where clear() cannot reach it. The generation stamp then guarantees a
+        # fresh id per rebuild -- see _row_generation.
+        global _row_generation
+        _row_generation += 1
+        rowInputs = jointTableInp.commandInputs
         for i, (joint, matched_side) in enumerate(_current_matches):
             other_occ = _other_side(joint, matched_side)
             other_label = other_occ.fullPathName if other_occ is not None else 'Ground'
             tag = ' [As-built]' if _is_as_built(joint) else ''
             label = f'{_joint_name(joint)}{tag}  ->  {other_label}'
-            rowInp = inputs.addBoolValueInput(f'joint_row_{i}', '', True, '', i == 0)
-            labelInp = inputs.addTextBoxCommandInput(f'joint_label_{i}', '', label, 1, True)
+            rowInp = rowInputs.addBoolValueInput(_row_id(i), '', True, '', i == 0)
+            labelInp = rowInputs.addTextBoxCommandInput(_label_id(i), '', label, 1, True)
             jointTableInp.addCommandInput(rowInp, i, 0)
             jointTableInp.addCommandInput(labelInp, i, 1)
         jointTableInp.isEnabled = True
@@ -366,7 +405,11 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
         _render_joint_info(inputs, 0)
 
     elif changed.id.startswith('joint_row_'):
-        idx = int(changed.id[len('joint_row_'):])
+        idx = _row_index(changed.id)
+        if idx < 0 or idx >= len(_current_matches):
+            # A row from a superseded table generation, or one whose joint has
+            # since been cleared -- ignore rather than index into stale state.
+            return
         if changed.value:
             _set_selected_row(inputs, idx)
             _render_joint_info(inputs, idx)
@@ -375,7 +418,9 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             _render_joint_info(inputs, -1)
 
     elif changed.id == 'ghost_others':
-        _update_ghosting(inputs)
+        # Record only. Applying it here -- i.e. writing Component.opacity from
+        # inputChanged -- is exactly what broke the command (see command_preview).
+        _ghost_enabled = changed.value
 
     elif changed.id == 'edit_joint_btn':
         global _joint_to_edit
@@ -390,6 +435,27 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             app.fireCustomEvent(_EDIT_JOINT_EVENT_ID)
 
 
+def _row_id(i: int) -> str:
+    return f'joint_row_{_row_generation}_{i}'
+
+
+def _label_id(i: int) -> str:
+    return f'joint_label_{_row_generation}_{i}'
+
+
+def _row_index(input_id: str) -> int:
+    """Row index out of a generation-stamped 'joint_row_<gen>_<i>' id, or -1 if
+    the id belongs to a table we have since rebuilt (those inputs stay alive and
+    keep firing -- see _row_generation)."""
+    try:
+        gen, idx = input_id[len('joint_row_'):].split('_', 1)
+        if int(gen) != _row_generation:
+            return -1
+        return int(idx)
+    except Exception:
+        return -1
+
+
 def _set_selected_row(inputs: adsk.core.CommandInputs, idx: int):
     """Uncheck every joint_row_* checkbox except row `idx`, guarded against
     re-entrantly firing _command_input_changed for each row it unchecks."""
@@ -398,11 +464,15 @@ def _set_selected_row(inputs: adsk.core.CommandInputs, idx: int):
         return
     _syncing_rows = True
     try:
+        jointTableInp: adsk.core.TableCommandInput = inputs.itemById('joint_table')
+        if jointTableInp is None:
+            return
+        rowInputs = jointTableInp.commandInputs
         for i in range(len(_current_matches)):
             if i == idx:
                 continue
-            rowInp: adsk.core.BoolValueCommandInput = inputs.itemById(f'joint_row_{i}')
-            if rowInp is not None:
+            rowInp: adsk.core.BoolValueCommandInput = rowInputs.itemById(_row_id(i))
+            if rowInp is not None and rowInp.value:
                 rowInp.value = False
     finally:
         _syncing_rows = False
@@ -417,16 +487,14 @@ def _reset_joint_ui(inputs: adsk.core.CommandInputs):
     jointTableInp.isEnabled = False
     inputs.itemById('joint_info').text = 'No joint selected.'
     inputs.itemById('edit_joint_btn').isEnabled = False
-    _clear_highlight()
-    _clear_ghosting()
-    _refresh_viewport()
 
 
 def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
     """Update the dialog text and record which joint is selected.
 
-    Deliberately does NOT draw -- command_preview() owns the viewport, because
-    only graphics created there survive Fusion's preview rebuilds.
+    Deliberately touches neither the viewport nor the design -- command_preview()
+    owns both, because it is the only handler allowed to modify the design and
+    the only place custom graphics survive Fusion's preview rebuilds.
     """
     global _selected_idx
     jointInfoInp: adsk.core.TextBoxCommandInput = inputs.itemById('joint_info')
@@ -434,11 +502,8 @@ def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
 
     if idx < 0 or idx >= len(_current_matches):
         _selected_idx = -1
-        _clear_highlight()
-        _clear_ghosting()
         jointInfoInp.text = 'No joint selected.'
         editJointBtn.isEnabled = False
-        _refresh_viewport()
         return
 
     _selected_idx = idx
@@ -459,38 +524,85 @@ def _render_joint_info(inputs: adsk.core.CommandInputs, idx: int):
     )
 
     jointInfoInp.formattedText = legend
-    _update_ghosting(inputs)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
-    """Draw the selected joint's highlight.
+    """Apply the ghosting and draw the selected joint's highlight.
 
     Fusion calls this after every preview rebuild -- which is also what wipes
-    the previous CustomGraphicsGroup -- so redrawing unconditionally here is
-    what keeps the highlight on screen instead of flashing once and vanishing.
+    the previous CustomGraphicsGroup -- so redoing both unconditionally here is
+    what keeps them on screen instead of flashing once and vanishing.
+
+    Both halves live here rather than in inputChanged. Writing
+    Component.opacity / Occurrence.isLightBulbOn from inputChanged was confirmed
+    live to suspend this command's entire compute pipeline: Fusion stopped
+    firing validateInputs and executePreview for the rest of the dialog's life,
+    so the OK button greyed itself out, target_entity silently lost its
+    selection (activeCommand reported selectionCount 0 while the joint table was
+    still populated), and the highlight never drew at all -- with nothing logged
+    anywhere, because the draw was never reached. inputChanged only ever records
+    intent now (_selected_idx, _ghost_enabled); executePreview is the one
+    handler in which a command may legitimately modify the design.
+
+    Guarded against re-entrancy, and deliberately does not force a viewport
+    refresh -- see _in_preview and the comment at the end of this function.
     """
-    try:
-        if 0 <= _selected_idx < len(_current_matches):
-            joint, matched_side = _current_matches[_selected_idx]
-            _draw_joint_highlight(joint, matched_side)
-        else:
-            _clear_highlight()
-            _refresh_viewport()
-    except Exception:
-        # Never fail silently here: a swallowed exception in the redraw path
-        # once looked exactly like "the tool just stopped working".
-        futil.handle_error(f'{CMD_NAME} command_preview', show_message_box=False)
+    global _in_preview
 
     # Nothing is being built -- keep the command in preview mode so Fusion
-    # doesn't treat this as a computed result.
+    # doesn't treat this as a computed result. Set first so the early return
+    # below can't leave the command looking computed.
     args.isValidResult = False
+
+    if _in_preview:
+        # Re-entered while the previous pass is still running (see _in_preview).
+        # Bail rather than interleave two passes of design writes + graphics.
+        futil.log(f'{CMD_NAME}: executePreview re-entered, skipping nested pass')
+        return
+    _in_preview = True
+    try:
+        try:
+            _update_ghosting()
+        except Exception:
+            futil.handle_error(f'{CMD_NAME} command_preview ghosting', show_message_box=False)
+
+        try:
+            joint = None
+            matched_side = 0
+            if 0 <= _selected_idx < len(_current_matches):
+                joint, matched_side = _current_matches[_selected_idx]
+            if _is_live(joint):
+                _draw_joint_highlight(joint, matched_side)
+            else:
+                _clear_highlight()
+        except Exception:
+            # Never fail silently here: a swallowed exception in the redraw path
+            # once looked exactly like "the tool just stopped working".
+            futil.handle_error(f'{CMD_NAME} command_preview', show_message_box=False)
+    finally:
+        _in_preview = False
+
+    # Deliberately NO activeViewport.refresh() here. refresh() pumps Fusion's
+    # message loop, so calling it from inside a command event lets a queued
+    # inputChanged/executePreview run *re-entrantly*, on top of the design
+    # writes this pass just made and is still holding -- which takes Fusion
+    # down outright rather than raising. executePreview is already part of
+    # Fusion's own redraw cycle, so the graphics built above get painted
+    # without asking. (The manual refresh was needed back when the drawing
+    # happened in inputChanged, outside any redraw.) Teardown still refreshes,
+    # from command_destroy, where no further preview can be queued behind it.
 
 
 def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
+    # Deliberately NOT gated on target_entity.selectionCount. This command
+    # builds nothing -- OK just closes it -- so there is no result to protect,
+    # and an invalid command is one Fusion stops calling executePreview for.
+    # Since executePreview is now the sole owner of both the highlight and the
+    # ghosting, gating it would strand whatever was last drawn/dimmed on screen
+    # with no handler left running to clean it up. Only a genuinely unusable
+    # pick (an ambiguous multi-instance component) blocks OK.
     try:
-        inputs = args.inputs
-        targetInp: adsk.core.SelectionCommandInput = inputs.itemById('target_entity')
-        args.areInputsValid = targetInp.selectionCount == 1 and not _target_ambiguous
+        args.areInputsValid = not _target_ambiguous
     except Exception:
         futil.handle_error(f'{CMD_NAME} command_validate_input', show_message_box=False)
         args.areInputsValid = False
@@ -507,12 +619,16 @@ def command_execute(args: adsk.core.CommandEventArgs):
 
 def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers, _current_matches, _target_ambiguous, _selected_idx
+    global _ghost_enabled, _applied_ghost_key
     local_handlers = []
     _current_matches = []
     _target_ambiguous = False
     _selected_idx = -1
+    _ghost_enabled = True
+    _applied_ghost_key = None
     _clear_highlight()
     _clear_ghosting()
+    _refresh_viewport()
 
 
 def _on_edit_joint_event(args: adsk.core.CustomEventArgs):
@@ -648,6 +764,20 @@ def _joint_name(joint):
         return '<unnamed joint>'
 
 
+def _is_live(entity) -> bool:
+    """True when `entity` is still a usable API object.
+
+    _current_matches caches Joint objects from when the target was picked, and
+    Fusion rolls back executePreview's design writes before each rebuild -- so
+    by a later pass a cached joint, or geometry reached through it, can already
+    be dead. Reading off a dead one crashes Fusion instead of raising, so
+    anything cached across preview rebuilds is checked before use."""
+    try:
+        return entity is not None and entity.isValid
+    except Exception:
+        return False
+
+
 def _is_as_built(joint) -> bool:
     try:
         return joint.objectType == adsk.fusion.AsBuiltJoint.classType()
@@ -740,35 +870,49 @@ def _is_kept(full_path, keep_paths, leaf_paths):
     return any(full_path.startswith(leaf + '+') for leaf in leaf_paths)
 
 
-def _collect_component_keep_status(occurrences, keep_paths, leaf_paths, groups):
-    """Recursively visit every occurrence in the design, recording for each
-    distinct Component (compared via `==`, since Component has no usable
-    hash -- see `_ghosted_components` above) how its occurrences relate to the
-    joint. `groups` is a list of `[component, any_kept, all_kept,
-    unrelated_occurrences]` entries, mutated in place; a linear `==` scan is
-    used to find each occurrence's entry for the same reason
-    `_ghosted_components` is a list rather than a dict.
+def _collect_component_keep_status(root, keep_paths, leaf_paths):
+    """Visit every occurrence in the design, recording for each distinct
+    Component (compared via `==`, since Component has no usable hash -- see
+    `_ghosted_components` above) how its occurrences relate to the joint.
+    Returns a list of `[component, any_kept, all_kept, unrelated_occurrences]`.
 
     `any_kept`/`all_kept` are what separate the three cases in `_apply_ghosting`;
     `unrelated_occurrences` carries the specific instances to hide when a
-    component turns out to be mixed."""
-    for occ in occurrences:
+    component turns out to be mixed.
+
+    `root.allOccurrences` is the flattened equivalent of recursing through
+    `childOccurrences`, and components are bucketed by name -- a plain string
+    compare -- before the `==` scan that actually establishes identity, so that
+    scan only ever runs against the handful of components sharing a name.
+    The previous version compared each occurrence's component against *every*
+    component seen so far: O(n^2) COM comparisons across the whole assembly,
+    redone on every single preview rebuild. On the user's 194-occurrence
+    shooter that is tens of thousands of API round-trips per redraw, which is
+    what made clicking through a long joint list stall."""
+    groups = []
+    buckets = {}
+    for occ in root.allOccurrences:
         comp = occ.component
-        kept = _is_kept(occ.fullPathName, keep_paths, leaf_paths)
+        try:
+            key = comp.name
+        except Exception:
+            key = ''
+        bucket = buckets.setdefault(key, [])
         entry = None
-        for g in groups:
+        for g in bucket:
             if g[0] == comp:
                 entry = g
                 break
         if entry is None:
             entry = [comp, False, True, []]
+            bucket.append(entry)
             groups.append(entry)
-        if kept:
+        if _is_kept(occ.fullPathName, keep_paths, leaf_paths):
             entry[1] = True
         else:
             entry[2] = False
             entry[3].append(occ)
-        _collect_component_keep_status(occ.childOccurrences, keep_paths, leaf_paths, groups)
+    return groups
 
 
 def _find_ghosted(comp):
@@ -786,6 +930,8 @@ def _restore_if_ghosted(comp):
     if idx < 0:
         return
     comp2, original_opacity = _ghosted_components.pop(idx)
+    if not _is_live(comp2):
+        return
     try:
         comp2.opacity = original_opacity
     except Exception as err:
@@ -793,12 +939,22 @@ def _restore_if_ghosted(comp):
 
 
 def _ghost_component(comp):
-    if _find_ghosted(comp) >= 0:
+    """Dim `comp`, remembering its original opacity the first time only.
+
+    Re-asserts the ghost value when it has drifted back rather than returning
+    early on "already ghosted": these writes now happen from executePreview, and
+    Fusion rolls a preview's design changes back before building the next one,
+    so an entry in _ghosted_components does not prove the model is still dimmed.
+    Recording the original only once is what keeps a rolled-back value from
+    being saved over the real one.
+    """
+    if not _is_live(comp):
         return
     try:
-        original_opacity = comp.opacity
-        comp.opacity = _GHOST_OPACITY
-        _ghosted_components.append((comp, original_opacity))
+        if _find_ghosted(comp) < 0:
+            _ghosted_components.append((comp, comp.opacity))
+        if comp.opacity != _GHOST_OPACITY:
+            comp.opacity = _GHOST_OPACITY
     except Exception as err:
         futil.log(f'{CMD_NAME}: could not ghost "{comp.name}": {err}')
 
@@ -808,12 +964,13 @@ def _hide_occurrence(path, occ):
     state. Unlike opacity this really is per-instance, so it is what lets a
     shared part be hidden at one occurrence while the joint's own instance of
     that same component stays lit."""
-    if path in _hidden_occurrences:
+    if not _is_live(occ):
         return
     try:
-        original = occ.isLightBulbOn
-        occ.isLightBulbOn = False
-        _hidden_occurrences[path] = (occ, original)
+        if path not in _hidden_occurrences:
+            _hidden_occurrences[path] = (occ, occ.isLightBulbOn)
+        if occ.isLightBulbOn:
+            occ.isLightBulbOn = False
     except Exception as err:
         # Never silent: if this ever gets rejected the way an
         # Occurrence.appearance write does, the Text Command window is how we
@@ -826,6 +983,8 @@ def _unhide_occurrence(path):
     if entry is None:
         return
     occ, original = entry
+    if not _is_live(occ):
+        return
     try:
         occ.isLightBulbOn = original
     except Exception as err:
@@ -847,8 +1006,7 @@ def _apply_ghosting(target_occ, other_occ):
     keep_paths = _ancestor_paths(target_occ) | _ancestor_paths(other_occ)
     leaf_paths = {occ.fullPathName for occ in (target_occ, other_occ) if occ is not None}
 
-    groups = []
-    _collect_component_keep_status(root.occurrences, keep_paths, leaf_paths, groups)
+    groups = _collect_component_keep_status(root, keep_paths, leaf_paths)
 
     desired_hidden = {}
     for comp, any_kept, all_kept, unrelated in groups:
@@ -873,11 +1031,11 @@ def _apply_ghosting(target_occ, other_occ):
     for path, occ in desired_hidden.items():
         _hide_occurrence(path, occ)
 
-    _refresh_viewport()
-
 
 def _clear_ghosting():
     for comp, original_opacity in _ghosted_components:
+        if not _is_live(comp):
+            continue
         try:
             comp.opacity = original_opacity
         except Exception as err:
@@ -887,20 +1045,42 @@ def _clear_ghosting():
     for path in list(_hidden_occurrences.keys()):
         _unhide_occurrence(path)
 
-    _refresh_viewport()
+
+def _ghosting_still_applied() -> bool:
+    """Cheap check that a previously-applied ghost is actually still on the
+    model. Fusion rolls a preview's design changes back before rebuilding, so
+    _ghosted_components alone doesn't prove anything; spot-checking one entry is
+    enough to tell "nothing changed, skip the work" from "our writes were
+    undone, redo them" without re-walking the occurrence tree."""
+    if not _ghosted_components:
+        return True
+    comp = _ghosted_components[0][0]
+    if not _is_live(comp):
+        return False
+    try:
+        return comp.opacity == _GHOST_OPACITY
+    except Exception:
+        return False
 
 
-def _update_ghosting(inputs: adsk.core.CommandInputs):
-    ghostInp: adsk.core.BoolValueCommandInput = inputs.itemById('ghost_others')
-    if ghostInp is None or not ghostInp.value:
-        _clear_ghosting()
+def _update_ghosting():
+    """Reconcile the ghosting with the current checkbox + joint selection.
+
+    Called only from command_preview -- see that function for why none of this
+    may happen from inputChanged.
+    """
+    global _applied_ghost_key
+    key = (_ghost_enabled, _selected_idx)
+    if key == _applied_ghost_key and _ghosting_still_applied():
         return
 
-    if 0 <= _selected_idx < len(_current_matches):
+    if _ghost_enabled and 0 <= _selected_idx < len(_current_matches):
         joint, matched_side = _current_matches[_selected_idx]
         _apply_ghosting(_joint_occurrence(joint, matched_side), _other_side(joint, matched_side))
     else:
         _clear_ghosting()
+
+    _applied_ghost_key = key
 
 
 # ---------------------------------------------------------------------------
@@ -932,8 +1112,31 @@ def _solid_color(rgb):
 def _add_mesh(group, mesh, rgb, opacity, depth):
     if mesh is None:
         return
-    coords = adsk.fusion.CustomGraphicsCoordinates.create(mesh.nodeCoordinatesAsDouble)
-    entity = group.addMesh(coords, mesh.nodeIndices, mesh.normalVectorsAsDouble, [])
+    try:
+        points = mesh.nodeCoordinatesAsDouble
+        indices = mesh.nodeIndices
+        normals = mesh.normalVectorsAsDouble
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: display mesh unreadable, skipping: {err}')
+        return
+
+    # An empty or inconsistent display mesh -- what a body that is hidden,
+    # suppressed or mid-recompute hands back -- takes addMesh down with it (a
+    # Fusion crash, not a Python exception), so it is rejected here rather than
+    # trusted. addMesh wants one normal per node and indices that actually
+    # address those nodes.
+    node_count = len(points) // 3
+    if node_count == 0 or not indices or len(normals) != len(points):
+        futil.log(f'{CMD_NAME}: skipping degenerate mesh (nodes={node_count}, '
+                  f'indices={len(indices) if indices else 0}, '
+                  f'normals={len(normals) if normals else 0})')
+        return
+    if max(indices) >= node_count:
+        futil.log(f'{CMD_NAME}: skipping mesh with out-of-range node indices')
+        return
+
+    coords = adsk.fusion.CustomGraphicsCoordinates.create(points)
+    entity = group.addMesh(coords, indices, normals, [])
     entity.color = _solid_color(rgb)
     entity.setOpacity(opacity, True)
     entity.depthPriority = depth
@@ -946,20 +1149,37 @@ def _highlight_body(group, body: adsk.fusion.BRepBody, rgb):
     face/edge/point below is frequently hidden inside the solid, but a whole
     tube changing colour never is.
     """
-    if body is None:
+    if not _is_live(body):
         return
     try:
+        # A body that is not on screen has no display mesh to ask for -- and the
+        # ghosting switches whole occurrences off, so this is the normal case
+        # here, not an edge case. bestMesh on a hidden body gives back an empty
+        # mesh at best and crashes at worst.
+        if not body.isVisible:
+            return
         _add_mesh(group, body.meshManager.displayMeshes.bestMesh, rgb, _BODY_OPACITY, _DEPTH_BODY)
     except Exception as err:
         futil.log(f'{CMD_NAME}: could not wash body: {err}')
 
 
 def _highlight_face(group, face: adsk.fusion.BRepFace, rgb):
-    _add_mesh(group, face.meshManager.displayMeshes.bestMesh, rgb, _EXACT_OPACITY, _DEPTH_EXACT)
+    if not _is_live(face):
+        return
+    try:
+        _add_mesh(group, face.meshManager.displayMeshes.bestMesh, rgb, _EXACT_OPACITY, _DEPTH_EXACT)
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not highlight face: {err}')
 
 
 def _highlight_edge(group, edge: adsk.fusion.BRepEdge, rgb):
-    entity = group.addCurve(edge.geometry)
+    if not _is_live(edge):
+        return
+    try:
+        entity = group.addCurve(edge.geometry)
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not highlight edge: {err}')
+        return
     entity.color = _solid_color(rgb)
     entity.weight = 6
     entity.depthPriority = _DEPTH_EXACT
@@ -1007,12 +1227,27 @@ def _add_marker(group, point: adsk.core.Point3D, rgb, pixels):
         futil.log(f'{CMD_NAME}: viewScale unavailable for marker: {err}')
 
 
+def _side_entities(joint_geometry):
+    """The joint side's two attachment entities, skipping any that has gone
+    stale. A JointGeometry cached in _current_matches outlives several preview
+    rebuilds, and reading geometry off an entity a rollback has invalidated
+    crashes Fusion rather than raising -- so every entity is filtered through
+    _is_live() once, here, instead of at each of its use sites."""
+    entities = []
+    for attr in ('entityOne', 'entityTwo'):
+        try:
+            entity = getattr(joint_geometry, attr)
+        except Exception:
+            continue
+        if _is_live(entity):
+            entities.append(entity)
+    return entities
+
+
 def _side_body(joint_geometry):
     """The BRepBody a joint side hangs off, or None for non-BRep geometry
     (a ConstructionPoint or SketchPoint has no owning body)."""
-    for entity in (joint_geometry.entityOne, joint_geometry.entityTwo):
-        if entity is None:
-            continue
+    for entity in _side_entities(joint_geometry):
         try:
             if entity.body is not None:
                 return entity.body
@@ -1027,9 +1262,7 @@ def _highlight_side(group, joint_geometry, rgb, marker_pixels):
 
     _highlight_body(group, _side_body(joint_geometry), rgb)
 
-    for entity in (joint_geometry.entityOne, joint_geometry.entityTwo):
-        if entity is None:
-            continue
+    for entity in _side_entities(joint_geometry):
         ot = entity.objectType
         if ot == adsk.fusion.BRepFace.classType():
             _highlight_face(group, entity, rgb)
@@ -1040,8 +1273,8 @@ def _highlight_side(group, joint_geometry, rgb, marker_pixels):
 
     try:
         _add_marker(group, joint_geometry.origin, rgb, marker_pixels)
-    except Exception:
-        pass
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not mark joint origin: {err}')
 
 
 def _clear_highlight():
@@ -1064,6 +1297,8 @@ def _occurrence_bodies(occ):
     trace back to a single body."""
     try:
         if occ is not None:
+            if not _is_live(occ):
+                return []
             return list(occ.bRepBodies)
         design = adsk.fusion.Design.cast(app.activeProduct)
         return list(design.rootComponent.bRepBodies)
@@ -1076,6 +1311,8 @@ def _draw_joint_highlight(joint, matched_side):
     _clear_highlight()
 
     design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return
     group = design.rootComponent.customGraphicsGroups.add()
     # Take ownership of the group immediately, not after it's fully populated:
     # if any of the drawing calls below raise, the caller swallows it and a
@@ -1088,8 +1325,6 @@ def _draw_joint_highlight(joint, matched_side):
         _draw_asbuilt_highlight(group, joint, matched_side)
     else:
         _draw_regular_highlight(group, joint, matched_side)
-
-    _refresh_viewport()
 
 
 def _draw_regular_highlight(group, joint, matched_side):
@@ -1109,8 +1344,8 @@ def _draw_regular_highlight(group, joint, matched_side):
             connector.color = _solid_color(_CONNECTOR_COLOR)
             connector.weight = 3
             connector.depthPriority = _DEPTH_EXACT
-        except Exception:
-            pass
+        except Exception as err:
+            futil.log(f'{CMD_NAME}: could not draw connector line: {err}')
 
 
 def _draw_asbuilt_highlight(group, joint, matched_side):
@@ -1143,9 +1378,7 @@ def _draw_asbuilt_highlight(group, joint, matched_side):
         # happens for a proxy body in a nested component).
         this_bodies = _occurrence_bodies(this_occ)
         other_bodies = _occurrence_bodies(other_occ)
-        for entity in (geom.entityOne, geom.entityTwo):
-            if entity is None:
-                continue
+        for entity in _side_entities(geom):
             body = None
             try:
                 body = entity.body
@@ -1168,8 +1401,8 @@ def _draw_asbuilt_highlight(group, joint, matched_side):
         try:
             _add_marker(group, geom.origin, _THIS_SIDE_COLOR, _MARKER_PIXELS_THIS)
             _add_marker(group, geom.origin, _OTHER_SIDE_COLOR, _MARKER_PIXELS_OTHER)
-        except Exception:
-            pass
+        except Exception as err:
+            futil.log(f'{CMD_NAME}: could not mark as-built joint origin: {err}')
 
 
 def _refresh_viewport():

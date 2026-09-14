@@ -23,6 +23,62 @@ session.
 
 ## Lessons
 
+### `activeViewport.refresh()` inside a command event can crash Fusion
+`refresh()` pumps Fusion's message loop, so calling it from `executePreview`/`inputChanged` lets a
+queued event run **re-entrantly** on top of the design writes the current pass is still holding --
+Fusion dies outright rather than raising. **Fix:** never refresh from inside a command event that
+modifies the design; `executePreview` is already part of the redraw cycle, so graphics built there
+paint without asking. Refresh only from `destroy`, and keep a re-entrancy flag on `executePreview`.
+`commands/JointInspector/entry.py`
+
+### `bestMesh` on a hidden/stale body hands back a mesh that crashes `addMesh`
+A body that is invisible, suppressed or mid-recompute returns an empty or inconsistent display mesh,
+and `CustomGraphicsGroup.addMesh` takes the process down with it instead of raising. **Fix:** skip
+`not body.isVisible`, and validate the mesh before drawing -- non-zero node count,
+`len(normals) == len(points)`, `max(indices) < nodeCount`. Same for anything cached across preview
+rebuilds: check `.isValid` first, because reading a rolled-back entity crashes rather than raises.
+`commands/JointInspector/entry.py`
+
+### Table rows must be created from `TableCommandInput.commandInputs`, and need unique ids
+`TableCommandInput.clear()` only detaches rows; inputs built from the *dialog's* `CommandInputs`
+stay alive there forever, so rebuilding the table reuses ids like `joint_row_0`. Fusion doesn't
+reject the duplicate -- `itemById()` then returns the stale input while events arrive from the new
+one. **Fix:** create rows from `tableInput.commandInputs` and stamp a generation counter into every
+id (`joint_row_<gen>_<i>`), ignoring events whose generation is stale.
+`commands/JointInspector/entry.py`
+
+### Grouping occurrences by `Component` is O(n^2) unless you bucket by name first
+`Component` has no usable hash and a colliding `entityToken`, so identity needs a linear `==` scan --
+which on a 194-occurrence assembly is tens of thousands of COM calls *per preview rebuild*.
+**Fix:** bucket by `comp.name` (a plain string) first and run the `==` scan only inside the bucket;
+walk `root.allOccurrences` flat instead of recursing `childOccurrences`.
+`commands/JointInspector/entry.py`
+
+### Writing to the design from `inputChanged` suspends a command's whole compute pipeline
+**Root cause of "Joint Inspector ghosts correctly but never shows the orange/green highlight."**
+Ghosting applied `Component.opacity`/`Occurrence.isLightBulbOn` from `inputChanged`. The writes
+themselves succeed (101 components really did dim), but afterwards Fusion **stops firing
+`validateInputs` and `executePreview` for the rest of that dialog's life** while `inputChanged`
+keeps working -- so the dialog looks alive and responsive while the OK button greys itself out,
+`target_entity` silently loses its selection (`activeCommand` reported `selectionCount: 0` with the
+joint table still populated and no `inputChanged` fired for it), and every CustomGraphic silently
+never draws. **Nothing is logged, because the draw is never reached** -- this is not an exception
+being swallowed. Confirmed by A/B: with `ghost_others` unchecked *before* picking, the identical
+code path draws the highlight perfectly and OK is enabled. It is also why unchecking the box
+mid-session didn't recover -- `_clear_ghosting()` is itself another `inputChanged` design write.
+**Fix:** `inputChanged` may only *record intent* (an index, a flag); `executePreview` is the one
+handler that may modify the design, and it re-applies both the ghosting and the graphics on every
+rebuild. Two corollaries: (1) a preview's design writes can be rolled back before the next rebuild,
+so the "already applied, skip" guards must re-assert the value when it has drifted and record the
+original only once, or the ghost silently stops re-applying; (2) don't gate `areInputsValid` on
+anything optional in a command whose `executePreview` owns on-screen state -- an invalid command
+gets no `executePreview`, stranding whatever was last drawn with no handler left to clean it up.
+**Diagnosing this class of bug:** empty log + `customGraphicsGroups.count == 0` +
+`_highlight_group is None` means the draw never ran -- look at what stopped the *handler* firing,
+not at the renderer. All three are readable from a `readOnly: true` MCP script while the dialog is
+open, which is safe (unlike walking a live command's `commandInputs`).
+`commands/JointInspector/entry.py` (`command_preview`, `_update_ghosting`, `command_validate_input`)
+
 ### There is no per-occurrence opacity at all -- `Occurrence.isLightBulbOn` is the only genuinely per-instance display control
 Chasing "Joint Inspector ghosts the entire model": `Component.opacity` is the **only** settable
 opacity in the API. `Occurrence.visibleOpacity` is read-only and its own doc says so outright ("To set
