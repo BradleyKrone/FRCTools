@@ -266,10 +266,15 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     )
 
     # A persistently visible, clickable list of joints instead of a dropdown --
-    # one row per joint, each a checkbox-styled button; _set_selected_row()
-    # enforces that only one is ever checked at a time. Rows are (re)built in
-    # _command_input_changed() once a target body resolves to some joints.
-    jointTableInp = inputs.addTableCommandInput('joint_table', 'Joints', 1, '1')
+    # one row per joint, each a checkbox in column 0 plus a read-only text
+    # label in column 1 carrying the joint's name; _set_selected_row() enforces
+    # that only one checkbox is ever checked at a time. Two separate controls
+    # rather than the checkbox's own label text, because a BoolValueCommandInput
+    # placed in a TableCommandInput was confirmed live to render only the
+    # checkbox glyph -- its text argument never shows inside a table cell.
+    # Rows are (re)built in _command_input_changed() once a target body
+    # resolves to some joints.
+    jointTableInp = inputs.addTableCommandInput('joint_table', 'Joints', 2, '1:4')
     jointTableInp.isEnabled = False
 
     inputs.addTextBoxCommandInput('joint_info', '', 'No joint selected.', 8, True)
@@ -352,8 +357,10 @@ def _command_input_changed(args: adsk.core.InputChangedEventArgs):
             other_label = other_occ.fullPathName if other_occ is not None else 'Ground'
             tag = ' [As-built]' if _is_as_built(joint) else ''
             label = f'{_joint_name(joint)}{tag}  ->  {other_label}'
-            rowInp = inputs.addBoolValueInput(f'joint_row_{i}', label, True, '', i == 0)
+            rowInp = inputs.addBoolValueInput(f'joint_row_{i}', '', True, '', i == 0)
+            labelInp = inputs.addTextBoxCommandInput(f'joint_label_{i}', '', label, 1, True)
             jointTableInp.addCommandInput(rowInp, i, 0)
+            jointTableInp.addCommandInput(labelInp, i, 1)
         jointTableInp.isEnabled = True
 
         _render_joint_info(inputs, 0)
