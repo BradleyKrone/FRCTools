@@ -30,15 +30,16 @@ def start():
     cmd_def = ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER)
     futil.add_handler(cmd_def.commandCreated, command_created)
 
-    submenu = config.get_solid_submenu()
-    control = submenu.controls.addCommand(cmd_def)
+    panel = config.get_frc_panel()
+    control = panel.controls.addCommand(cmd_def)
+    control.isPromotedByDefault = IS_PROMOTED
     control.isPromoted = IS_PROMOTED
 
 
 # Executed when add-in is stopped.
 def stop():
-    submenu = config.get_solid_submenu()
-    command_control = submenu.controls.itemById(CMD_ID)
+    panel = config.get_frc_panel()
+    command_control = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
 
     if command_control:

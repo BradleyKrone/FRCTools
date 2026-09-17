@@ -8,7 +8,6 @@ from .FaceFillet import entry as FaceFillet
 from .Lighten import entry as Lighten
 from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
-from .Tubify import entry as Tubify
 from .AutoHole import entry as AutoHole
 from .JointInspector import entry as JointInspector
 
@@ -20,7 +19,6 @@ commands = [
     Lighten,
     QuickCircle,
     PartsGen,
-    Tubify,
     AutoHole,
     JointInspector
 ]

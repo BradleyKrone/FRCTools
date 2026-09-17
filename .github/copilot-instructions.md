@@ -16,22 +16,25 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 
 ## Project structure
 
-- **`FRCTools.py`** — the add-in entry point. `run()` creates the `FRCTools` dropdown submenu in
-  the Solid-Create, Sketch-Create, and Sketch-Modify panels, then starts every command; `stop()`
-  tears it all down. You rarely need to edit this.
+- **`FRCTools.py`** — the add-in entry point. `run()` creates the custom **FRC** panel in the
+  SOLID tab (solid commands hang their buttons directly off it) plus the `FRCTools` dropdown
+  submenu in the Sketch-Create and Sketch-Modify panels, then starts every command; `stop()`
+  tears it all down, including deleting the FRC panel. You rarely need to edit this.
 - **`config.py`** — shared globals: `WORKSPACE_ID`, the panel IDs, `FRC_TOOLS_DROPDOWN_ID`,
   `ADDIN_NAME`, `COMPANY_NAME` (still the literal `'Team4698'` — it only builds unique internal UI
   IDs, so leave it unless the user asks to rebrand), a `DEBUG` flag, and the
-  `get_solid_submenu()` / `get_sketch_create_submenu()` / `get_sketch_modify_submenu()` helpers
-  that commands use to hang their buttons.
+  `FRC_PANEL_*` settings, and the `get_frc_panel()` / `get_sketch_create_submenu()` /
+  `get_sketch_modify_submenu()` helpers that commands use to hang their buttons.
 - **`commands/__init__.py`** — the command **registry**. Every tool is imported here and listed in
   the `commands[]` array; `start()`/`stop()` iterate over it. **Adding a tool = create a new folder
   under `commands/` and register it in this file.**
-- **`commands/<Name>/entry.py`** — one command each. Use **`AutoHole`** and **`Tubify`** as
+- **`commands/<Name>/entry.py`** — one command each. Use **`AutoHole`** and **`Lighten`** as
   reference implementations. Standard shape:
   - `CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_...'` (must be globally unique),
     `CMD_NAME`, `CMD_Description`, `ICON_FOLDER`, and a module-level `local_handlers = []`.
-  - `start()` — registers the command definition and adds the button to a submenu.
+  - `start()` — registers the command definition and adds the button to the FRC panel (solid
+    tools) or a sketch submenu. Panel controls need `isPromoted = True` or they hide in the
+    panel's overflow dropdown.
   - `stop()` — deletes the control/definition and resets `local_handlers`.
   - `command_created(args)` — builds the dialog `commandInputs`, then wires handlers with
     `futil.add_handler(...)`: `command_execute`, `command_preview` (optional), `command_input_changed`,
@@ -75,7 +78,7 @@ There are **no automated tests** — tools are verified live in Fusion.
 1. Edit the Python files in place (this repo *is* the installed add-in directory).
 2. In Fusion, open **Scripts and Add-Ins** (`Shift+S`), and **Stop → Run** FRCTools to reload the
    code.
-3. Trigger the command from its `FRCTools` submenu and watch the **Text Command** window (with
+3. Trigger the command from the **FRC** panel (or the `FRCTools` sketch submenu) and watch the **Text Command** window (with
    `config.DEBUG = True`) for `futil.log` output and tracebacks.
 4. To ship, run the VS Code **"Create Installer and Zip Archive"** task (or `bash ./bundle.sh`).
 

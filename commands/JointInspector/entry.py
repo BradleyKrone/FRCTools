@@ -15,7 +15,7 @@ CMD_Description = ('Select a body and see every joint that '
                     'each side is attached to, right in the viewport.')
 
 # Specify that the command will be promoted to the panel.
-IS_PROMOTED = False
+IS_PROMOTED = True
 
 # Resource location for command icons.
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
@@ -218,8 +218,9 @@ def start():
     cmd_def = ui.commandDefinitions.addButtonDefinition(CMD_ID, CMD_NAME, CMD_Description, ICON_FOLDER)
     futil.add_handler(cmd_def.commandCreated, command_created)
 
-    submenu = config.get_solid_submenu()
-    control = submenu.controls.addCommand(cmd_def)
+    panel = config.get_frc_panel()
+    control = panel.controls.addCommand(cmd_def)
+    control.isPromotedByDefault = IS_PROMOTED
     control.isPromoted = IS_PROMOTED
 
     global _edit_joint_event
@@ -236,8 +237,8 @@ def start():
 
 # Executed when add-in is stopped.
 def stop():
-    submenu = config.get_solid_submenu()
-    command_control = submenu.controls.itemById(CMD_ID)
+    panel = config.get_frc_panel()
+    command_control = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
 
     if command_control:
@@ -280,7 +281,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # ever combines filters from one family (e.g. CCDistance's three Sketch*
     # filters together), never a body-level filter with a face/edge-level one.
     # A single 'SolidBodies' filter is the exact pattern already proven to
-    # work standalone in Tubify/Lighten. _resolve_target() already walks up
+    # work standalone in Lighten. _resolve_target() already walks up
     # from a picked body to its owning Occurrence via assemblyContext, so
     # clicking a body still resolves the right component.
     targetInp.addSelectionFilter('SolidBodies')

@@ -17,7 +17,7 @@ CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenDialog'
 CMD_NAME = 'Parts Gen'
 CMD_Description = 'Create FRC robot parts (shafts and tubes)'
 
-IS_PROMOTED = False
+IS_PROMOTED = True
 
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
 
@@ -134,8 +134,9 @@ def start():
     )
     futil.add_handler(cmd_def.commandCreated, command_created)
 
-    submenu = config.get_solid_submenu()
-    control = submenu.controls.addCommand(cmd_def)
+    panel = config.get_frc_panel()
+    control = panel.controls.addCommand(cmd_def)
+    control.isPromotedByDefault = IS_PROMOTED
     control.isPromoted = IS_PROMOTED
 
     # Edit command — shown only via the right-click marking menu; no toolbar button
@@ -153,8 +154,8 @@ def start():
 
 
 def stop():
-    submenu = config.get_solid_submenu()
-    command_control  = submenu.controls.itemById(CMD_ID)
+    panel = config.get_frc_panel()
+    command_control  = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
     edit_cmd_def       = ui.commandDefinitions.itemById(EDIT_CMD_ID)
 

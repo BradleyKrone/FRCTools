@@ -36,14 +36,6 @@ image::BoltPatternCreate.png[]
 
 == Solid Tab Tools
 
-== Tubify Tool image:icons/Tubify.png['Tubify', 30]
-TIP: kbd:[Solid Tab] menu:Create[FRCTools > Tubify Solid]
-
-This tool converts solid 1x1 or 1x2 shapes into shelled and hole punched tubes used in FRC.  
-
-image::TubifyDialog.png[]
-
-
 == Lighten Tool image:icons/Lighten.png['Lighten', 30]
 TIP: kbd:[Solid Tab] menu:Create[FRCTools > Lighten]
 
