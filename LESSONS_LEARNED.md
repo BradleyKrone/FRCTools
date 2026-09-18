@@ -23,6 +23,68 @@ session.
 
 ## Lessons
 
+### A hand-built reference part's bore clearance is a fixed radial offset, not a scale factor — read it straight off the B-rep, don't guess
+Asked to add a "Hex Spacer" option to PartsGen's Shaft Type dropdown (round OD, hex bore -- the
+inverse of the same-size hex shaft) matching an existing hand-modelled part (`Hood_Spacer` in the
+"Double Wheel Shooter" design) exactly. Read the part's actual `ExtrudeFeature.profile.profileLoops`
+(not just the sketch's raw curve list, which also picks up unrelated projected/reference geometry
+sharing the same sketch — see next entry) and compared its bore's measured apothem/corner-radius
+against `SHAFT_HALF_HEX_FLATS_CM`/`SHAFT_HALF_HEX_ROUND_DIA_CM`. The difference was a **constant
+0.008in** on both numbers, not a uniform percentage scale (0.032/0.030 — close but not equal, which
+would be the wrong conclusion to draw from just eyeballing two ratios). Confirms clearance was
+designed as a per-side radial offset (same "constant wall thickness offset" idea already used for
+the MAXSpline bore), so `HEX_SPACER_CLEARANCE_IN = 0.008` is added to the apothem and corner-circle
+radius separately, not multiplied through the whole profile.
+`commands/PartsGen/shaft_gen.py` (`_hex_spacer_bore_dims_cm`)
+
+### `ExtrudeFeature.profile` is the ground truth for "what's actually in this body" — a shared sketch's raw curve list isn't
+Reading `Hood_Spacer`'s sketch curves directly (`sketchCurves.sketchLines`/`sketchArcs`/
+`sketchCircles`) returned 4 unrelated hex/circle groups at 4 different centres — the sketch is
+shared with (or has projected geometry from) other nearby parts in the assembly, all coexisting in
+one `Sketch` object. Naively picking "the biggest circle" or "the arcs near the right coordinates"
+would have used the wrong group. **Fix:** read `extrudeFeature.profile.profileLoops` instead — it's
+the exact loop set Fusion resolved for that specific feature, with `loop.isOuter` distinguishing
+the boundary from holes, and `loop.profileCurves[i].geometry` giving plain `Line3D`/`Arc3D`/
+`Circle3D` with concrete start/end/center/radius — no sketch-wide filtering/guessing needed.
+`commands/PartsGen/shaft_gen.py`
+
+### `importlib.reload()` is safe when a change only *adds* names — the staleness trap is specifically about deletions
+A separate entry below (`importlib.reload` in an MCP test script leaves ... stale`) warns that
+reloading doesn't clear names the new source deleted. Adding the Hex Spacer shaft types only added
+new constants/branches to `shaft_gen.py`, never removed any, so `importlib.reload(sg)` on the
+already-imported module (looked up by suffix, `[m for m in sys.modules if
+m.endswith('commands.PartsGen.shaft_gen')][0]` — Fusion's add-in loader mangles the real module name
+into something like `__main__<url-encoded-full-path>`, not the plain `FRCTools...`) picked up the
+edited `_create_shaft` cleanly. This let the *real* function (not a re-typed copy) be exercised live
+with a duck-typed fake `CommandInputs` (`itemById` returning small stub objects with `.value`/
+`.expression`/`.selectedItem.name`) to build an actual part and verify its geometry, then clean up
+with `occurrence.deleteMe()` — no dialog, no Stop→Run, no restart.
+`commands/PartsGen/shaft_gen.py`
+
+### Multi-radius wavy profiles: `addTangent` between arcs can snap to the wrong branch — fix every point instead
+Building the REV MAXSpline profile (6 lobes, each flank a major-arc + minor-arc joined by two
+off-axis blend arcs) by chaining `addCoincident` + `addTangent` between the blend arcs looked
+correct on paper but the solver kept collapsing the whole loop or flipping a blend to the wrong
+side, because two arcs of known radius sharing one fixed point still leaves an angular DOF that
+`addTangent` resolves ambiguously once several such joints interact in one solve. **Fix:** since
+every vertex (including each blend arc's off-axis centre) has a closed-form polar formula anyway,
+skip dimensions/tangency entirely and set `sketchPoint.isFixed = True` on every arc's start, end,
+*and* centre point — same trick `_anchor_point` already uses for one point, just applied to the
+whole profile. Zero solver ambiguity, verified with `sketch.isFullyConstrained`.
+`commands/PartsGen/shaft_gen.py` (`_draw_maxspline`)
+
+### REV MAXSpline profile has no public tooth-count/blend-radius spec — read it off the STEP B-rep live in Fusion
+REV's drawing (REV-21-2520-DR.pdf) only gives major/minor OD (34.9/28.55 mm) and calls the bore a
+plain 25.4 mm round hole; it never states the tooth count or the two blend-arc radii that make up
+each flank, and the raw STEP text is too ambiguous to hand-parse (repeated near-duplicate radii
+from float noise). **Fix:** `importManager.importToNewDocument()` the STEP in a scratch Fusion doc,
+then read `face.loops[i].edges[j].geometry.{radius,center}` on a planar end face directly — this
+gives exact arc radii/centers/angles straight from the real B-rep. That's how the 6-tooth count,
+the two blend radii, and the junction angles below were confirmed (the bore turned out to be a
+matching scalloped shape too, constant ~0.062" wall thickness — simplified to a plain round hole
+in the add-in since REV's own drawing does the same).
+`commands/PartsGen/shaft_gen.py` (`_draw_maxspline`)
+
 ### Sketch curves drawn at identical coordinates are NOT merged — you get zero constraints
 Building a closed loop by passing the same `Point3D` to consecutive `addByTwoPoints` /
 `addByThreePoints` calls yields a valid single profile, but `sketchPoints.count` shows every

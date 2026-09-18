@@ -3,7 +3,7 @@ import adsk.fusion
 import os
 from ...lib import fusionAddInUtils as futil
 from ... import config
-from .shaft_gen import _create_shaft
+from .shaft_gen import _create_shaft, _hex_spacer_bore_dims_cm
 from .tube_gen import _create_tube
 from .pulley_gen import _create_pulley
 from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
@@ -45,12 +45,17 @@ PART_CHAIN   = 'Chain'
 # ---------------------------------------------------------------------------
 # Shaft types
 # ---------------------------------------------------------------------------
-SHAFT_HALF_HEX       = '1/2" Hex Shaft'
-SHAFT_THREE_EIGHTH_HEX = '3/8" Hex Shaft'
-SHAFT_CUSTOM         = 'Custom (Round Tube)'
+SHAFT_HALF_HEX            = '1/2" Hex Shaft'
+SHAFT_THREE_EIGHTH_HEX    = '3/8" Hex Shaft'
+SHAFT_MAXSPLINE           = 'MAXSpline Shaft'
+SHAFT_HALF_HEX_SPACER     = '1/2" Hex Spacer'
+SHAFT_THREE_EIGHTH_SPACER = '3/8" Hex Spacer'
+SHAFT_CUSTOM              = 'Custom (Round Tube)'
 
 # Both hex sizes are generated as WCP rounded hex (hex flats + round bearing pilot);
-# the profile constants live in shaft_gen.py
+# MAXSpline is REV Robotics' 6-lobe wavy spline shaft. A "Hex Spacer" is the inverse of its
+# same-size hex shaft: round OD (user-set) with a clearance-fit hex bore, for a spacer that
+# spins freely on that hex shaft. The profile constants for all of these live in shaft_gen.py
 
 # ---------------------------------------------------------------------------
 # Tube thickness options  (inches, label)
@@ -199,6 +204,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     shaftTypeInp.listItems.add(SHAFT_HALF_HEX, True, '')
     shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX, False, '')
+    shaftTypeInp.listItems.add(SHAFT_MAXSPLINE, False, '')
+    shaftTypeInp.listItems.add(SHAFT_HALF_HEX_SPACER, False, '')
+    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_SPACER, False, '')
     shaftTypeInp.listItems.add(SHAFT_CUSTOM, False, '')
 
     customOD = inputs.addValueInput(
@@ -440,6 +448,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_sprocket = (part_type == PART_SPROCKET)
     part_is_chain    = (part_type == PART_CHAIN)
     is_custom_shaft  = (shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
+    is_spacer_shaft  = (shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
@@ -447,7 +456,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     # Shaft inputs
     shaftTypeInp.isVisible   = part_is_shaft
-    customOD.isVisible       = part_is_shaft and is_custom_shaft
+    customOD.isVisible       = part_is_shaft and (is_custom_shaft or is_spacer_shaft)
     customID.isVisible       = part_is_shaft and is_custom_shaft
 
     # Tube inputs
@@ -541,6 +550,15 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     if part_is_chain and chainCirclesInp is not None and args.input.id == 'part_type':
         chainCirclesInp.hasFocus = True
+
+    # Outer Diameter is shared between Custom (Round Tube) and the two Hex Spacer shaft
+    # types; reset it to a sensible starting point for whichever one was just picked
+    # instead of leaving whatever the field last held.
+    if args.input.id == 'shaft_type':
+        if is_spacer_shaft:
+            customOD.value = 0.65 * IN_TO_CM
+        elif is_custom_shaft:
+            customOD.value = 0.75 * IN_TO_CM
 
     # Auto-focus Face 1 when switching to Between Two Faces mode
     if args.input.id == 'length_type' and is_between_faces:
@@ -707,10 +725,17 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             return
 
     if part_type == PART_SHAFT:
-        if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
+        shaft_type = shaftTypeInp.selectedItem.name
+        if shaft_type == SHAFT_CUSTOM:
             od = customOD.value
             id_ = customID.value
             if od <= 0 or id_ <= 0 or id_ >= od:
+                args.areInputsValid = False
+                return
+        elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+            od = customOD.value
+            _, bore_round_dia_cm = _hex_spacer_bore_dims_cm(shaft_type)
+            if od <= 0 or od <= bore_round_dia_cm:
                 args.areInputsValid = False
                 return
     else:
@@ -968,6 +993,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     is_sprocket     = (part_type == PART_SPROCKET)
     is_chain        = (part_type == PART_CHAIN)
     is_custom_shaft = (shaft_type == SHAFT_CUSTOM)
+    is_spacer_shaft = (shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
 
     tube_thick      = _s(ATTR_TUBE_THICK,   THICK_1_8)
     is_custom_thick = (tube_thick == THICK_CUSTOM)
@@ -1017,16 +1043,19 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     shaftTypeInp = inputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    shaftTypeInp.listItems.add(SHAFT_HALF_HEX,         shaft_type == SHAFT_HALF_HEX,         '')
-    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX, shaft_type == SHAFT_THREE_EIGHTH_HEX, '')
-    shaftTypeInp.listItems.add(SHAFT_CUSTOM,           is_custom_shaft,                      '')
+    shaftTypeInp.listItems.add(SHAFT_HALF_HEX,            shaft_type == SHAFT_HALF_HEX,            '')
+    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX,    shaft_type == SHAFT_THREE_EIGHTH_HEX,    '')
+    shaftTypeInp.listItems.add(SHAFT_MAXSPLINE,           shaft_type == SHAFT_MAXSPLINE,           '')
+    shaftTypeInp.listItems.add(SHAFT_HALF_HEX_SPACER,     shaft_type == SHAFT_HALF_HEX_SPACER,     '')
+    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_SPACER, shaft_type == SHAFT_THREE_EIGHTH_SPACER, '')
+    shaftTypeInp.listItems.add(SHAFT_CUSTOM,              is_custom_shaft,                         '')
     shaftTypeInp.isVisible = is_shaft
 
     customOD = inputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
         adsk.core.ValueInput.createByString(od_expr)
     )
-    customOD.isVisible = is_shaft and is_custom_shaft
+    customOD.isVisible = is_shaft and (is_custom_shaft or is_spacer_shaft)
 
     customID = inputs.addValueInput(
         'custom_id', 'Bore Diameter', 'in',

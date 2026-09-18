@@ -16,9 +16,12 @@ IN_TO_CM = 2.54
 PART_SHAFT  = 'Shaft'
 LEN_FACES   = 'Between Two Faces'
 
-SHAFT_HALF_HEX         = '1/2" Hex Shaft'
-SHAFT_THREE_EIGHTH_HEX = '3/8" Hex Shaft'
-SHAFT_CUSTOM           = 'Custom (Round Tube)'
+SHAFT_HALF_HEX            = '1/2" Hex Shaft'
+SHAFT_THREE_EIGHTH_HEX    = '3/8" Hex Shaft'
+SHAFT_MAXSPLINE           = 'MAXSpline Shaft'
+SHAFT_HALF_HEX_SPACER     = '1/2" Hex Spacer'
+SHAFT_THREE_EIGHTH_SPACER = '3/8" Hex Spacer'
+SHAFT_CUSTOM              = 'Custom (Round Tube)'
 
 # WCP rounded hex stock (wcproducts.com/products/shaft-stock): a regular hex whose six
 # corners are truncated by a circle, so it still drives hex bores but also pilots in a
@@ -32,6 +35,59 @@ SHAFT_HALF_HEX_ROUND_DIA_CM     = 13.74 * MM_TO_CM
 SHAFT_THREE_EIGHTH_FLATS_CM     = 0.375 * IN_TO_CM
 SHAFT_THREE_EIGHTH_ROUND_DIA_CM = 10.24 * MM_TO_CM
 SHAFT_BORE_DIA_CM               = 0.159 * IN_TO_CM
+
+# "Hex Spacer" shaft types: the inverse of their same-size hex shaft -- a user-set round OD
+# with a hex bore that slips freely over that hex shaft, instead of a hex OD with a round
+# bore. The bore is that shaft size's own rounded-hex profile with a radial clearance added
+# to both the flats apothem and the corner-circle radius -- not a uniform scale -- so it
+# spins freely instead of binding. Not a guess: measured live off Team 1756's existing
+# "Hood_Spacer" part (Double Wheel Shooter design) via the Fusion MCP server, where both
+# numbers came out offset from the nominal 1/2in hex by exactly the same 0.008in. See
+# LESSONS_LEARNED.md.
+HEX_SPACER_CLEARANCE_IN = 0.008
+HEX_SPACER_CLEARANCE_CM = HEX_SPACER_CLEARANCE_IN * IN_TO_CM
+
+
+def _hex_spacer_bore_dims_cm(shaft_type: str):
+    """Return (flats_cm, round_dia_cm) of a Hex Spacer's clearance bore for `shaft_type`."""
+    if shaft_type == SHAFT_THREE_EIGHTH_SPACER:
+        flats_cm, round_dia_cm = SHAFT_THREE_EIGHTH_FLATS_CM, SHAFT_THREE_EIGHTH_ROUND_DIA_CM
+    else:
+        flats_cm, round_dia_cm = SHAFT_HALF_HEX_FLATS_CM, SHAFT_HALF_HEX_ROUND_DIA_CM
+    return (flats_cm + 2 * HEX_SPACER_CLEARANCE_CM,
+            round_dia_cm + 2 * HEX_SPACER_CLEARANCE_CM)
+
+# REV Robotics MAXSpline shaft (revrobotics.com/MAXSpline-shafts-47in, REV-21-2520): a
+# 6-lobe wavy spline. Major/minor OD diameters match REV's drawing (REV-21-2520-DR.pdf);
+# neither the lobe shape (each flank is a major-circle arc and a minor-circle arc joined by
+# two small blend arcs) nor the bore is on that 2D drawing -- REV's drawing just labels the
+# bore "25.4 mm ID", but the real bore is *also* the same 6-lobe wave, offset in from the
+# OD by a constant ~1.575 mm wall thickness (25.4 mm is only the bore's minor diameter, at
+# the valleys). Both waves were measured directly off REV's own STEP file via a live Fusion
+# import+inspection (exact arc radii/centers read off the real B-rep edges) -- reproducing
+# a plain round bore looked "close" but was visibly wrong next to the real part.
+SHAFT_MAXSPLINE_TEETH             = 6
+SHAFT_MAXSPLINE_MAJOR_DIA_CM      = 34.9    * MM_TO_CM
+SHAFT_MAXSPLINE_MINOR_DIA_CM      = 28.55   * MM_TO_CM
+SHAFT_MAXSPLINE_BLEND_A_RADIUS_CM = 2.0625  * MM_TO_CM
+SHAFT_MAXSPLINE_BLEND_B_RADIUS_CM = 2.0375  * MM_TO_CM
+# The bore wave: the same profile as the OD, offset inward by a constant wall thickness, so
+# its major/minor diameters and blend radii are all exactly (OD value -+ 2x wall thickness)
+# -- confirmed against the STEP data, not just assumed. Its minor diameter (25.4 mm) is the
+# only bore dimension REV's own drawing calls out.
+SHAFT_MAXSPLINE_BORE_MAJOR_DIA_CM      = 31.75  * MM_TO_CM
+SHAFT_MAXSPLINE_BORE_MINOR_DIA_CM      = 25.4   * MM_TO_CM
+SHAFT_MAXSPLINE_BORE_BLEND_A_RADIUS_CM = 3.6375 * MM_TO_CM
+SHAFT_MAXSPLINE_BORE_BLEND_B_RADIUS_CM = 0.4625 * MM_TO_CM
+# Junction angles (degrees) of one flank, measured from a valley's (minor arc's) own
+# centreline: where the valley arc ends and blend A starts, where blend A ends and blend B
+# starts, and where blend B ends and the tip (major arc) starts. The tip's own centreline
+# sits at exactly half a tooth pitch (30 deg for 6 teeth); the other flank mirrors these.
+# The bore wave shares these same angles -- it's a radial offset of the OD, not an
+# independently-angled shape.
+SHAFT_MAXSPLINE_VALLEY_END_DEG  = 8.182896124804051
+SHAFT_MAXSPLINE_BLEND_A_END_DEG = 15.245720358879575
+SHAFT_MAXSPLINE_BLEND_B_END_DEG = 22.643501176981662
 
 ATTR_GROUP      = 'FRCTools_PartsGen'
 ATTR_PART_TYPE  = 'part_type'
@@ -162,6 +218,99 @@ def _draw_rounded_hex(sketch: adsk.fusion.Sketch,
                            adsk.core.Point3D.create(cx - 1.6 * radius, cy + 1.6 * radius, 0.0))
 
 
+def _draw_maxspline_wave(sketch: adsk.fusion.Sketch,
+                         center: adsk.core.Point3D,
+                         major_dia_cm: float,
+                         minor_dia_cm: float,
+                         blend_a_radius_cm: float,
+                         blend_b_radius_cm: float,
+                         constrain: bool = True):
+    """Draw a REV MAXSpline wave centred at `center`: `SHAFT_MAXSPLINE_TEETH` lobes, each
+    flank built from a major-circle arc (tip) and a minor-circle arc (valley) joined by two
+    small blend arcs, mirrored either side of the tip. Used for both the OD and the bore --
+    the bore is the same wave shape at smaller radii (a constant-wall-thickness offset of
+    the OD), not a plain circle; see the SHAFT_MAXSPLINE_* comment above.
+
+    Every vertex (and every blend arc's off-axis centre) is placed by a closed-form polar
+    formula from the given radii and the module's fixed junction angles, so the loop closes
+    exactly without relying on the sketch solver to resolve the blend arcs' tangency itself
+    (that turned into two circles chased by one equation, which is where a generic
+    `addTangent` pass kept snapping to the wrong branch when tried live in Fusion) --
+    instead every point is pinned with `isFixed`, the same trick `_anchor_point` uses for a
+    single point, just applied to the whole profile.
+
+    `constrain=False` draws the geometry only (see `_draw_rounded_hex` for why).
+    """
+    N       = SHAFT_MAXSPLINE_TEETH
+    pitch   = 360.0 / N
+    R_maj   = major_dia_cm / 2.0
+    R_min   = minor_dia_cm / 2.0
+    r_a     = blend_a_radius_cm
+    r_b     = blend_b_radius_cm
+    a1      = SHAFT_MAXSPLINE_VALLEY_END_DEG
+    a3      = SHAFT_MAXSPLINE_BLEND_B_END_DEG
+
+    cx, cy = center.x, center.y
+
+    def _pt(radius, angle_deg):
+        a = math.radians(angle_deg)
+        return adsk.core.Point3D.create(cx + radius * math.cos(a), cy + radius * math.sin(a), 0.0)
+
+    def _blend_center(dist, angle_deg):
+        a = math.radians(angle_deg)
+        return adsk.core.Point3D.create(cx + dist * math.cos(a), cy + dist * math.sin(a), 0.0)
+
+    def _tangent_point(c_from, r_from, c_to):
+        # Point where two externally-tangent circles (centres `c_from`/`c_to`, the first
+        # of radius `r_from`) touch.
+        vx, vy = c_to.x - c_from.x, c_to.y - c_from.y
+        d = math.hypot(vx, vy)
+        return adsk.core.Point3D.create(c_from.x + r_from * vx / d, c_from.y + r_from * vy / d, 0.0)
+
+    def _arc_mid(c, r, p_start, p_end):
+        # Midpoint of the short arc from p_start to p_end around centre `c`.
+        vx = (p_start.x - c.x) + (p_end.x - c.x)
+        vy = (p_start.y - c.y) + (p_end.y - c.y)
+        n = math.hypot(vx, vy)
+        return adsk.core.Point3D.create(c.x + r * vx / n, c.y + r * vy / n, 0.0)
+
+    arcs = sketch.sketchCurves.sketchArcs
+    loop = []
+    sketch.isComputeDeferred = True
+    try:
+        for i in range(N):
+            off = i * pitch
+
+            v_start = _pt(R_min, off - a1)
+            v_end   = _pt(R_min, off + a1)
+            loop.append(arcs.addByThreePoints(v_start, _pt(R_min, off), v_end))
+
+            c_a      = _blend_center(R_min + r_a, off + a1)
+            c_b      = _blend_center(R_maj - r_b, off + a3)
+            junction = _tangent_point(c_a, r_a, c_b)
+            maj_start = _pt(R_maj, off + a3)
+            loop.append(arcs.addByThreePoints(v_end, _arc_mid(c_a, r_a, v_end, junction), junction))
+            loop.append(arcs.addByThreePoints(junction, _arc_mid(c_b, r_b, junction, maj_start), maj_start))
+
+            maj_end = _pt(R_maj, off + pitch - a3)
+            loop.append(arcs.addByThreePoints(maj_start, _pt(R_maj, off + pitch / 2.0), maj_end))
+
+            c_b2      = _blend_center(R_maj - r_b, off + pitch - a3)
+            c_a2      = _blend_center(R_min + r_a, off + pitch - a1)
+            junction2 = _tangent_point(c_b2, r_b, c_a2)
+            v_next_start = _pt(R_min, off + pitch - a1)
+            loop.append(arcs.addByThreePoints(maj_end, _arc_mid(c_b2, r_b, maj_end, junction2), junction2))
+            loop.append(arcs.addByThreePoints(junction2, _arc_mid(c_a2, r_a, junction2, v_next_start), v_next_start))
+
+        if constrain:
+            for arc in loop:
+                arc.startSketchPoint.isFixed  = True
+                arc.endSketchPoint.isFixed    = True
+                arc.centerSketchPoint.isFixed = True
+    finally:
+        sketch.isComputeDeferred = False
+
+
 def _draw_circle(sketch: adsk.fusion.Sketch,
                  center: adsk.core.Point3D,
                  dia_cm: float,
@@ -249,6 +398,12 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         if od_check <= 0 or id_check <= 0 or id_check >= od_check:
             futil.log('PartsGen _create_shaft: invalid OD/ID, skipping')
             return
+    elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+        od_check = customOD.value
+        _, bore_round_dia_check = _hex_spacer_bore_dims_cm(shaft_type)
+        if od_check <= 0 or od_check <= bore_round_dia_check:
+            futil.log('PartsGen _create_shaft: OD too small for the hex spacer bore, skipping')
+            return
 
     design       = adsk.fusion.Design.cast(app.activeProduct)
     rootComp     = design.rootComponent
@@ -300,6 +455,18 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             _draw_rounded_hex(sketch, center,
                               SHAFT_THREE_EIGHTH_FLATS_CM, SHAFT_THREE_EIGHTH_ROUND_DIA_CM,
                               constrain=constrain)
+        elif shaft_type == SHAFT_MAXSPLINE:
+            workingComp.name = 'Shaft_MAXSpline'
+            _draw_maxspline_wave(sketch, center,
+                                 SHAFT_MAXSPLINE_MAJOR_DIA_CM, SHAFT_MAXSPLINE_MINOR_DIA_CM,
+                                 SHAFT_MAXSPLINE_BLEND_A_RADIUS_CM, SHAFT_MAXSPLINE_BLEND_B_RADIUS_CM,
+                                 constrain=constrain)
+        elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+            od_cm = customOD.value
+            od_in = od_cm / IN_TO_CM
+            size_tag = 'HalfInchHex' if shaft_type == SHAFT_HALF_HEX_SPACER else 'ThreeEighthHex'
+            workingComp.name = f'HexSpacer_{size_tag}_{od_in:.4g}in'
+            _draw_circle(sketch, center, od_cm, constrain=constrain)
         else:
             od_cm = customOD.value
             od_in = od_cm / IN_TO_CM
@@ -325,12 +492,21 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         bore_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
         bore_sketch.name = 'BoreProfile'
 
-        if shaft_type in (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX):
-            bore_dia = SHAFT_BORE_DIA_CM
+        if shaft_type == SHAFT_MAXSPLINE:
+            _draw_maxspline_wave(bore_sketch, center,
+                                 SHAFT_MAXSPLINE_BORE_MAJOR_DIA_CM, SHAFT_MAXSPLINE_BORE_MINOR_DIA_CM,
+                                 SHAFT_MAXSPLINE_BORE_BLEND_A_RADIUS_CM, SHAFT_MAXSPLINE_BORE_BLEND_B_RADIUS_CM,
+                                 constrain=constrain)
+        elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+            bore_flats_cm, bore_round_dia_cm = _hex_spacer_bore_dims_cm(shaft_type)
+            _draw_rounded_hex(bore_sketch, center, bore_flats_cm, bore_round_dia_cm,
+                              constrain=constrain)
         else:
-            bore_dia = customID.value
-
-        _draw_circle(bore_sketch, center, bore_dia, constrain=constrain)
+            if shaft_type in (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX):
+                bore_dia = SHAFT_BORE_DIA_CM
+            else:
+                bore_dia = customID.value
+            _draw_circle(bore_sketch, center, bore_dia, constrain=constrain)
 
         if bore_sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create bore profile.')
@@ -361,6 +537,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_ID, customID.expression)
+            elif shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
             if len_type == LEN_FACES:
                 d = math.sqrt(
                     (centroid2.x - centroid1.x) ** 2 +
