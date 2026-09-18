@@ -63,6 +63,15 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 - **Units:** Fusion's API works in **centimeters internally**. FRC is imperial, so expose **inch**
   inputs in dialogs but convert to cm before touching geometry — use `IN_TO_CM = 2.54` or
   `futil.inchValue(inches)`.
+- **Sketches must end up fully constrained.** Every sketch a tool generates has to be black/fully
+  constrained, so nothing can be dragged out of shape later. Note that Fusion does **not** merge
+  sketch points created at identical coordinates through the API — curves drawn end-to-end come out
+  with *zero* constraints and only look closed — so stitch the loop with explicit coincident
+  constraints, anchor it (`sketch.originPoint`, or a fixed point when the sketch is on a picked
+  face), and dimension the rest. Assert it with `sketch.isFullyConstrained` rather than assuming.
+  Constraining costs roughly 13 ms per constraint, so skip it in `executePreview` and set
+  `args.isValidResult = False` so `command_execute` rebuilds the committed result constrained. See
+  `commands/PartsGen/shaft_gen.py` (`_draw_rounded_hex`, `_draw_circle`) for a worked example.
 - **Errors & logging:** wrap risky work in `try/except` and route failures through
   `futil.handle_error(name, show_message_box=...)`. Use `futil.log(...)` for tracing. Set
   `config.DEBUG = True` to mirror logs to Fusion's **Text Command** window while developing.

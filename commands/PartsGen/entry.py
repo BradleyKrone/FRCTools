@@ -49,7 +49,8 @@ SHAFT_HALF_HEX       = '1/2" Hex Shaft'
 SHAFT_THREE_EIGHTH_HEX = '3/8" Hex Shaft'
 SHAFT_CUSTOM         = 'Custom (Round Tube)'
 
-# Half-inch hex and 3/8" hex circumradius constants live in shaft_gen.py
+# Both hex sizes are generated as WCP rounded hex (hex flats + round bearing pilot);
+# the profile constants live in shaft_gen.py
 
 # ---------------------------------------------------------------------------
 # Tube thickness options  (inches, label)
@@ -562,18 +563,22 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 # execute / preview
 # ===========================================================================
 
-def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool) -> bool:
+def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
+                       is_preview: bool = False) -> bool:
     """Dispatch to the selected part type's creation function.
 
     Returns True on success, False if an exception was caught — used by
     command_preview to report an honest isValidResult instead of always True,
     and to keep preview-time failures out of a blocking message box.
+
+    `is_preview` lets a generator skip work that only matters on the committed
+    result; the shaft uses it to skip its (slow) sketch constraining.
     """
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     try:
         if part_type == PART_SHAFT:
-            _create_shaft(inputs)
+            _create_shaft(inputs, constrain=not is_preview)
         elif part_type == PART_TUBE:
             _create_tube(inputs)
         elif part_type == PART_PULLEY:
@@ -609,7 +614,10 @@ def command_preview(args: adsk.core.CommandEventArgs):
         # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
         # a value) — don't pop a blocking message box on every tick, and report failure
         # honestly instead of always claiming success (previously masked here).
-        args.isValidResult = _run_part_creation(inputs, show_message_box=False)
+        ok = _run_part_creation(inputs, show_message_box=False, is_preview=True)
+        # A shaft preview skips sketch constraining to stay responsive, so it must not
+        # be reused as the result — let command_execute rebuild it fully constrained.
+        args.isValidResult = ok and part_type != PART_SHAFT
 
 
 # ===========================================================================

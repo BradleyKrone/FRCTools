@@ -20,9 +20,18 @@ SHAFT_HALF_HEX         = '1/2" Hex Shaft'
 SHAFT_THREE_EIGHTH_HEX = '3/8" Hex Shaft'
 SHAFT_CUSTOM           = 'Custom (Round Tube)'
 
-SHAFT_HALF_HEX_CR_CM         = (0.500 / math.sqrt(3)) * IN_TO_CM
-SHAFT_THREE_EIGHTH_HEX_CR_CM = (0.375 / math.sqrt(3)) * IN_TO_CM
-SHAFT_BORE_RADIUS_CM          = (0.159 / 2.0) * IN_TO_CM
+# WCP rounded hex stock (wcproducts.com/products/shaft-stock): a regular hex whose six
+# corners are truncated by a circle, so it still drives hex bores but also pilots in a
+# round bearing. Values taken from WCP's own STEP files (which are modelled in inches):
+#   WCP-0914  .500" OD x .159" ID  -> hex flats 0.500", corner circle 13.74 mm
+#   WCP-0911  .375" OD x .159" ID  -> hex flats 0.375", corner circle 10.24 mm
+MM_TO_CM = 0.1
+
+SHAFT_HALF_HEX_FLATS_CM         = 0.500 * IN_TO_CM
+SHAFT_HALF_HEX_ROUND_DIA_CM     = 13.74 * MM_TO_CM
+SHAFT_THREE_EIGHTH_FLATS_CM     = 0.375 * IN_TO_CM
+SHAFT_THREE_EIGHTH_ROUND_DIA_CM = 10.24 * MM_TO_CM
+SHAFT_BORE_DIA_CM               = 0.159 * IN_TO_CM
 
 ATTR_GROUP      = 'FRCTools_PartsGen'
 ATTR_PART_TYPE  = 'part_type'
@@ -45,22 +54,126 @@ def _bbox_center(face: adsk.fusion.BRepFace) -> adsk.core.Point3D:
     )
 
 
-def _draw_hex(sketch: adsk.fusion.Sketch,
-              center: adsk.core.Point3D,
-              circumradius_cm: float):
-    """Draw a regular hexagon (flat-side up/down) centred at `center` in sketch space."""
+def _anchor_point(sketch: adsk.fusion.Sketch,
+                  center: adsk.core.Point3D) -> adsk.fusion.SketchPoint:
+    """Return a sketch point at `center` that a profile can be constrained against.
+
+    A sketch on the XY plane is centred on the sketch origin, which is already a fixed
+    reference. A sketch on a picked face is centred on that face's bounding box, which
+    has no natural reference in the sketch, so anchor it with a fixed point.
+    """
+    if abs(center.x) < 1e-9 and abs(center.y) < 1e-9:
+        return sketch.originPoint
+    anchor = sketch.sketchPoints.add(adsk.core.Point3D.create(center.x, center.y, 0.0))
+    anchor.isFixed = True
+    return anchor
+
+
+def _draw_rounded_hex(sketch: adsk.fusion.Sketch,
+                      center: adsk.core.Point3D,
+                      flats_cm: float,
+                      round_dia_cm: float,
+                      constrain: bool = True):
+    """Draw a fully-constrained WCP-style rounded hex (six flats joined by six corner
+    arcs) centred at `center` in sketch space: a regular hexagon of `flats_cm` across
+    the flats, with its corners truncated by a circle of `round_dia_cm`. Flat-side
+    up/down, matching the plain hex this replaced.
+
+    Curves created at identical coordinates are *not* merged by Fusion — they come out
+    with no constraints at all, so the profile closes only by luck and anything can drag
+    it apart. Every point therefore gets stitched and constrained explicitly.
+
+    `constrain=False` draws the geometry only. The constraint pass costs ~400 ms, which
+    is far too slow for executePreview; preview skips it and command_execute rebuilds.
+    """
+    apothem = flats_cm / 2.0
+    radius  = round_dia_cm / 2.0
+    if radius <= apothem or radius >= apothem / math.cos(math.radians(30)):
+        raise ValueError('rounded hex: corner circle must fall between the flats and the corners')
+
     cx, cy = center.x, center.y
-    vertices = [
-        adsk.core.Point3D.create(
-            cx + circumradius_cm * math.cos(math.radians(i * 60)),
-            cy + circumradius_cm * math.sin(math.radians(i * 60)),
+    # Angular half-width of a flat, seen from the centre. Its ends sit on the circle,
+    # so every point below is at `radius` from the centre.
+    half_flat_ang = math.acos(apothem / radius)
+
+    def _pt(angle_rad):
+        return adsk.core.Point3D.create(
+            cx + radius * math.cos(angle_rad),
+            cy + radius * math.sin(angle_rad),
             0.0,
         )
-        for i in range(6)
-    ]
+
     lines = sketch.sketchCurves.sketchLines
-    for i in range(6):
-        lines.addByTwoPoints(vertices[i], vertices[(i + 1) % 6])
+    arcs  = sketch.sketchCurves.sketchArcs
+    flats   = []
+    corners = []
+    sketch.isComputeDeferred = True
+    try:
+        for i in range(6):
+            phi = math.radians(30 + i * 60)          # outward normal of this flat
+            flats.append(lines.addByTwoPoints(
+                _pt(phi - half_flat_ang), _pt(phi + half_flat_ang)))
+            corners.append(arcs.addByThreePoints(
+                _pt(phi + half_flat_ang),                # flat end
+                _pt(phi + math.radians(30)),             # tip of the truncated corner
+                _pt(phi + math.radians(60) - half_flat_ang)))   # next flat's start
+    finally:
+        sketch.isComputeDeferred = False
+
+    if not constrain:
+        return
+
+    # --- Constrain ----------------------------------------------------------
+    # 30 degrees of freedom once the loop is stitched, removed by exactly the 30
+    # constraints/dimensions below, so the sketch lands fully constrained.
+    gc = sketch.geometricConstraints
+    sd = sketch.sketchDimensions
+
+    for i in range(6):                                                  # -24 dof
+        gc.addCoincident(flats[i].endSketchPoint, corners[i].startSketchPoint)
+        gc.addCoincident(corners[i].endSketchPoint, flats[(i + 1) % 6].startSketchPoint)
+
+    anchor = _anchor_point(sketch, center)
+    for arc in corners:                                                 # -12 dof
+        gc.addCoincident(arc.centerSketchPoint, anchor)
+    for arc in corners[1:]:                                             # -5 dof
+        gc.addEqual(corners[0], arc)
+    sd.addDiameterDimension(                                            # -1 dof
+        corners[0], adsk.core.Point3D.create(cx + 1.2 * radius, cy + 1.2 * radius, 0.0))
+
+    for i, flat in enumerate(flats):                                    # -6 dof
+        phi = math.radians(30 + i * 60)
+        sd.addOffsetDimension(flat, anchor, adsk.core.Point3D.create(
+            cx + 0.55 * apothem * math.cos(phi),
+            cy + 0.55 * apothem * math.sin(phi),
+            0.0,
+        ))
+
+    # Flats 1 and 4 are the horizontal pair; the other four follow from those.
+    gc.addHorizontal(flats[1])                                          # -2 dof
+    gc.addHorizontal(flats[4])
+    gc.addParallel(flats[0], flats[3])                                  # -2 dof
+    gc.addParallel(flats[2], flats[5])
+    # Text point picks the quadrant an angular dimension measures — keep these outside
+    # the profile, on the side of the flat being dimensioned.
+    sd.addAngularDimension(flats[1], flats[0],                          # -2 dof
+                           adsk.core.Point3D.create(cx + 1.6 * radius, cy + 1.6 * radius, 0.0))
+    sd.addAngularDimension(flats[1], flats[2],
+                           adsk.core.Point3D.create(cx - 1.6 * radius, cy + 1.6 * radius, 0.0))
+
+
+def _draw_circle(sketch: adsk.fusion.Sketch,
+                 center: adsk.core.Point3D,
+                 dia_cm: float,
+                 constrain: bool = True) -> adsk.fusion.SketchCircle:
+    """Draw a fully-constrained circle of `dia_cm` centred at `center` in sketch space."""
+    circle = sketch.sketchCurves.sketchCircles.addByCenterRadius(center, dia_cm / 2.0)
+    if constrain:
+        anchor = _anchor_point(sketch, center)
+        sketch.geometricConstraints.addCoincident(circle.centerSketchPoint, anchor)
+        sketch.sketchDimensions.addDiameterDimension(circle, adsk.core.Point3D.create(
+            center.x + dia_cm, center.y + dia_cm, 0.0))
+    return circle
 
 
 def _largest_profile(sketch: adsk.fusion.Sketch) -> adsk.fusion.Profile:
@@ -115,7 +228,7 @@ def _extrude_one_side(comp: adsk.fusion.Component,
 # Shaft creation
 # ===========================================================================
 
-def _create_shaft(inputs: adsk.core.CommandInputs):
+def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
     shaftTypeInp:   adsk.core.DropDownCommandInput  = inputs.itemById('shaft_type')
     customOD:       adsk.core.ValueCommandInput     = inputs.itemById('custom_od')
     customID:       adsk.core.ValueCommandInput     = inputs.itemById('custom_id')
@@ -179,15 +292,19 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
         # --- Draw outer profile -------------------------------------------------
         if shaft_type == SHAFT_HALF_HEX:
             workingComp.name = 'Shaft_HalfInchHex'
-            _draw_hex(sketch, center, SHAFT_HALF_HEX_CR_CM)
+            _draw_rounded_hex(sketch, center,
+                              SHAFT_HALF_HEX_FLATS_CM, SHAFT_HALF_HEX_ROUND_DIA_CM,
+                              constrain=constrain)
         elif shaft_type == SHAFT_THREE_EIGHTH_HEX:
             workingComp.name = 'Shaft_ThreeEighthHex'
-            _draw_hex(sketch, center, SHAFT_THREE_EIGHTH_HEX_CR_CM)
+            _draw_rounded_hex(sketch, center,
+                              SHAFT_THREE_EIGHTH_FLATS_CM, SHAFT_THREE_EIGHTH_ROUND_DIA_CM,
+                              constrain=constrain)
         else:
             od_cm = customOD.value
             od_in = od_cm / IN_TO_CM
             workingComp.name = f'Shaft_Custom_{od_in:.4g}in'
-            sketch.sketchCurves.sketchCircles.addByCenterRadius(center, od_cm / 2.0)
+            _draw_circle(sketch, center, od_cm, constrain=constrain)
 
         if sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create a valid outer sketch profile.')
@@ -209,11 +326,11 @@ def _create_shaft(inputs: adsk.core.CommandInputs):
         bore_sketch.name = 'BoreProfile'
 
         if shaft_type in (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX):
-            bore_r = SHAFT_BORE_RADIUS_CM
+            bore_dia = SHAFT_BORE_DIA_CM
         else:
-            bore_r = customID.value / 2.0
+            bore_dia = customID.value
 
-        bore_sketch.sketchCurves.sketchCircles.addByCenterRadius(center, bore_r)
+        _draw_circle(bore_sketch, center, bore_dia, constrain=constrain)
 
         if bore_sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create bore profile.')

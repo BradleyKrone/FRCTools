@@ -23,6 +23,44 @@ session.
 
 ## Lessons
 
+### Sketch curves drawn at identical coordinates are NOT merged — you get zero constraints
+Building a closed loop by passing the same `Point3D` to consecutive `addByTwoPoints` /
+`addByThreePoints` calls yields a valid single profile, but `sketchPoints.count` shows every
+endpoint still separate and `geometricConstraints.count == 0`, so the "closed" loop can be dragged
+apart and can never be fully constrained. **Fix:** explicitly
+`addCoincident(curve.endSketchPoint, nextCurve.startSketchPoint)` around the loop, then constrain
+the rest. Check the result with `sketch.isFullyConstrained` rather than assuming.
+`commands/PartsGen/shaft_gen.py` (`_draw_rounded_hex`)
+
+### Constraining a sketch costs ~13 ms per constraint — too slow for executePreview
+Fully constraining the 12-curve rounded hex (30 constraints/dimensions) took ~400 ms vs ~11 ms for
+the bare geometry, and `isComputeDeferred` does not help — the cost is per API call, not solving.
+**Fix:** give the draw helpers a `constrain` flag, skip it when called from preview, and set
+`args.isValidResult = False` so `command_execute` rebuilds the committed part fully constrained.
+`commands/PartsGen/entry.py` (`_run_part_creation`, `command_preview`)
+
+### Dimensions added to already-correct geometry lock in what is there — no value-flipping
+`addAngularDimension` picking the wrong quadrant, or a radial dim snapping to the wrong side, is a
+non-issue if you build the geometry at exact coordinates *first* and then add dimensions without
+setting `.value`. Each one captures the current measurement. Only the dimension's `textPoint`
+matters — for an angular dim it selects which of the four quadrants is measured.
+`commands/PartsGen/shaft_gen.py` (`_draw_rounded_hex`)
+
+### WCP "rounded hex" = hex flats truncated by a circle; get the numbers from WCP's STEP files
+The shaft-stock page only lists `.500" OD` / `.375" OD` and never the bearing-pilot diameter.
+**Fix:** download the STEP from the product page's CAD table (WCP models in inches) and read the
+radii straight out of it — 1/2" is 0.500" across flats ∩ Ø13.74 mm, 3/8" is 0.375" ∩ Ø10.24 mm,
+both with a .159" bore. Draw it as 6 lines + 6 arcs whose endpoints all come from one polar
+formula at the corner radius, so shared points land exactly on each other and the profile closes.
+`commands/PartsGen/shaft_gen.py` (`_draw_rounded_hex`)
+
+### `importlib.reload` in an MCP test script leaves `from ... import name` bindings stale
+Reloading a generator module to test an edit without Stop→Run updates the module dict but not
+`entry.py`'s already-bound `_create_shaft`, so the stale function hits NameError on any renamed
+module global. **Fix:** rebind the importer's attribute after reloading
+(`entry._create_shaft = sg._create_shaft`), or just Stop→Run the add-in.
+`commands/PartsGen/entry.py`
+
 ### "Joints on this linked component" means boundary-crossing joints, not joints whose side *is* it
 A pick inside a linked/external-reference component should answer "what mounts this link into my
 design?", so Joint Inspector rolls the target up to the outermost ancestor with
