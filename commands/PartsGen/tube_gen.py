@@ -61,6 +61,83 @@ def _bbox_center(face: adsk.fusion.BRepFace) -> adsk.core.Point3D:
     )
 
 
+def _anchor_point(sketch: adsk.fusion.Sketch,
+                  center: adsk.core.Point3D) -> adsk.fusion.SketchPoint:
+    """Return a sketch point at `center` that a profile can be constrained against.
+
+    A sketch on the XY plane is centred on the sketch origin, which is already a fixed
+    reference. A sketch on a picked face is centred on that face's bounding box, which
+    has no natural reference in the sketch, so anchor it with a fixed point.
+    """
+    if abs(center.x) < 1e-9 and abs(center.y) < 1e-9:
+        return sketch.originPoint
+    anchor = sketch.sketchPoints.add(adsk.core.Point3D.create(center.x, center.y, 0.0))
+    anchor.isFixed = True
+    return anchor
+
+
+def _draw_rectangle(sketch: adsk.fusion.Sketch,
+                    center: adsk.core.Point3D,
+                    width_cm: float,
+                    height_cm: float,
+                    constrain: bool = True) -> list:
+    """Draw a fully-constrained rectangle `width_cm` x `height_cm` centred at `center`
+    in sketch space. Returns the four sketch lines (bottom, right, top, left).
+
+    Curves created at identical coordinates are *not* merged by Fusion — the loop
+    closes only by luck and can be dragged apart — so each corner is stitched with an
+    explicit coincident constraint, anchored, and dimensioned (see
+    `shaft_gen._draw_rounded_hex` for the original worked example of this pattern).
+
+    `constrain=False` draws the geometry only, for use inside `executePreview`; the
+    caller must rebuild with `constrain=True` for the committed result.
+    """
+    cx, cy = center.x, center.y
+    hw = width_cm / 2.0
+    hh = height_cm / 2.0
+
+    corners = [
+        adsk.core.Point3D.create(cx - hw, cy - hh, 0),
+        adsk.core.Point3D.create(cx + hw, cy - hh, 0),
+        adsk.core.Point3D.create(cx + hw, cy + hh, 0),
+        adsk.core.Point3D.create(cx - hw, cy + hh, 0),
+    ]
+    lines_col = sketch.sketchCurves.sketchLines
+    lines = [lines_col.addByTwoPoints(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+
+    if not constrain:
+        return lines
+
+    # --- Constrain ------------------------------------------------------------
+    # 16 dof for 4 unconnected lines, removed by exactly the constraints/dimensions
+    # below, so the sketch lands fully constrained.
+    gc = sketch.geometricConstraints
+    sd = sketch.sketchDimensions
+
+    for i in range(4):                                                  # -8 dof
+        gc.addCoincident(lines[i].endSketchPoint, lines[(i + 1) % 4].startSketchPoint)
+
+    anchor = _anchor_point(sketch, corners[0])
+    gc.addCoincident(lines[0].startSketchPoint, anchor)                 # -2 dof
+
+    bottom, right, top, left = lines
+    gc.addHorizontal(bottom)                                            # -4 dof
+    gc.addHorizontal(top)
+    gc.addVertical(right)
+    gc.addVertical(left)
+
+    sd.addDistanceDimension(                                            # -2 dof
+        bottom.startSketchPoint, bottom.endSketchPoint,
+        adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+        adsk.core.Point3D.create(cx, cy - hh - 0.3, 0.0))
+    sd.addDistanceDimension(
+        bottom.startSketchPoint, left.startSketchPoint,
+        adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+        adsk.core.Point3D.create(cx - hw - 0.3, cy, 0.0))
+
+    return lines
+
+
 def _largest_profile(sketch: adsk.fusion.Sketch) -> adsk.fusion.Profile:
     """Return the sketch profile with the largest area."""
     best = sketch.profiles.item(0)
@@ -335,7 +412,7 @@ def _add_face_holes(comp: adsk.fusion.Component,
 # Tube creation
 # ===========================================================================
 
-def _create_tube(inputs: adsk.core.CommandInputs):
+def _create_tube(inputs: adsk.core.CommandInputs, constrain: bool = True):
     tubeWidthInp:   adsk.core.ValueCommandInput     = inputs.itemById('tube_width')
     tubeHeightInp:  adsk.core.ValueCommandInput     = inputs.itemById('tube_height')
     tubeThickInp:   adsk.core.DropDownCommandInput  = inputs.itemById('tube_thickness')
@@ -409,18 +486,8 @@ def _create_tube(inputs: adsk.core.CommandInputs):
         c_sk   = outer_sketch.modelToSketchSpace(centroid1)
         cx, cy = c_sk.x, c_sk.y
 
-        hw = w_cm / 2.0
-        hh = h_cm / 2.0
-
-        lines = outer_sketch.sketchCurves.sketchLines
-        corners_outer = [
-            adsk.core.Point3D.create(cx - hw, cy - hh, 0),
-            adsk.core.Point3D.create(cx + hw, cy - hh, 0),
-            adsk.core.Point3D.create(cx + hw, cy + hh, 0),
-            adsk.core.Point3D.create(cx - hw, cy + hh, 0),
-        ]
-        for i in range(4):
-            lines.addByTwoPoints(corners_outer[i], corners_outer[(i + 1) % 4])
+        _draw_rectangle(outer_sketch, adsk.core.Point3D.create(cx, cy, 0), w_cm, h_cm,
+                        constrain=constrain)
 
         if outer_sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create outer tube profile.')
@@ -441,17 +508,8 @@ def _create_tube(inputs: adsk.core.CommandInputs):
         inner_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
         inner_sketch.name = 'TubeInnerProfile'
 
-        ihw = (w_cm - 2 * t_cm) / 2.0
-        ihh = (h_cm - 2 * t_cm) / 2.0
-        corners_inner = [
-            adsk.core.Point3D.create(cx - ihw, cy - ihh, 0),
-            adsk.core.Point3D.create(cx + ihw, cy - ihh, 0),
-            adsk.core.Point3D.create(cx + ihw, cy + ihh, 0),
-            adsk.core.Point3D.create(cx - ihw, cy + ihh, 0),
-        ]
-        inner_lines = inner_sketch.sketchCurves.sketchLines
-        for i in range(4):
-            inner_lines.addByTwoPoints(corners_inner[i], corners_inner[(i + 1) % 4])
+        _draw_rectangle(inner_sketch, adsk.core.Point3D.create(cx, cy, 0),
+                        w_cm - 2 * t_cm, h_cm - 2 * t_cm, constrain=constrain)
 
         if inner_sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create inner tube profile.')

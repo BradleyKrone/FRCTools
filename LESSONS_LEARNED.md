@@ -882,3 +882,39 @@ over-constraining an already-defined edge.
 Passing inch values straight into the API makes parts 2.54x too small. **Fix:** convert with
 `IN_TO_CM = 2.54` or `futil.inchValue(inches)`; expose inches in dialogs, store/compute in cm.
 `lib/fusionAddInUtils/general_utils.py`
+
+### A distance dimension between two names that alias the same stitched point is a silent zero-length dimension, and Fusion reports it as "over constrained"
+PartsGen's tube outer/inner rectangles were built from 4 unconnected `addByTwoPoints` lines with no
+constraints at all (the classic gotcha at the top of this file) — never actually flagged by
+`sketch.isFullyConstrained` because nobody was checking it. Fixing it by porting `shaft_gen`'s
+stitch-anchor-dimension pattern (see `_draw_rounded_hex`) to a new `_draw_rectangle` helper hit one
+new mistake along the way: after stitching the loop with `addCoincident`, `left.endSketchPoint` is
+the *same point* as `bottom.startSketchPoint` (the anchor corner), not the opposite corner — so a
+height dimension written as `addDistanceDimension(bottom.startSketchPoint, left.endSketchPoint, ...)`
+asks for the distance between a point and itself. Fusion doesn't call this out as degenerate; it
+throws `RuntimeError: 3 : VCS_SKETCH_OVER_CONSTRAINTS` on the very next `addDistanceDimension` call,
+which reads exactly like a plain over-dimensioning bug. **Fix:** after stitching a loop, always name
+the far corner via the *start* point of the line leaving it (`left.startSketchPoint`), not the *end*
+point of the line arriving at the anchor — draw the loop's point identities out on paper (or log each
+`SketchPoint.geometry` by id) before wiring dimensions to them. Verified live via the Fusion MCP
+script tool: reloading the module and calling `_draw_rectangle` directly, checking
+`sketch.isFullyConstrained`, catches this in seconds without ever opening the command dialog.
+`commands/PartsGen/tube_gen.py` (`_draw_rectangle`)
+
+### Skipping a feature during preview is a UX trade-off, not a free performance win — confirm with the user before assuming it's wanted
+`_create_tube` always called `_add_face_holes` — a sketch + dimensions + cut + feature rectangular
+pattern *per outer face* (up to 4) — on every `executePreview` tick, not just on OK. Following
+`belt_gen`/`chain_gen`'s existing `if is_preview: <cheap extrude>; return` convention for their own
+expensive step (tooth patterning), this was changed to skip the hole pattern during preview too:
+verified live via the Fusion MCP script tool with a duck-typed `CommandInputs` stub, `constrain=False`
+dropped from ~0.93 s to ~0.065 s with 0 pattern features. **But the user rejected this fix on sight**
+once it reached the live dialog — with the holes invisible until OK, they could no longer see hole
+placement while adjusting width/height/hole size, which they use to "select the correct thing" (verify
+positions before committing). Reverted: holes are drawn on every preview tick again, same as before.
+**Lesson:** an existing convention elsewhere in the codebase (belt/chain hiding their pattern during
+preview) does not mean every generator's expensive step is equally safe to hide — whether the
+live-updating detail is load-bearing for the user's workflow is a product judgment, not a performance
+one. Ask before applying this pattern to a new command, rather than assuming a measured speedup is
+strictly better. The sketch-constraining skip (previous entry) was kept, since it has no visible effect
+on the preview either way — only the *visible* hole pattern was walked back.
+`commands/PartsGen/tube_gen.py` (`_create_tube`)

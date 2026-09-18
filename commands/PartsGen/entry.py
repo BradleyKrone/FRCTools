@@ -572,7 +572,7 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
     and to keep preview-time failures out of a blocking message box.
 
     `is_preview` lets a generator skip work that only matters on the committed
-    result; the shaft uses it to skip its (slow) sketch constraining.
+    result; the shaft and tube use it to skip their (slow) sketch constraining.
     """
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
@@ -580,7 +580,7 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
         if part_type == PART_SHAFT:
             _create_shaft(inputs, constrain=not is_preview)
         elif part_type == PART_TUBE:
-            _create_tube(inputs)
+            _create_tube(inputs, constrain=not is_preview)
         elif part_type == PART_PULLEY:
             _create_pulley(inputs)
         elif part_type == PART_SPROCKET:
@@ -615,9 +615,9 @@ def command_preview(args: adsk.core.CommandEventArgs):
         # a value) — don't pop a blocking message box on every tick, and report failure
         # honestly instead of always claiming success (previously masked here).
         ok = _run_part_creation(inputs, show_message_box=False, is_preview=True)
-        # A shaft preview skips sketch constraining to stay responsive, so it must not
-        # be reused as the result — let command_execute rebuild it fully constrained.
-        args.isValidResult = ok and part_type != PART_SHAFT
+        # A shaft/tube preview skips sketch constraining to stay responsive, so it must
+        # not be reused as the result — let command_execute rebuild it fully constrained.
+        args.isValidResult = ok and part_type not in (PART_SHAFT, PART_TUBE)
 
 
 # ===========================================================================
