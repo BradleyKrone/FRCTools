@@ -31,6 +31,7 @@ ATTR_PULLEY_BELT_WIDTH      = 'pulley_belt_width'
 ATTR_PULLEY_SHOW_TEETH      = 'pulley_show_teeth'
 ATTR_PULLEY_BELT_COMP_TOKEN  = 'pulley_belt_comp_token'
 ATTR_PULLEY_PITCH_CIRCLE_IDX = 'pulley_pitch_circle_index'
+ATTR_CUSTOM_NAME             = 'custom_name'
 
 # ---------------------------------------------------------------------------
 # Flange dimensions (Fusion 360 uses centimetres internally)
@@ -297,6 +298,11 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
 
         workingComp.name = comp_name
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
         extrudes   = workingComp.features.extrudeFeatures
         widthValue = adsk.core.ValueInput.createByReal(beltWidth.value)
 
@@ -344,6 +350,8 @@ def _create_pulley(inputs: adsk.core.CommandInputs):
             attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT,  str(n_teeth))
             attrs.add(ATTR_GROUP, ATTR_PULLEY_BELT_WIDTH,   beltWidth.expression)
             attrs.add(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH,   str(show_teeth))
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME,     custom_name)
         except Exception:
             futil.log('PartsGen: failed to save pulley attributes')
 

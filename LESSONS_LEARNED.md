@@ -23,6 +23,15 @@ session.
 
 ## Lessons
 
+### A component-naming live-sync must check for a user override before it renames on every geometry edit
+PartsGen Timing Belt/Chain rename their component on every `commandTerminated` sync (`_update_belt_name`,
+`_update_chain_name`) so the name always reflects the current tooth/link count as the user drags the
+C-C distance. Adding an optional "Component Name" field meant that override would get silently
+clobbered the next time the geometry changed. **Fix:** keep the geometry rebuild unconditional, but
+add an early `return` right before the actual rename — guarded on a stored `custom_name` component
+attribute — so a user-supplied name survives live edits while the body still rebuilds correctly.
+`commands/PartsGen/belt_gen.py` (`_update_belt_name`), `commands/PartsGen/chain_gen.py` (`_update_chain_name`)
+
 ### A hand-built reference part's bore clearance is a fixed radial offset, not a scale factor — read it straight off the B-rep, don't guess
 Asked to add a "Hex Spacer" option to PartsGen's Shaft Type dropdown (round OD, hex bore -- the
 inverse of the same-size hex shaft) matching an existing hand-modelled part (`Hood_Spacer` in the

@@ -46,6 +46,7 @@ ATTR_ADD_HOLES   = 'tube_add_holes'
 ATTR_HOLE_SIZE   = 'hole_size'
 ATTR_HOLE_DIAM   = 'hole_diam_expr'
 ATTR_LEN_EXPR    = 'custom_len_expr'
+ATTR_CUSTOM_NAME = 'custom_name'
 
 
 # ===========================================================================
@@ -459,6 +460,11 @@ def _create_tube(inputs: adsk.core.CommandInputs, constrain: bool = True):
         t_in = t_cm / IN_TO_CM
         workingComp.name = f'Tube_{w_in:.4g}x{h_in:.4g}_T{t_in:.4g}in'
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = custom_name
+
         if len_type == LEN_FACES:
             face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
             face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
@@ -574,6 +580,8 @@ def _create_tube(inputs: adsk.core.CommandInputs, constrain: bool = True):
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
             else:
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+            if custom_name:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
         except Exception:
             futil.log('PartsGen: failed to save tube attributes')
 

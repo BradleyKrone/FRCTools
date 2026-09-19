@@ -58,6 +58,7 @@ ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
 ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
 ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
 ATTR_CHAIN_LOOP_LENGTH    = 'chain_loop_length'
+ATTR_CUSTOM_NAME          = 'custom_name'
 
 # ---------------------------------------------------------------------------
 # Chain-name-sync (commandTerminated hook)
@@ -339,6 +340,9 @@ def _update_chain_name(comp: adsk.fusion.Component):
         if stored_len is None or abs(loop_cm - stored_len) > 1e-6:
             _rebuild_chain_3d(comp, loop_cm, width_cm, link_height_cm)
 
+        if comp.attributes.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME):
+            return  # user gave this chain a custom name — don't auto-rename it
+
         width_mm = round(width_cm * 10)
         new_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
         if comp.name != new_name:
@@ -582,6 +586,11 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         comp_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
         workingComp.name = comp_name
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
         # Build offset profiles around the pitch loop for the chain body cross-section
         half_thickness = adsk.core.ValueInput.createByReal(link_height_cm / 2)
         geoConstraints = sketch.geometricConstraints
@@ -611,6 +620,8 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
             attrs.add(ATTR_GROUP, ATTR_CHAIN_GEN_SPROCKETS,  str(genSprocketsInp.value if genSprocketsInp else True))
             attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_TEETH, str(sprTeethInp.value if sprTeethInp else False))
             attrs.add(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH,    str(round(curveLength, 8)))
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME,      custom_name)
         except Exception:
             futil.log('PartsGen: failed to save chain attributes')
 

@@ -29,6 +29,7 @@ ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
 ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
 ATTR_BELT_LOOP_LENGTH  = 'belt_loop_length'
+ATTR_CUSTOM_NAME       = 'custom_name'
 
 # ---------------------------------------------------------------------------
 # Belt-name-sync (commandTerminated hook)
@@ -367,6 +368,9 @@ def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
         if stored_len is None or abs(loop_cm - stored_len) > 1e-6:
             _rebuild_belt_3d(comp, belt_pitch_mm, tooth_count, loop_cm)
 
+        if comp.attributes.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME):
+            return  # user gave this belt a custom name — don't auto-rename it
+
         # Extract belt width from the existing name (format: "Belt_XXX-NNNTxMMmm")
         try:
             width_mm = int(comp.name.split('Tx')[1].replace('mm', ''))
@@ -517,6 +521,11 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
             comp_name = f'Belt_GT2_3mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
         workingComp.name = comp_name
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
         # Build the belt thickness offset around the pitch loop
         half_belt_thickness = adsk.core.ValueInput.createByReal(beltThickness / 2)
         geoConstraints      = sketch.geometricConstraints
@@ -581,6 +590,8 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
             attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
             attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
             attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
         except Exception:
             futil.log('PartsGen: failed to save belt attributes')
 

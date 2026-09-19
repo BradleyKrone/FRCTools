@@ -33,6 +33,7 @@ ATTR_SPROCKET_CHAIN_TYPE    = 'sprocket_chain_type'     # '#25 Chain' or '#35 Ch
 ATTR_SPROCKET_CHAIN_COMP_TOKEN = 'sprocket_chain_comp_token'
 ATTR_SPROCKET_PITCH_CIRCLE_IDX = 'sprocket_pitch_circle_index'
 ATTR_SPROCKET_CHAIN_PITCH      = 'sprocket_chain_pitch_mm'
+ATTR_CUSTOM_NAME               = 'custom_name'
 
 # ---------------------------------------------------------------------------
 # #25 Chain constants (ANSI B29.1)
@@ -323,6 +324,11 @@ def _create_sprocket(inputs: adsk.core.CommandInputs):
         comp_name   = f'{chain_prefix}-{n_teeth}Tx{width_mm}mm'
         workingComp.name = comp_name
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
         extrudes   = workingComp.features.extrudeFeatures
         widthValue = adsk.core.ValueInput.createByReal(width_cm)
 
@@ -367,6 +373,8 @@ def _create_sprocket(inputs: adsk.core.CommandInputs):
             attrs.add(ATTR_GROUP, ATTR_SPROCKET_WIDTH,       sprocket_width.expression)
             attrs.add(ATTR_GROUP, ATTR_SPROCKET_SHOW_TEETH,  str(show_teeth))
             attrs.add(ATTR_GROUP, ATTR_SPROCKET_CHAIN_TYPE,  chain_type_str)
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME,      custom_name)
         except Exception:
             futil.log('PartsGen: failed to save sprocket attributes')
 

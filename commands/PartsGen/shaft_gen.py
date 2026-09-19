@@ -95,6 +95,7 @@ ATTR_SHAFT_TYPE = 'shaft_type'
 ATTR_CUSTOM_OD  = 'custom_od_expr'
 ATTR_CUSTOM_ID  = 'custom_id_expr'
 ATTR_LEN_EXPR   = 'custom_len_expr'
+ATTR_CUSTOM_NAME = 'custom_name'
 
 
 # ===========================================================================
@@ -473,6 +474,11 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             workingComp.name = f'Shaft_Custom_{od_in:.4g}in'
             _draw_circle(sketch, center, od_cm, constrain=constrain)
 
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = custom_name
+
         if sketch.profiles.count < 1:
             futil.popup_error('Parts Gen: could not create a valid outer sketch profile.')
             workingOcc.deleteMe()
@@ -548,6 +554,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
             else:
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+            if custom_name:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
         except Exception:
             futil.log('PartsGen: failed to save shaft attributes')
 

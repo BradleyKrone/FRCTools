@@ -129,6 +129,8 @@ ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
 ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
 ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
 
+ATTR_CUSTOM_NAME          = 'custom_name'
+
 
 # ===========================================================================
 # start / stop
@@ -197,6 +199,10 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    False, '')
     partTypeInp.listItems.add(PART_SPROCKET, False, '')
     partTypeInp.listItems.add(PART_CHAIN,   False, '')
+
+    # --- Component name (optional override; blank = auto-generated name) -----
+    customNameInp = inputs.addStringValueInput('custom_name', 'Component Name', '')
+    customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---------------------------------------------------------
     shaftTypeInp = inputs.addDropDownCommandInput(
@@ -972,7 +978,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
-                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH):
+                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
+                    ATTR_CUSTOM_NAME):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -1027,6 +1034,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     chain_spr_width_val  = _s(ATTR_CHAIN_SPROCKET_WIDTH, '0.375 in')
     chain_gen_spr_val    = _b(ATTR_CHAIN_GEN_SPROCKETS,  True)
     chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
+    custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
 
     # --- Part type ---
     partTypeInp = inputs.addDropDownCommandInput(
@@ -1038,6 +1046,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    is_belt,     '')
     partTypeInp.listItems.add(PART_SPROCKET, is_sprocket, '')
     partTypeInp.listItems.add(PART_CHAIN,   is_chain,    '')
+
+    # --- Component name (optional override; blank = auto-generated name) -----
+    customNameInp = inputs.addStringValueInput('custom_name', 'Component Name', custom_name_val)
+    customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---
     shaftTypeInp = inputs.addDropDownCommandInput(
