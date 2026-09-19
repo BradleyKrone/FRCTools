@@ -28,6 +28,16 @@ _edit_target_occ       = None   # occurrence being edited; set in ui_command_sta
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
 
 # ---------------------------------------------------------------------------
+# Reference-face highlight (Shaft/Tube preview) -- see command_preview /
+# command_destroy and _draw_ref_face_highlight below.
+# ---------------------------------------------------------------------------
+_ref_face_highlight_group = None
+
+_REF_FACE_COLOR   = (230, 30, 180)   # magenta -- distinct from Fusion's blue selection
+_REF_FACE_OPACITY = 0.9
+_DEPTH_REF_FACE   = 10
+
+# ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
 IN_TO_CM = 2.54
@@ -297,6 +307,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString('6 in')
     )
+
+    highlightRefFaceInp = inputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
     customLenInp.isVisible = True
 
     # --- Pulley group --------------------------------------------------------
@@ -434,6 +447,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     face1Sel:       adsk.core.SelectionCommandInput  = inputs.itemById('face1_selection')
     face2Sel:       adsk.core.SelectionCommandInput  = inputs.itemById('face2_selection')
     customLenInp:   adsk.core.ValueCommandInput      = inputs.itemById('custom_length')
+    highlightRefFaceInp: adsk.core.BoolValueCommandInput = inputs.itemById('highlight_ref_face')
     beltTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('belt_type')
     toothCountInp:  adsk.core.ValueCommandInput      = inputs.itemById('tooth_count')
     beltWidthInp:   adsk.core.ValueCommandInput      = inputs.itemById('belt_width')
@@ -531,6 +545,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     face1Sel.isVisible     = not hide_length and is_between_faces
     face2Sel.isVisible     = not hide_length and is_between_faces
     customLenInp.isVisible = not hide_length and not is_between_faces
+    if highlightRefFaceInp is not None:
+        highlightRefFaceInp.isVisible = not hide_length
 
     # Sync selection limits with visibility
     if not hide_length and is_between_faces:
@@ -588,12 +604,14 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 # ===========================================================================
 
 def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
-                       is_preview: bool = False) -> bool:
+                       is_preview: bool = False):
     """Dispatch to the selected part type's creation function.
 
-    Returns True on success, False if an exception was caught — used by
-    command_preview to report an honest isValidResult instead of always True,
-    and to keep preview-time failures out of a blocking message box.
+    Returns (success, ref_face): success is False if an exception was caught — used
+    by command_preview to report an honest isValidResult instead of always True, and
+    to keep preview-time failures out of a blocking message box. ref_face is the
+    BRepFace the part was extruded from (Shaft/Tube only, else None), used to draw
+    the reference-face highlight.
 
     `is_preview` lets a generator skip work that only matters on the committed
     result; the shaft and tube use it to skip their (slow) sketch constraining.
@@ -601,10 +619,11 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     try:
+        ref_face = None
         if part_type == PART_SHAFT:
-            _create_shaft(inputs, constrain=not is_preview)
+            ref_face = _create_shaft(inputs, constrain=not is_preview)
         elif part_type == PART_TUBE:
-            _create_tube(inputs, constrain=not is_preview)
+            ref_face = _create_tube(inputs, constrain=not is_preview)
         elif part_type == PART_PULLEY:
             _create_pulley(inputs)
         elif part_type == PART_SPROCKET:
@@ -613,10 +632,10 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
             _create_chain(inputs)
         else:
             _create_belt(inputs)
-        return True
+        return True, ref_face
     except Exception:
         futil.handle_error('PartsGen command_execute', show_message_box=show_message_box)
-        return False
+        return False, None
 
 
 def command_execute(args: adsk.core.CommandEventArgs):
@@ -632,16 +651,24 @@ def command_preview(args: adsk.core.CommandEventArgs):
         suppressTeethInp = inputs.itemById('tb_suppress_teeth')
         if suppressTeethInp and suppressTeethInp.value:
             args.isValidResult = True
+        _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
         _create_chain(inputs, is_preview=True)
+        _clear_ref_face_highlight()
     else:
         # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
         # a value) — don't pop a blocking message box on every tick, and report failure
         # honestly instead of always claiming success (previously masked here).
-        ok = _run_part_creation(inputs, show_message_box=False, is_preview=True)
+        ok, ref_face = _run_part_creation(inputs, show_message_box=False, is_preview=True)
         # A shaft/tube preview skips sketch constraining to stay responsive, so it must
         # not be reused as the result — let command_execute rebuild it fully constrained.
         args.isValidResult = ok and part_type not in (PART_SHAFT, PART_TUBE)
+        highlightRefFaceInp = inputs.itemById('highlight_ref_face')
+        highlight_enabled = highlightRefFaceInp is None or highlightRefFaceInp.value
+        try:
+            _draw_ref_face_highlight(ref_face if highlight_enabled else None)
+        except Exception:
+            futil.handle_error('PartsGen ref face highlight', show_message_box=False)
 
 
 # ===========================================================================
@@ -773,6 +800,120 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers
     local_handlers = []
+    _clear_ref_face_highlight()
+    try:
+        app.activeViewport.refresh()
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# Reference-face highlight (live preview only)
+# ===========================================================================
+# A transient CustomGraphics overlay on the real start-cap face an extrude feature was
+# built from (Shaft/Tube), so the user can tell which side of the part is the
+# reference/extrude-from side while the dialog is still open and being adjusted.
+# Cleared in command_destroy — the color that stays after OK is a separate, permanent
+# BRepFace.appearance override applied by _create_shaft/_create_tube themselves once
+# the real (non-preview) geometry is built. CustomGraphics is used here rather than
+# that same appearance override, because per LESSONS_LEARNED.md, writing
+# Occurrence.appearance from a live command handler either throws (read-only context)
+# or, deferred, destabilizes an open SelectionCommandInput — CustomGraphics never
+# mutates the design, so neither failure applies, and it's proven safe to redraw every
+# executePreview tick even with Face 1/Face 2 selection inputs open (see
+# commands/JointInspector/entry.py, the source of this pattern).
+
+def _is_live(entity) -> bool:
+    try:
+        return entity is not None and entity.isValid
+    except Exception:
+        return False
+
+
+def _solid_color(rgb):
+    r, g, b = rgb
+    return adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(r, g, b, 255))
+
+
+def _calc_mesh(entity):
+    """Compute a fresh triangle mesh for `entity` (a BRepFace or BRepBody).
+
+    Deliberately not entity.meshManager.displayMeshes.bestMesh: that reads Fusion's
+    cached display mesh, which is empty for geometry created moments earlier in this
+    same preview tick (confirmed live: bestMesh threw "InternalValidationError:
+    count > 0" on a body extruded seconds before, in the same script). The reference
+    face/body here is always freshly rebuilt every executePreview call, so the mesh
+    has to be calculated on demand instead of assumed to already be cached.
+    """
+    try:
+        calc = entity.meshManager.createMeshCalculator()
+        calc.setQuality(adsk.fusion.TriangleMeshQualityOptions.NormalQualityTriangleMesh)
+        return calc.calculate()
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not calculate mesh: {err}')
+        return None
+
+
+def _add_mesh(group, mesh, rgb, opacity, depth):
+    if mesh is None:
+        return
+    try:
+        points  = mesh.nodeCoordinatesAsDouble
+        indices = mesh.nodeIndices
+        normals = mesh.normalVectorsAsDouble
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: display mesh unreadable, skipping: {err}')
+        return
+
+    # An empty or inconsistent display mesh -- what a body that is hidden, suppressed
+    # or mid-recompute hands back -- takes addMesh down with it (a Fusion crash, not a
+    # Python exception), so it is rejected here rather than trusted.
+    node_count = len(points) // 3
+    if node_count == 0 or not indices or len(normals) != len(points):
+        futil.log(f'{CMD_NAME}: skipping degenerate mesh (nodes={node_count}, '
+                  f'indices={len(indices) if indices else 0}, '
+                  f'normals={len(normals) if normals else 0})')
+        return
+    if max(indices) >= node_count:
+        futil.log(f'{CMD_NAME}: skipping mesh with out-of-range node indices')
+        return
+
+    coords = adsk.fusion.CustomGraphicsCoordinates.create(points)
+    entity = group.addMesh(coords, indices, normals, [])
+    entity.color = _solid_color(rgb)
+    entity.setOpacity(opacity, True)
+    entity.depthPriority = depth
+
+
+def _highlight_face(group, face: adsk.fusion.BRepFace, rgb):
+    if not _is_live(face):
+        return
+    _add_mesh(group, _calc_mesh(face), rgb, _REF_FACE_OPACITY, _DEPTH_REF_FACE)
+
+
+def _clear_ref_face_highlight():
+    global _ref_face_highlight_group
+    if _ref_face_highlight_group is None:
+        return
+    group = _ref_face_highlight_group
+    _ref_face_highlight_group = None
+    try:
+        if group.isValid:
+            group.deleteMe()
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: failed to delete reference face highlight: {err}')
+
+
+def _draw_ref_face_highlight(ref_face):
+    global _ref_face_highlight_group
+    _clear_ref_face_highlight()
+    if not _is_live(ref_face):
+        return
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    group = design.rootComponent.customGraphicsGroups.add()
+    _ref_face_highlight_group = group  # set immediately so a half-built group is
+                                        # still reachable if something below throws
+    _highlight_face(group, ref_face, _REF_FACE_COLOR)
 
 
 # ===========================================================================
@@ -1254,6 +1395,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
         adsk.core.ValueInput.createByString(len_expr)
     )
     customLenInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+
+    highlightRefFaceInpEdit = inputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
+    highlightRefFaceInpEdit.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)

@@ -176,3 +176,32 @@ def group_timeline_features(design: adsk.fusion.Design, start_marker: int, group
             group.name = group_name
     except Exception:
         log(f'FRCTools: failed to create timeline group "{group_name}"')
+
+
+def get_or_create_appearance(design: adsk.fusion.Design, name: str, rgb) -> adsk.core.Base:
+    """Return a design-local Appearance named `name`, colored `rgb` (an (r, g, b) 0-255
+    tuple) -- reusing it if a previous call already created it in this design, or copying
+    a base appearance out of the Fusion Appearance Library the first time it's needed.
+
+    Used to mark a specific face with a persistent color override (e.g. PartsGen's
+    reference-face indicator) -- unlike a CustomGraphics overlay, this is a real design
+    property that's saved with the file and survives after the command that created it
+    closes.
+    """
+    existing = design.appearances.itemByName(name)
+    if existing:
+        return existing
+
+    lib = app.materialLibraries.itemByName('Fusion Appearance Library')
+    src = lib.appearances.itemByName('Paint - Enamel Glossy (Yellow)') if lib else None
+    if src is None and lib and lib.appearances.count > 0:
+        src = lib.appearances.item(0)
+    if src is None:
+        raise RuntimeError('Fusion Appearance Library unavailable -- cannot create appearance')
+
+    appearance = design.appearances.addByCopy(src, name)
+    r, g, b = rgb
+    color_prop = appearance.appearanceProperties.itemByName('Color')
+    if color_prop:
+        color_prop.value = adsk.core.Color.create(r, g, b, 255)
+    return appearance

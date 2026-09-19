@@ -23,6 +23,37 @@ session.
 
 ## Lessons
 
+### A persistent per-face color needs `BRepFace.appearance`, and it's safe to write from `command_execute` — just not from preview/inputChanged
+PartsGen's reference-face indicator needed to survive after OK is clicked, not just during the
+live preview. A `CustomGraphicsGroup` overlay (the right tool for the *live* preview highlight,
+see the mesh-calculator entry below) is always transient — Fusion clears it on every preview
+rebuild and it isn't a real design property, so it can't be what's still colored after the dialog
+closes. **Fix:** copy an appearance out of `app.materialLibraries.itemByName('Fusion Appearance
+Library')` into `design.appearances` via `addByCopy`, retint it through
+`appearance.appearanceProperties.itemByName('Color').value = adsk.core.Color.create(...)`, and
+assign it directly to `face.appearance` — confirmed live, and it renders on just that one face,
+not the whole body. Do this only in the command's real `command_execute` (i.e. where
+`_create_shaft`/`_create_tube` already run with `constrain=True`, their signal for "this is the
+final build, not a preview tick") — unlike the `Occurrence.appearance` case earlier in this file,
+which failed specifically because it was written from a live-preview/inputChanged context, this
+same class of write is a normal, already-proven-safe design mutation once it's inside execute.
+`commands/PartsGen/shaft_gen.py`, `commands/PartsGen/tube_gen.py` (`REF_FACE_COLOR`),
+`lib/fusionAddInUtils/general_utils.py` (`get_or_create_appearance`)
+
+### `BRepFace/BRepBody.meshManager.displayMeshes.bestMesh` throws on geometry created moments earlier — use `createMeshCalculator()` instead
+Building a CustomGraphics highlight (PartsGen's reference-face indicator) for a body/face created
+earlier in the *same* script or `executePreview` call: `displayMeshes.bestMesh` threw
+`RuntimeError: 2 : InternalValidationError : count > 0` (confirmed live) because Fusion hadn't
+cached a display mesh for the brand-new geometry yet — that cache only exists for geometry Fusion
+has already rendered at least once (e.g. pre-existing bodies a user selected, as in
+JointInspector). **Fix:** call `entity.meshManager.createMeshCalculator()`,
+`.setQuality(adsk.fusion.TriangleMeshQualityOptions.NormalQualityTriangleMesh)`, `.calculate()` —
+this computes the mesh synchronously on demand instead of depending on a cache, and works
+immediately after the entity is created. `ExtrudeFeature.startFaces` itself is fine to query
+right after a later participant-body cut on the same body (confirmed live: `.count` stayed 1
+across the cut) — it's specifically the mesh cache that's unreliable on fresh geometry.
+`commands/PartsGen/entry.py` (`_calc_mesh`)
+
 ### A component-naming live-sync must check for a user override before it renames on every geometry edit
 PartsGen Timing Belt/Chain rename their component on every `commandTerminated` sync (`_update_belt_name`,
 `_update_chain_name`) so the name always reflects the current tooth/link count as the user drags the

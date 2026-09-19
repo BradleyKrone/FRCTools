@@ -97,6 +97,12 @@ ATTR_CUSTOM_ID  = 'custom_id_expr'
 ATTR_LEN_EXPR   = 'custom_len_expr'
 ATTR_CUSTOM_NAME = 'custom_name'
 
+# Persistent color marking the reference face (the face the part was extruded from) --
+# matches entry.py's transient preview highlight so the color doesn't change when the
+# dialog closes and this permanent appearance takes over.
+REF_FACE_APPEARANCE_NAME = 'FRCTools_PartsGen_RefFace'
+REF_FACE_COLOR           = (230, 30, 180)
+
 
 # ===========================================================================
 # Helpers
@@ -560,6 +566,28 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             futil.log('PartsGen: failed to save shaft attributes')
 
         futil.group_timeline_features(design, start_marker, workingComp.name)
+
+        # The face the shaft was extruded from -- stays live through the bore
+        # cut above, since Fusion keeps an extrude feature's startFaces in
+        # sync as later participant-body operations modify the same body.
+        ref_face = outer_feat.startFaces.item(0) if outer_feat.startFaces.count > 0 else None
+
+        # Persistently color it so the reference face is still obvious after OK,
+        # not just during the dialog's live preview (entry.py handles that part
+        # with a transient CustomGraphics overlay). Only on the real, fully
+        # constrained build -- not every preview tick -- and only if the user
+        # hasn't unchecked "Highlight Reference Face".
+        highlightInp = inputs.itemById('highlight_ref_face')
+        highlight_enabled = highlightInp is None or highlightInp.value
+        if constrain and highlight_enabled and ref_face is not None:
+            try:
+                appearance = futil.get_or_create_appearance(
+                    design, REF_FACE_APPEARANCE_NAME, REF_FACE_COLOR)
+                ref_face.appearance = appearance
+            except Exception:
+                futil.log('PartsGen: failed to color shaft reference face')
+
+        return ref_face
     except Exception:
         try:
             workingOcc.deleteMe()
