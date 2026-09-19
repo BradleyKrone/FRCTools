@@ -101,7 +101,7 @@ ATTR_CUSTOM_NAME = 'custom_name'
 # matches entry.py's transient preview highlight so the color doesn't change when the
 # dialog closes and this permanent appearance takes over.
 REF_FACE_APPEARANCE_NAME = 'FRCTools_PartsGen_RefFace'
-REF_FACE_COLOR           = (230, 30, 180)
+REF_FACE_COLOR           = (120, 190, 255)  # light blue
 
 
 # ===========================================================================

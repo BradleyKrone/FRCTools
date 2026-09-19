@@ -33,7 +33,7 @@ _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui
 # ---------------------------------------------------------------------------
 _ref_face_highlight_group = None
 
-_REF_FACE_COLOR   = (230, 30, 180)   # magenta -- distinct from Fusion's blue selection
+_REF_FACE_COLOR   = (120, 190, 255)  # light blue
 _REF_FACE_OPACITY = 0.9
 _DEPTH_REF_FACE   = 10
 

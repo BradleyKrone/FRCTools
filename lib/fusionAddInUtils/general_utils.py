@@ -183,13 +183,22 @@ def get_or_create_appearance(design: adsk.fusion.Design, name: str, rgb) -> adsk
     tuple) -- reusing it if a previous call already created it in this design, or copying
     a base appearance out of the Fusion Appearance Library the first time it's needed.
 
+    An existing appearance found by name has its color re-synced to `rgb` on every call
+    (not just set once at creation), so a code change to the target color takes effect on
+    documents that already created it under the old color, and every part sharing the
+    named appearance stays in sync rather than only new ones.
+
     Used to mark a specific face with a persistent color override (e.g. PartsGen's
     reference-face indicator) -- unlike a CustomGraphics overlay, this is a real design
     property that's saved with the file and survives after the command that created it
     closes.
     """
+    r, g, b = rgb
     existing = design.appearances.itemByName(name)
     if existing:
+        color_prop = existing.appearanceProperties.itemByName('Color')
+        if color_prop:
+            color_prop.value = adsk.core.Color.create(r, g, b, 255)
         return existing
 
     lib = app.materialLibraries.itemByName('Fusion Appearance Library')
@@ -200,7 +209,6 @@ def get_or_create_appearance(design: adsk.fusion.Design, name: str, rgb) -> adsk
         raise RuntimeError('Fusion Appearance Library unavailable -- cannot create appearance')
 
     appearance = design.appearances.addByCopy(src, name)
-    r, g, b = rgb
     color_prop = appearance.appearanceProperties.itemByName('Color')
     if color_prop:
         color_prop.value = adsk.core.Color.create(r, g, b, 255)
