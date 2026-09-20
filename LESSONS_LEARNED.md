@@ -23,6 +23,213 @@ session.
 
 ## Lessons
 
+### A picked entity 2+ occurrence levels deep makes `JointGeometry`'s axis wrong -- but `isFlipped` still comes out right, so add `angle=pi` to the candidate sweep instead of trying to fix the axis
+Live-debugged a real user report: Shaft's "Create Joint at Reference Face" against a bearing bore
+picked through `Hood_Group:1+Bearing ... :13` (two occurrence levels deep) failed every single
+time, not intermittently -- the existing 6-candidate `isFlipped`/`angle` sweep (see the three joint
+entries below) always exhausted itself. Root cause, confirmed live via the Fusion MCP server against
+the user's real open document: `JointGeometry.primaryAxisVector`/`secondaryAxisVector` return the
+entity's **local, component-native axis**, not the properly world-composed one, once the entity sits
+2+ occurrence levels deep -- confirmed by reproducing the exact "wrong" reported value as
+`(native edge normal) transformed by only the entity's OWN occurrence, ignoring its parent's`. This
+reproduced identically for `createByCurve` on the edge and `createByNonPlanarFace` on the edge's own
+cylindrical face, so it's the axis computation itself, not one particular constructor. Meanwhile
+`.origin`, and raw B-Rep reads (`BRepEdge.geometry.normal`, `Cylinder.axis`,
+`Plane.cast(face.geometry).normal`) all correctly compose through the *full* proxy chain and agree
+with physical reality -- only `JointGeometry`'s own computed frame is wrong. **Counterintuitive
+finding:** switching `_frame_correction`'s `isFlipped` decision to use the reliable raw normal
+instead did **not** fix it (tried both flip choices with the reliable axis, both landed ~90-180
+degrees off) -- `Joints.add()` demonstrably uses the *same wrong, local* axis internally that
+`primaryAxisVector` reports, not the true world one, so no external isFlipped choice computed from
+correct data can compensate. What *did* work, confirmed live down to `rot_err ~ 1e-32`: keep
+`_frame_correction`'s existing (buggy-but-internally-consistent) `isFlipped` computation exactly as
+it was, and just make sure `angle = pi` is always one of the tried candidates, in addition to
+whatever `angle` `_frame_correction` guesses from the (equally unreliable)
+`secondaryAxisVector`-based math. Once `isFlipped` correctly forces the two Z axes onto the same
+line (which it still does, since the bug is self-consistent), whatever residual clocking is left
+turned out to be a *clean half-turn* about that shared axis in this case, not a continuous
+angle -- `{0, pi}` covers it regardless of what the unreliable computed `angle` said. **Caveat also
+observed live:** even the winning candidate left a small (~0.5 cm) translation residual, most likely
+unrelated pre-existing drift between this shaft's `ref_plane` (parametric, built once through
+`setByOffsetThroughPoint`) and the bearing's *current* position in a 40-joint assembly that's kept
+evolving since -- the existing code already tolerates this (it only pops the "left unjointed" error
+when the *rotation* can't be resolved, and logs+ships a rotation-correct joint with any leftover
+translation), so it wasn't chased further here.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint` candidate list)
+
+### The shaft-joint 180-degree flip, actually solved: read both `JointGeometry` frames *before* `Joints.add()` and compute `isFlipped`
+The two entries below chased this by trial and error and never got it. Real cause: a hole has a rim
+edge at each end, with **opposite circle normals** (confirmed live -- the same hole offers
+Z=(0,-1,0) and Z=(0,1,0)), so which rim the user clicked decided whether the solver flipped the
+shaft. **Fix:** a `JointGeometry` publishes its computed frame before any joint exists --
+`primaryAxisVector` is its Z, `secondaryAxisVector` its X, both world-space -- so set
+`isFlipped = z1.dotProduct(z2) < 0.0` outright instead of probing. Verified live across all four
+rims of one hole x Rigid/Revolute: 8/8 left the occurrence at exactly `rot_err=0, trans_err=0`,
+with `isFlipped` False for the matching rim and True for the opposed one.
+`commands/PartsGen/shaft_gen.py` (`_frame_correction`, `_create_reference_joint`)
+
+### `Matrix3D.isEqualTo` is an exact float compare -- it rejects a *correctly* corrected joint
+This was what actually shipped the wrong shaft. The no-op case (`isFlipped=False`, nothing to
+solve) is bit-exact and passes; the corrected case makes Fusion compute a rotation, which leaves
+~1e-16 of dust, so `occ.transform.isEqualTo(Matrix3D.create())` says "still wrong" and the retry
+loop falls through to its worst candidate. **Fix:** compare with tolerances, and score the 9
+rotation elements separately from the translation length -- different units, and orientation is
+what matters (a flip reads as `rot_err == 2.0`). Rank probes by `(rot_err, trans_err)` and keep the
+*best*, never the last.
+`commands/PartsGen/shaft_gen.py` (`_identity_deviation`)
+
+### `JointInput.angle` rotates about the joint's *primary* axis, so it can never undo a direction reversal
+`angle` spins about the joint's Z -- for a shaft joint that is the shaft's own axis -- so a
+half-turn only re-clocks the flats. Sweeping `isFlipped x angle in {0, pi}` therefore has just two
+distinct orientations, two wasted probes, and a fallback (`isFlipped=True, angle=pi`) that composes
+the residual flip with a half-turn into a *different* 180-degree error. Only `isFlipped` changes
+which way the part points; use `angle` solely to align the secondary axes.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### Persist a dialog's entity picks with `entityToken` + `Design.findEntityByToken`, and re-select them from `activate`, not `commandCreated`
+PartsGen's right-click Edit used to drop Between-Two-Faces entirely (rebuilding the shaft at the
+world origin and silently losing its joint) because the picks weren't stored. **Fix:** save
+`entity.entityToken` as a component attribute; `findEntityByToken` returns a list and **preserves
+the assembly context**, so a token taken from a selection proxy comes back as that same proxy
+(verified live for both a `BRepEdge` and a `BRepFace`). Unlike `Component.entityToken`, BRep tokens
+are reliable for this. `SelectionCommandInput.addSelection()` does nothing while inputs are still
+being built, so re-select in a `command.activate` handler and stash the resolved entities in a
+module global. Guard `entityToken` itself in try/except -- it throws on transient entities.
+`commands/PartsGen/entry.py` (`_resolve_entity_token`, `edit_command_activate`)
+
+### A shaft's stored length was the distance to Face 2's bounding-box *centre*, not its plane
+`ATTR_LEN_EXPR` used the straight-line distance from the Reference Point to `_bbox_center(face2)`,
+which overstates the shaft whenever Face 2 is wider than the shaft and the pick is off-centre --
+so the Custom-Length fallback on Edit rebuilt it too long. **Fix:** project onto Face 2's plane:
+`abs((p - plane.origin) . plane.normal)`. Verified live: 7 in for a 7 in span.
+`commands/PartsGen/shaft_gen.py` (`_create_shaft` attribute block)
+
+### SUPERSEDED (see the top three joint entries) -- The reference-face-joint 180-degree flip has (at least) two independent causes, not one -- `isFlipped` alone didn't cover both
+*The four-combination sweep this prescribes was the bug, not the fix: it kept its worst candidate
+because `isEqualTo` rejected the good one. Kept for the live evidence it records.*
+The `isFlipped`-retry fix (previous entry) resolved the flip for a simple test box with a
+directly-sketched hole, but a real user's tube -- whose hole came from
+`rectangularPatternFeatures` (see `tube_gen.py` `_add_face_holes`), not a plain sketched circle --
+still came out 180 degrees wrong (confirmed live: measuring the occurrence transform's rotation
+angle via its trace gave exactly 180.0 degrees, about an axis unrelated to the one `isFlipped`
+alone corrected in the simpler case). **Fix:** don't rely on a single boolean toggle. Try every
+combination of `JointInput.isFlipped` (False/True) *and* an explicit `JointInput.angle` half-turn
+(0/pi radians) -- four attempts total -- deleting each failed one before the next, keeping
+whichever leaves the occurrence at identity. If somehow none of the four work, log a warning
+(`futil.log`) instead of silently shipping a wrong orientation with no signal. Never assume a
+single geometry-based reproduction proves a fix generalizes to how the same-looking geometry was
+actually built (sketched vs. patterned vs. otherwise) -- confirmed live these behave differently
+here even though the resulting circular edge looks identical either way.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### `SelectionCommandInput.selectionCount >= 1` does not guarantee `selection(0)` succeeds
+PartsGen Shaft's `_create_shaft` guarded its Face 2 read with `face2Sel.selectionCount < 1`
+before calling `face2Sel.selection(0).entity`, mirroring the existing "defensive guard" pattern
+for transient preview state -- but it still hit `RuntimeError: 3 : invalid argument index` on
+`selection(0)`, confirmed live via a real user reproduction (a preview tick landed exactly
+mid-click, right as a selection was being made). The count and the indexer can be
+momentarily inconsistent, not just "either the count is 0 or the read succeeds". **Fix:** don't
+trust the count as a precondition for the read; wrap `selection(0).entity` itself in
+`try/except RuntimeError` and treat a failure exactly like "nothing selected yet" (return
+`None`), same as any other transient/incomplete input state `executePreview` can call this
+function with.
+`commands/PartsGen/shaft_gen.py` (`_selected_entity`)
+
+### SUPERSEDED (see the top three joint entries) -- A `Joint` between a `createByPlanarFace` side and a `createByCurve`/`createByPoint` side can silently rotate the whole occurrence 180 degrees -- detect it, don't assume a fixed `isFlipped`
+*Its prescription (probe and retry) is replaced by computing `isFlipped` from the two geometries'
+`primaryAxisVector`s up front. The live observations below still hold.*
+Building the Shaft "Reference Point" joint (`_create_reference_joint`), the resulting shaft
+occurrence sometimes came out **flipped 180 degrees and translated**, even though the joint's own
+recorded origin coordinates matched exactly on both sides -- confirmed live: `occ.transform`
+after `Joints.add()` was `[[-1,0,0,20],[0,-1,0,10],[0,0,1,0]]`, not identity, sending the shaft's
+extrude the wrong direction (backward into the part it started from) even though nothing about
+the extrude/positioning code itself was wrong. Root cause: `JointGeometry.createByPlanarFace`
+(the shaft's own reference face) and `JointGeometry.createByCurve`/`createByPoint` (the other
+part's point/circular edge) each pick their own default in-plane axes with no guarantee they
+agree, and `Joints.add()` reorients the whole occurrence -- not just its position -- to reconcile
+them. This reproduced identically for both Rigid and Revolute joints, so it's not specific to one
+joint type. **Fix:** don't guess a fixed `JointInput.isFlipped` value. Build the joint, check
+whether the occurrence stayed at its as-built identity transform
+(`occ.transform.isEqualTo(Matrix3D.create())`), and if not, `joint.deleteMe()` (confirmed live
+that this cleanly reverts the occurrence back to identity) and rebuild with the opposite
+`isFlipped`. Confirmed live this self-corrects regardless of which way Fusion's default axis
+inference happened to go for a given geometry combination.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### `ConstructionPlaneInput.setByOffsetThroughPoint` builds a shaft's sketch plane from a point instead of a picked face
+Asked to change Shaft's "Reference Face" into a "Reference Point" (so the joint's target didn't
+need a second, separate face pick -- see the point-vs-face-center entry below), the sketch still
+needs an actual plane to be drawn on, not just a point. **Fix:**
+`ConstructionPlaneInput.setByOffsetThroughPoint(face2, point)` creates a plane parallel to the
+existing `face2` (the shaft's other end), offset so it passes exactly through the picked point --
+`point` accepts a `BRepVertex`/`SketchPoint`/`ConstructionPoint` directly (a `Point3D` is only
+valid in direct-edit/non-parametric mode and would fail here), and a circular edge needs
+`ConstructionPointInput.setByCenter(edge)` first to get a usable point entity.
+`ConstructionPlaneInput.setByPlane(plane)` -- the seemingly obvious "point + normal" constructor
+-- explicitly fails in parametric mode per its own doc string, so it was never an option. The
+resulting plane's own `.geometry.normal` (read *after* creating it, not assumed in advance) feeds
+the existing face-to-face extrude-direction sign check unchanged.
+`commands/PartsGen/shaft_gen.py` (`_plane_offset_point`, `_extrude_direction`)
+
+### A SECOND confirmed Fusion crash from `cmdDef.execute()` + `doEvents()` in an MCP script -- this rule was already written down and got ignored anyway
+An earlier entry below ("`fusion_mcp_execute` scripts can't drive a live interactive command
+dialog" / "Driving Fusion's UI via script... can crash the app") already documented this exact
+failure mode. It still got re-tried -- this time trying to probe whether `'CircularEdges'` is a
+valid `SelectionCommandInput.addSelectionFilter` string by opening a throwaway command definition
+via `cmd.execute()` and pumping `adsk.doEvents()` in a loop -- and it crashed Fusion again, this
+time taking an unsaved user document with it. **Fix: there is no live-script way to test command
+dialog behavior, full stop.** Answer "is this filter string valid" from Autodesk's own published
+API docs/forum reference instead of probing live, and if a dialog-only behavior truly can't be
+confirmed statically, say so to the user and have *them* test it interactively -- never call
+`.execute()` on a command definition, or `doEvents()` in a loop, from any MCP script, for any
+reason, even a read-only-seeming probe. This class of mistake is worth over-indexing on: the cost
+of guessing wrong is an app crash and potential data loss in whatever document is open.
+`commands/PartsGen/entry.py`
+
+### A generator module can be live-tested via MCP even when the add-in isn't running at all
+Verifying the new Shaft "Create Joint at Reference Face" option (`shaft_gen.py`) needed a real
+Fusion session, but FRCTools wasn't loaded in it (no add-in to reuse via the usual
+`sys.modules` suffix-lookup + `importlib.reload` trick). **Fix:** in one `fusion_mcp_execute`
+script, hand-build a minimal fake package tree (`types.ModuleType` for each package level,
+registered in `sys.modules` *and* set as an attribute of its parent so `from X import Y`
+resolves either way) mirroring the real `commands.PartsGen.shaft_gen` -> `...lib import
+fusionAddInUtils` relative-import chain, then `importlib.util.spec_from_file_location` +
+`exec_module` the real files into it. This loads the *actual* `futil` and generator code with
+zero add-in state touched. Combine with a duck-typed `CommandInputs` stub (`itemById` ->
+small stub objects exposing just `.value`/`.expression`/`.selectedItem.name`/`.selection(i)
+.entity`/`.selectionCount`) to call `_create_shaft(stub_inputs, constrain=True)` directly and
+assert on real created geometry/joints — then `occ.deleteMe()` everything created, all inside
+the same script call (a separate call starts a fresh Python process with nothing carried over).
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### Shaft reference-face joint: an explicit point beats a face's "center" keypoint for the far side
+Live user testing of the first version (both sides built from `JointGeometry.createByPlanarFace(...,
+CenterKeyPoint)`) confirmed the caveat noted in the entry below is a real problem, not just a
+theoretical one -- the other part's face is rarely a clean symmetric rectangle/circle in a real
+design, so its area-centroid "center" keypoint doesn't reliably land where the part was actually
+built. **Fix:** keep `CenterKeyPoint` for the shaft's own reference face (it's always a symmetric
+profile the code just drew, so its centroid is exactly where it should be), but require the user to
+explicitly select a **point** (`BRepVertex`/`SketchPoint`/`ConstructionPoint`, via a `SelectionCommandInput`
+filtered to `Vertices`/`SketchPoints`/`ConstructionPoints`) for the other part's side, and build that
+side with `JointGeometry.createByPoint(point)` instead of a face. Also renamed the "Face 1" dialog
+label to "Reference Face" since that's what it actually is/positions the shaft from.
+`commands/PartsGen/entry.py` (`joint_point_selection`), `commands/PartsGen/shaft_gen.py`
+(`_create_reference_joint`)
+
+### `JointGeometry.createByPlanarFace`'s middle argument is a required `BRepEdge`, not optional in signature but `None` is valid for `CenterKeyPoint`
+The 3-arg signature is `(face, edge, keyPointType)` -- `edge` is only used to place the keypoint
+along an *edge* (Start/Middle/EndKeyPoint); for `CenterKeyPoint` on the whole face it must be
+passed as `None`, not omitted (the call is not overloaded to 2 args). Confirmed live: with
+`None`, the returned geometry's `.origin` lands exactly at the face's bounding-box center for a
+symmetric rectangular face -- matching the point the shaft was actually positioned at
+(`_bbox_center(face1)`), so a joint built this way does not move either side. This alignment is
+only guaranteed for a face whose area centroid coincides with its bbox center (rectangles,
+circles); an irregular `face1` could in principle land its `CenterKeyPoint` somewhere slightly
+off from where the shaft was actually built, since `_create_shaft` positions the shaft at
+`_bbox_center(face1)` while `CenterKeyPoint` uses the face's true area centroid -- not yet hit in
+practice, but worth knowing if a joint ever appears to snap a picked face1 slightly out of place.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
 ### A persistent per-face color needs `BRepFace.appearance`, and it's safe to write from `command_execute` — just not from preview/inputChanged
 PartsGen's reference-face indicator needed to survive after OK is clicked, not just during the
 live preview. A `CustomGraphicsGroup` overlay (the right tool for the *live* preview highlight,

@@ -25,6 +25,10 @@ local_handlers         = []
 edit_local_handlers   = []
 ui_handlers            = []
 _edit_target_occ       = None   # occurrence being edited; set in ui_command_starting
+_edit_ref_entities     = None   # (ref_point, face2) recovered from the edited shaft's stored
+                                # entity tokens, re-selected in edit_command_activate --
+                                # SelectionCommandInput.addSelection() doesn't stick when it is
+                                # called from commandCreated.
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
 
 # ---------------------------------------------------------------------------
@@ -98,6 +102,13 @@ LEN_FACES  = 'Between Two Faces'
 LEN_CUSTOM = 'Custom Length'
 
 # ---------------------------------------------------------------------------
+# Shaft reference-face joint options -- only meaningful in LEN_FACES mode,
+# since that's the only mode where the reference face touches another part.
+# ---------------------------------------------------------------------------
+JOINT_REVOLUTE = 'Revolute (Spins Freely)'
+JOINT_RIGID    = 'Rigid (Fixed)'
+
+# ---------------------------------------------------------------------------
 # Edit command  (shown only via the right-click marking menu)
 # ---------------------------------------------------------------------------
 EDIT_CMD_ID          = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenEdit'
@@ -140,6 +151,14 @@ ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
 ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
 
 ATTR_CUSTOM_NAME          = 'custom_name'
+
+ATTR_CREATE_JOINT = 'shaft_create_joint'
+ATTR_JOINT_TYPE   = 'shaft_joint_type'
+
+# Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
+# where it was instead of dropping back to a Custom Length at the world origin.
+ATTR_REF_POINT_TOKEN = 'shaft_ref_point_token'
+ATTR_FACE2_TOKEN     = 'shaft_face2_token'
 
 
 # ===========================================================================
@@ -289,12 +308,32 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     lenTypeInp.listItems.add(LEN_FACES, False, '')
     lenTypeInp.listItems.add(LEN_CUSTOM, True, '')
 
+    # Face 1 -- used only by Tube now. Shaft uses Reference Point instead (below): a
+    # face's own "center" is its area centroid, which is wrong for any face that isn't
+    # fully symmetric (e.g. a plate face with other holes in it), so Shaft needs an
+    # explicit point or circular edge to build from, not a face-center guess.
     face1Sel = inputs.addSelectionInput(
-        'face1_selection', 'Face 1', 'Select the starting planar face'
+        'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
     face1Sel.setSelectionLimits(0, 1)
     face1Sel.isVisible = False
+
+    # Reference Point -- Shaft only. Defines both where the shaft is built from AND
+    # (when "Create Joint" is checked) the joint's target on the other part -- one
+    # selection serves both roles, like Fusion's own Joint picker. A circular edge (a
+    # real hole's boundary) is usually what's actually available to click on a real
+    # part -- a construction/sketch point rarely already exists there.
+    refPointSel = inputs.addSelectionInput(
+        'ref_point_selection', 'Reference Point',
+        'Select a point, or a circular edge (its center is used), that the shaft is built from'
+    )
+    refPointSel.addSelectionFilter('Vertices')
+    refPointSel.addSelectionFilter('SketchPoints')
+    refPointSel.addSelectionFilter('ConstructionPoints')
+    refPointSel.addSelectionFilter('CircularEdges')
+    refPointSel.setSelectionLimits(0, 1)
+    refPointSel.isVisible = False
 
     face2Sel = inputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
@@ -311,6 +350,17 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     highlightRefFaceInp = inputs.addBoolValueInput(
         'highlight_ref_face', 'Highlight Reference Face', True, '', True)
     customLenInp.isVisible = True
+
+    createJointInp = inputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', False)
+    createJointInp.isVisible = False
+
+    jointTypeInp = inputs.addDropDownCommandInput(
+        'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    jointTypeInp.listItems.add(JOINT_REVOLUTE, True, '')
+    jointTypeInp.listItems.add(JOINT_RIGID, False, '')
+    jointTypeInp.isVisible = False
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = inputs.addDropDownCommandInput(
@@ -448,6 +498,9 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     face2Sel:       adsk.core.SelectionCommandInput  = inputs.itemById('face2_selection')
     customLenInp:   adsk.core.ValueCommandInput      = inputs.itemById('custom_length')
     highlightRefFaceInp: adsk.core.BoolValueCommandInput = inputs.itemById('highlight_ref_face')
+    createJointInp: adsk.core.BoolValueCommandInput  = inputs.itemById('create_joint')
+    jointTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('joint_type')
+    refPointSel:    adsk.core.SelectionCommandInput  = inputs.itemById('ref_point_selection')
     beltTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('belt_type')
     toothCountInp:  adsk.core.ValueCommandInput      = inputs.itemById('tooth_count')
     beltWidthInp:   adsk.core.ValueCommandInput      = inputs.itemById('belt_width')
@@ -540,20 +593,40 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         chainSprocketTeethInp.isVisible = (
             part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
 
-    # Length inputs — hidden when Pulley or Belt is selected
+    # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
+    # only for Tube; Shaft uses Reference Point instead (a point/circular-edge pick --
+    # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
-    face1Sel.isVisible     = not hide_length and is_between_faces
+    face1Sel.isVisible     = not hide_length and is_between_faces and part_is_tube
+    if refPointSel is not None:
+        refPointSel.isVisible = not hide_length and is_between_faces and part_is_shaft
     face2Sel.isVisible     = not hide_length and is_between_faces
     customLenInp.isVisible = not hide_length and not is_between_faces
     if highlightRefFaceInp is not None:
         highlightRefFaceInp.isVisible = not hide_length
 
+    # Reference-face joint -- only meaningful for a Shaft built in Between-Two-Faces
+    # mode, since that's the only mode where Reference Point touches another part.
+    # It reuses Reference Point directly as the joint's target -- no separate pick.
+    show_joint = part_is_shaft and is_between_faces
+    if createJointInp is not None:
+        createJointInp.isVisible = show_joint
+    if jointTypeInp is not None:
+        jointTypeInp.isVisible = show_joint and createJointInp is not None and createJointInp.value
+
     # Sync selection limits with visibility
-    if not hide_length and is_between_faces:
+    if not hide_length and is_between_faces and part_is_tube:
         face1Sel.setSelectionLimits(1, 1)
-        face2Sel.setSelectionLimits(1, 1)
     else:
         face1Sel.setSelectionLimits(0, 1)
+    if refPointSel is not None:
+        if not hide_length and is_between_faces and part_is_shaft:
+            refPointSel.setSelectionLimits(1, 1)
+        else:
+            refPointSel.setSelectionLimits(0, 1)
+    if not hide_length and is_between_faces:
+        face2Sel.setSelectionLimits(1, 1)
+    else:
         face2Sel.setSelectionLimits(0, 1)
 
     if part_is_belt and tbCirclesInp is not None:
@@ -582,12 +655,18 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         elif is_custom_shaft:
             customOD.value = 0.75 * IN_TO_CM
 
-    # Auto-focus Face 1 when switching to Between Two Faces mode
+    # Auto-focus Face 1 (Tube) / Reference Point (Shaft) when switching to Between Two Faces
     if args.input.id == 'length_type' and is_between_faces:
-        face1Sel.hasFocus = True
+        if part_is_shaft and refPointSel is not None:
+            refPointSel.hasFocus = True
+        elif part_is_tube:
+            face1Sel.hasFocus = True
 
-    # Auto-advance to Face 2 once Face 1 is filled
+    # Auto-advance to Face 2 once Face 1 / Reference Point is filled
     if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
+        face2Sel.hasFocus = True
+    if (args.input.id == 'ref_point_selection' and refPointSel is not None
+            and refPointSel.selectionCount >= 1):
         face2Sel.hasFocus = True
 
     # CCLine detection for Timing Belt circles
@@ -689,6 +768,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     lenTypeInp:     adsk.core.DropDownCommandInput  = inputs.itemById('length_type')
     face1Sel:       adsk.core.SelectionCommandInput = inputs.itemById('face1_selection')
     face2Sel:       adsk.core.SelectionCommandInput = inputs.itemById('face2_selection')
+    refPointSel:    adsk.core.SelectionCommandInput = inputs.itemById('ref_point_selection')
     customLenInp:   adsk.core.ValueCommandInput     = inputs.itemById('custom_length')
 
     part_type = partTypeInp.selectedItem.name
@@ -747,11 +827,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
     len_type  = lenTypeInp.selectedItem.name
 
-    # Length validation (shared by Shaft and Tube)
+    # Length validation -- Shaft uses Reference Point, Tube uses Face 1
     if len_type == LEN_FACES:
-        if face1Sel.selectionCount < 1 or face2Sel.selectionCount < 1:
-            args.areInputsValid = False
-            return
+        if part_type == PART_SHAFT:
+            if refPointSel is None or refPointSel.selectionCount < 1 or face2Sel.selectionCount < 1:
+                args.areInputsValid = False
+                return
+        else:
+            if face1Sel.selectionCount < 1 or face2Sel.selectionCount < 1:
+                args.areInputsValid = False
+                return
     else:
         if customLenInp.value <= 0:
             args.areInputsValid = False
@@ -771,6 +856,8 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             if od <= 0 or od <= bore_round_dia_cm:
                 args.areInputsValid = False
                 return
+        # No separate joint-point check needed -- Reference Point is already required
+        # above whenever len_type == LEN_FACES, and it doubles as the joint's target.
     else:
         w = tubeWidthInp.value
         h = tubeHeightInp.value
@@ -1100,8 +1187,30 @@ def ui_marking_menu(args: adsk.core.MarkingMenuEventArgs):
 # Edit command — created (dialog pre-populated from stored attributes)
 # ===========================================================================
 
+def _resolve_entity_token(token: str, label: str):
+    """Resolve a stored entity token back to the entity it came from, or None.
+
+    `Design.findEntityByToken` returns a (possibly empty) list and preserves the entity's
+    assembly context, so a token taken from a proxy comes back as that same proxy --
+    verified live. Unlike `Component.entityToken`, which collides across unrelated
+    components, BRep and sketch entity tokens are reliable for this.
+    """
+    if not token:
+        return None
+    try:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        found  = design.findEntityByToken(token)
+        if found and len(found) > 0:
+            return found[0]
+    except Exception:
+        pass
+    futil.log(f'{CMD_NAME} edit: stored {label} could not be resolved; '
+              'falling back to Custom Length')
+    return None
+
+
 def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
-    global _edit_target_occ
+    global _edit_target_occ, _edit_ref_entities
 
     inputs = args.command.commandInputs
 
@@ -1120,7 +1229,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
                     ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
-                    ATTR_CUSTOM_NAME):
+                    ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE,
+                    ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -1176,6 +1286,16 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     chain_gen_spr_val    = _b(ATTR_CHAIN_GEN_SPROCKETS,  True)
     chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
     custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
+    create_joint_val     = _b(ATTR_CREATE_JOINT, False)
+    joint_type_val       = _s(ATTR_JOINT_TYPE,  JOINT_REVOLUTE)
+
+    # Recover the original Between-Two-Faces picks. When both still resolve the shaft can be
+    # rebuilt exactly where it stands, joint and all; when either is gone (the other part was
+    # deleted, say) fall back to the old behaviour of editing it as a Custom Length.
+    edit_ref_point = _resolve_entity_token(_s(ATTR_REF_POINT_TOKEN, ''), 'Reference Point')
+    edit_face2     = _resolve_entity_token(_s(ATTR_FACE2_TOKEN, ''),     'Face 2')
+    keep_faces     = is_shaft and edit_ref_point is not None and edit_face2 is not None
+    _edit_ref_entities = (edit_ref_point, edit_face2) if keep_faces else None
 
     # --- Part type ---
     partTypeInp = inputs.addDropDownCommandInput(
@@ -1368,40 +1488,71 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
         'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
     chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
 
-    # --- Length — always use Custom Length in edit mode; face refs are gone ---
+    # --- Length ---------------------------------------------------------------
+    # Between-Two-Faces survives an edit whenever both stored picks still resolve, so the
+    # shaft rebuilds where it stands with its joint intact. Otherwise fall back to editing
+    # it as a Custom Length, which rebuilds it at the world origin -- the old behaviour,
+    # and all that is possible once the referenced geometry is gone.
+    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
+
     lenTypeInp = inputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    lenTypeInp.listItems.add(LEN_FACES,  False, '')
-    lenTypeInp.listItems.add(LEN_CUSTOM, True,  '')
-    lenTypeInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    lenTypeInp.listItems.add(LEN_FACES,  keep_faces,      '')
+    lenTypeInp.listItems.add(LEN_CUSTOM, not keep_faces,  '')
+    lenTypeInp.isVisible = has_len
 
     face1Sel = inputs.addSelectionInput(
-        'face1_selection', 'Face 1', 'Select the starting planar face'
+        'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
     face1Sel.setSelectionLimits(0, 1)
     face1Sel.isVisible = False
+
+    refPointSelEdit = inputs.addSelectionInput(
+        'ref_point_selection', 'Reference Point',
+        'Select a point, or a circular edge (its center is used), that the shaft is built from'
+    )
+    refPointSelEdit.addSelectionFilter('Vertices')
+    refPointSelEdit.addSelectionFilter('SketchPoints')
+    refPointSelEdit.addSelectionFilter('ConstructionPoints')
+    refPointSelEdit.addSelectionFilter('CircularEdges')
+    refPointSelEdit.setSelectionLimits(0, 1)
+    refPointSelEdit.isVisible = keep_faces
 
     face2Sel = inputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
     face2Sel.setSelectionLimits(0, 1)
-    face2Sel.isVisible = False
+    face2Sel.isVisible = keep_faces
 
     customLenInp = inputs.addValueInput(
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString(len_expr)
     )
-    customLenInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    customLenInp.isVisible = has_len and not keep_faces
 
     highlightRefFaceInpEdit = inputs.addBoolValueInput(
         'highlight_ref_face', 'Highlight Reference Face', True, '', True)
-    highlightRefFaceInpEdit.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    highlightRefFaceInpEdit.isVisible = has_len
+
+    # Reference-face joint -- only offered in Between-Two-Faces mode, same as the create
+    # dialog, since that's the only mode with a second part to joint against.
+    createJointInpEdit = inputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', create_joint_val)
+    createJointInpEdit.isVisible = keep_faces
+
+    jointTypeInpEdit = inputs.addDropDownCommandInput(
+        'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    jointTypeInpEdit.listItems.add(JOINT_REVOLUTE, joint_type_val != JOINT_RIGID, '')
+    jointTypeInpEdit.listItems.add(JOINT_RIGID, joint_type_val == JOINT_RIGID, '')
+    jointTypeInpEdit.isVisible = keep_faces and create_joint_val
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)
+    futil.add_handler(args.command.activate,       edit_command_activate,  local_handlers=edit_local_handlers)
     futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=edit_local_handlers)
     futil.add_handler(args.command.executePreview, edit_command_preview,   local_handlers=edit_local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=edit_local_handlers)
@@ -1413,7 +1564,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 # ===========================================================================
 
 def edit_command_execute(args: adsk.core.CommandEventArgs):
-    global _edit_target_occ
+    global _edit_target_occ, _edit_ref_entities
 
     if _edit_target_occ:
         try:
@@ -1439,12 +1590,36 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         _create_belt(inputs)
 
 
+def edit_command_activate(args: adsk.core.CommandEventArgs):
+    """Re-select the shaft's original Reference Point and Face 2 in the dialog.
+
+    This has to happen on `activate` rather than in `edit_command_created`:
+    `SelectionCommandInput.addSelection()` silently does nothing when the command's inputs
+    are still being built. If a selection doesn't take, leave the input empty rather than
+    dropping back to Custom Length -- the user can re-pick and still keep the placement.
+    """
+    if not _edit_ref_entities:
+        return
+    ref_point, face2 = _edit_ref_entities
+    inputs      = args.command.commandInputs
+    refPointSel = inputs.itemById('ref_point_selection')
+    face2Sel    = inputs.itemById('face2_selection')
+    try:
+        if refPointSel is not None and ref_point is not None:
+            refPointSel.addSelection(ref_point)
+        if face2Sel is not None and face2 is not None:
+            face2Sel.addSelection(face2)
+    except Exception:
+        futil.log(f'{CMD_NAME} edit: could not re-select the stored reference geometry')
+
+
 def edit_command_preview(args: adsk.core.CommandEventArgs):
     # No live preview for edit mode — the old component stays visible until OK.
     pass
 
 
 def edit_command_destroy(args: adsk.core.CommandEventArgs):
-    global edit_local_handlers, _edit_target_occ
+    global edit_local_handlers, _edit_target_occ, _edit_ref_entities
     edit_local_handlers = []
     _edit_target_occ    = None
+    _edit_ref_entities  = None
