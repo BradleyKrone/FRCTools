@@ -23,6 +23,25 @@ session.
 
 ## Lessons
 
+### `ConstructionPlaneInput.setByOffset`/`setByOffsetThroughPoint` take a ConstructionPlane, not just a BRepFace -- reuse the same fallback-plane helper for a picked point with no face to be parallel to
+Extending PartsGen Shaft's "Create Joint" to Custom Length mode (previously Between-Two-Faces
+only) meant a Reference Point could now be positioned with no Face 2 around to be parallel to.
+The existing fallback helper (for a Reference Point with no usable hole axis) already built its
+plane via `ConstructionPlaneInput.setByOffsetThroughPoint(face2, point)` / `setByOffset(face2,
+dist)` -- confirmed via `apiDocumentation` that `planarEntity` on both methods is typed `Base` and
+documented as "a planar BRepFace, ConstructionPlane, or Plane object", so passing
+`rootComp.xYConstructionPlane` instead of a real face works identically. **Fix:** generalized
+`_offset_plane_parallel_to_face2` to `_offset_plane_parallel_to(workingComp, base_plane, entity,
+world_point)`, reused with `face2` in Between-Two-Faces mode and `rootComp.xYConstructionPlane` in
+Custom Length mode -- no new construction-plane logic needed, just a generic parameter. Live-tested
+via the Fusion MCP server (hand-built fake module tree, see the entry below on that technique):
+Custom Length + a picked hole edge built coaxial with the hole (reusing the existing axis-face
+path, unaffected), Custom Length + a picked flat face built normal to that face directly, and a
+picked point with neither (fell through to this generalized helper) built parallel to world XY --
+all three joined successfully afterward, since the joint only ever needed the Reference Point
+entity, never the sketch plane.
+`commands/PartsGen/shaft_gen.py` (`_offset_plane_parallel_to`, `_create_shaft`)
+
 ### `Joints.add()`'s default `isFlipped=False` does not mean "leave the part where it was built" -- and `BRepFace.geometry.normal` lies about direction even at zero occurrence depth
 A regular Joint's default orientation is not "unflipped relative to how the part was already
 placed" -- it's just whichever of the two valid alignments falls out of each side's own,

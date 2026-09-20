@@ -99,9 +99,11 @@ ATTR_CUSTOM_NAME = 'custom_name'
 ATTR_CREATE_JOINT = 'shaft_create_joint'
 ATTR_JOINT_TYPE   = 'shaft_joint_type'
 ATTR_JOINT_FLIP   = 'shaft_joint_flip'
+ATTR_REVERSE_DIR  = 'shaft_reverse_direction'
 
 # Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
-# where it was instead of dropping back to a Custom Length at the world origin.
+# where it was instead of dropping back to a Custom Length at the world origin. A Custom
+# Length shaft built from a Reference Point (no Face 2) stores only the ref-point token.
 ATTR_REF_POINT_TOKEN = 'shaft_ref_point_token'
 ATTR_FACE2_TOKEN     = 'shaft_face2_token'
 
@@ -437,27 +439,30 @@ def _plane_offset_point(workingComp: adsk.fusion.Component, entity):
     return entity
 
 
-def _offset_plane_parallel_to_face2(workingComp: adsk.fusion.Component,
-                                    face2: adsk.fusion.BRepFace,
-                                    entity, world_point: adsk.core.Point3D):
+def _offset_plane_parallel_to(workingComp: adsk.fusion.Component,
+                              base_plane,
+                              entity, world_point: adsk.core.Point3D):
     """Build the construction plane the fallback shaft placement sketches onto: parallel to
-    Face 2, passing through the Reference Point.
+    `base_plane` (Face 2 in Between-Two-Faces mode, or the root XY plane in Custom Length
+    mode when no hole axis is available), passing through the Reference Point.
 
     Prefers `setByOffsetThroughPoint`, which stays associative to a real parametric point (a
     vertex/sketch/construction point, or a circular edge's centre via a construction point) --
     so the plane keeps following that point if it moves later. A straight/general edge's
     midpoint or a face's centroid has no such parametric point primitive in the Fusion API, so
     those instead get a fixed numeric offset computed from the already-resolved world point:
-    still correct at build time, just not associative.
+    still correct at build time, just not associative. `setByOffset`/`setByOffsetThroughPoint`
+    both accept a planar BRepFace, ConstructionPlane, or Plane for `base_plane` (confirmed via
+    apiDocumentation), so a construction plane works here exactly like Face 2 does.
     """
     plane_input = workingComp.constructionPlanes.createInput()
     plane_point = _plane_offset_point(workingComp, entity)
     if plane_point is not None:
-        plane_input.setByOffsetThroughPoint(face2, plane_point)
+        plane_input.setByOffsetThroughPoint(base_plane, plane_point)
     else:
-        face2_plane = adsk.core.Plane.cast(face2.geometry)
-        offset_dist = face2_plane.origin.vectorTo(world_point).dotProduct(face2_plane.normal)
-        plane_input.setByOffset(face2, adsk.core.ValueInput.createByReal(offset_dist))
+        base_geom_plane = adsk.core.Plane.cast(base_plane.geometry)
+        offset_dist = base_geom_plane.origin.vectorTo(world_point).dotProduct(base_geom_plane.normal)
+        plane_input.setByOffset(base_plane, adsk.core.ValueInput.createByReal(offset_dist))
     return workingComp.constructionPlanes.add(plane_input)
 
 
@@ -674,6 +679,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
     customLenInp:   adsk.core.ValueCommandInput     = inputs.itemById('custom_length')
     createJointInp: adsk.core.BoolValueCommandInput = inputs.itemById('create_joint')
     flipJointInp:   adsk.core.BoolValueCommandInput = inputs.itemById('flip_joint')
+    reverseDirInp:  adsk.core.BoolValueCommandInput = inputs.itemById('reverse_direction')
 
     shaft_type = shaftTypeInp.selectedItem.name
     len_type   = lenTypeInp.selectedItem.name
@@ -749,7 +755,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                 # general edge or face, or a rim with no perpendicular planar neighbour. Fall
                 # back to the original behaviour: a plane through the Reference Point, parallel
                 # to Face 2.
-                sketch_plane = _offset_plane_parallel_to_face2(
+                sketch_plane = _offset_plane_parallel_to(
                     workingComp, face2, ref_point_entity, centroid1)
                 futil.log('PartsGen: no hole axis available; shaft built parallel to Face 2')
 
@@ -757,9 +763,31 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             custom_len_expr = None
         else:
             face2_target    = None
-            centroid1       = adsk.core.Point3D.create(0, 0, 0)
             custom_len_expr = customLenInp.expression
-            sketch_plane    = rootComp.xYConstructionPlane
+            if ref_point_entity is not None:
+                # Custom Length with a Reference Point: same placement logic as
+                # Between-Two-Faces (coaxial with a picked hole when possible, or directly on
+                # a picked flat face), just extruded by a fixed length instead of to Face 2 --
+                # this is what lets a joint be built here too, since the joint targets the
+                # Reference Point either way.
+                centroid1 = _point_from_entity(ref_point_entity)
+                ref_axis  = _ref_axis(ref_point_entity)
+                axis_face = _axis_plane_face(ref_point_entity, ref_axis)
+                if axis_face is not None:
+                    sketch_plane = axis_face
+                    futil.log('PartsGen: shaft (custom length) built coaxial with the reference hole')
+                elif (ref_point_entity.objectType == adsk.fusion.BRepFace.classType()
+                        and adsk.core.Plane.cast(ref_point_entity.geometry) is not None):
+                    sketch_plane = ref_point_entity
+                    futil.log('PartsGen: shaft (custom length) built normal to the reference face')
+                else:
+                    sketch_plane = _offset_plane_parallel_to(
+                        workingComp, rootComp.xYConstructionPlane, ref_point_entity, centroid1)
+                    futil.log('PartsGen: no hole axis available; shaft (custom length) '
+                              'built parallel to the world XY plane')
+            else:
+                centroid1    = adsk.core.Point3D.create(0, 0, 0)
+                sketch_plane = rootComp.xYConstructionPlane
 
         sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
         sketch.name = 'ShaftProfile'
@@ -772,7 +800,15 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             sk_normal = sketch.xDirection.crossProduct(sketch.yDirection)
             ext_dir   = _extrude_direction(sk_normal, centroid1, centroid2)
         else:
-            ext_dir   = adsk.fusion.ExtentDirections.PositiveExtentDirection
+            # No Face 2 to derive a direction from -- the sketch plane's own normal picks a
+            # side arbitrarily (whichever way the picked hole/face happens to point), so
+            # "Reverse Direction" is a plain manual override, same spirit as the joint's own
+            # Flip checkbox.
+            ext_dir = (
+                adsk.fusion.ExtentDirections.NegativeExtentDirection
+                if (reverseDirInp is not None and reverseDirInp.value)
+                else adsk.fusion.ExtentDirections.PositiveExtentDirection
+            )
 
         c1_sk  = sketch.modelToSketchSpace(centroid1)
         center = adsk.core.Point3D.create(c1_sk.x, c1_sk.y, 0.0)
@@ -917,6 +953,14 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                               'Edit will fall back to Custom Length')
             else:
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+                comp_attrs.add(ATTR_GROUP, ATTR_REVERSE_DIR,
+                               str(reverseDirInp.value if reverseDirInp is not None else False))
+                if ref_point_entity is not None:
+                    try:
+                        comp_attrs.add(ATTR_GROUP, ATTR_REF_POINT_TOKEN, ref_point_entity.entityToken)
+                    except Exception:
+                        futil.log('PartsGen: could not save shaft reference point token '
+                                  '(custom length); Edit will fall back to world-origin placement')
             if custom_name:
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
             if createJointInp is not None and createJointInp.value:
@@ -950,18 +994,18 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                 futil.log('PartsGen: failed to color shaft reference face')
 
         # Optional joint between the shaft's reference face and the Reference Point on
-        # the other part -- only possible in Between-Two-Faces mode (only mode with a
-        # second part to joint against). Reuses ref_point_entity directly -- the same
-        # entity that positioned the shaft is also the joint's target. Gated on
-        # `constrain` for the same reason as the coloring above: executePreview reruns
-        # this whole function on every tick, and a Joint is a real, undo-tracked design
-        # mutation (unlike the transient preview highlight), so it must only be created
-        # once, on the final command_execute build. Isolated in its own try/except
-        # (mirroring pulley_gen.py's joint block) so a joint failure doesn't take down
-        # an otherwise-successful shaft build.
+        # the other part -- possible whenever a Reference Point was picked, in either
+        # Between-Two-Faces or Custom Length mode (the dialog only allows "Create Joint" to
+        # be checked once a Reference Point is selected -- see command_validate_input).
+        # Reuses ref_point_entity directly -- the same entity that positioned the shaft is
+        # also the joint's target. Gated on `constrain` for the same reason as the coloring
+        # above: executePreview reruns this whole function on every tick, and a Joint is a
+        # real, undo-tracked design mutation (unlike the transient preview highlight), so it
+        # must only be created once, on the final command_execute build. Isolated in its own
+        # try/except (mirroring pulley_gen.py's joint block) so a joint failure doesn't take
+        # down an otherwise-successful shaft build.
         if (constrain and createJointInp is not None and createJointInp.value
-                and len_type == LEN_FACES and ref_face is not None
-                and ref_point_entity is not None):
+                and ref_face is not None and ref_point_entity is not None):
             jointTypeInp = inputs.itemById('joint_type')
             joint_type = jointTypeInp.selectedItem.name if jointTypeInp is not None else JOINT_REVOLUTE
             joint_flip = flipJointInp.value if flipJointInp is not None else False
