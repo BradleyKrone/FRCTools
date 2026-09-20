@@ -305,8 +305,8 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     lenTypeInp = inputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    lenTypeInp.listItems.add(LEN_FACES, False, '')
-    lenTypeInp.listItems.add(LEN_CUSTOM, True, '')
+    lenTypeInp.listItems.add(LEN_FACES, True, '')
+    lenTypeInp.listItems.add(LEN_CUSTOM, False, '')
 
     # Face 1 -- used only by Tube now. Shaft uses Reference Point instead (below): a
     # face's own "center" is its area centroid, which is wrong for any face that isn't
@@ -332,15 +332,15 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     refPointSel.addSelectionFilter('SketchPoints')
     refPointSel.addSelectionFilter('ConstructionPoints')
     refPointSel.addSelectionFilter('CircularEdges')
-    refPointSel.setSelectionLimits(0, 1)
-    refPointSel.isVisible = False
+    refPointSel.setSelectionLimits(1, 1)
+    refPointSel.isVisible = True
 
     face2Sel = inputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
-    face2Sel.setSelectionLimits(0, 1)
-    face2Sel.isVisible = False
+    face2Sel.setSelectionLimits(1, 1)
+    face2Sel.isVisible = True
 
     customLenInp = inputs.addValueInput(
         'custom_length', 'Length', 'in',
@@ -349,18 +349,18 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     highlightRefFaceInp = inputs.addBoolValueInput(
         'highlight_ref_face', 'Highlight Reference Face', True, '', True)
-    customLenInp.isVisible = True
+    customLenInp.isVisible = False
 
     createJointInp = inputs.addBoolValueInput(
-        'create_joint', 'Create Joint at Reference Face', True, '', False)
-    createJointInp.isVisible = False
+        'create_joint', 'Create Joint at Reference Face', True, '', True)
+    createJointInp.isVisible = True
 
     jointTypeInp = inputs.addDropDownCommandInput(
         'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     jointTypeInp.listItems.add(JOINT_REVOLUTE, True, '')
     jointTypeInp.listItems.add(JOINT_RIGID, False, '')
-    jointTypeInp.isVisible = False
+    jointTypeInp.isVisible = True
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = inputs.addDropDownCommandInput(

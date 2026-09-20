@@ -366,6 +366,13 @@ def _extrude_direction(normal: adsk.core.Vector3D,
     dy = centroid2.y - centroid1.y
     dz = centroid2.z - centroid1.z
     dot = dx * normal.x + dy * normal.y + dz * normal.z
+    # Face 2 sitting edge-on to the sketch plane makes the sign a coin flip. That was
+    # impossible while the sketch plane was always parallel to Face 2 (`dot` was then just
+    # the gap between them), but a shaft built on the hole's axis can tilt far enough to
+    # reach it. Keep the positive direction, but say so rather than failing silently.
+    if abs(dot) < 1e-7:
+        futil.log('PartsGen: Face 2 is nearly edge-on to the shaft; '
+                  'extrude direction is ambiguous, using positive')
     return (
         adsk.fusion.ExtentDirections.PositiveExtentDirection
         if dot >= 0
@@ -412,6 +419,62 @@ def _plane_offset_point(workingComp: adsk.fusion.Component, entity):
     return entity
 
 
+def _ref_axis(entity):
+    """Return the unit world-space axis a Reference Point entity implies, or None.
+
+    A circular edge carries its hole's axis in its own circle normal. Raw B-Rep reads like
+    this compose correctly through the *full* proxy chain, unlike `JointGeometry`'s computed
+    frame, which reports an entity's local component-native axis once it sits 2+ occurrence
+    levels deep (see LESSONS_LEARNED.md). A plain vertex/sketch point/construction point
+    carries no axis at all, hence None.
+    """
+    if entity.objectType != adsk.fusion.BRepEdge.classType():
+        return None
+    geom = entity.geometry
+    # The dialog's CircularEdges filter admits arcs as well as full circles.
+    for curve_cls in (adsk.core.Circle3D, adsk.core.Arc3D, adsk.core.Ellipse3D):
+        curve = curve_cls.cast(geom)
+        if curve is not None:
+            return curve.normal
+    return None
+
+
+def _axis_plane_face(entity, axis: adsk.core.Vector3D):
+    """Return the planar face the circular edge bounds whose plane is perpendicular to
+    `axis` -- the plate or bearing face the hole is drilled through -- or None.
+
+    That face is what makes a coaxial shaft possible at all: `ConstructionPlaneInput` has no
+    parametric "plane through a point normal to an axis" constructor (`setByPlane` is
+    direct-modeling only, see LESSONS_LEARNED.md), so the hole's own face stands in for one.
+    """
+    if axis is None:
+        return None
+    for face in entity.faces:
+        plane = adsk.core.Plane.cast(face.geometry)
+        # Both vectors are unit, so |dot| ~ 1 means parallel. The test doubles as a reject
+        # for the slanted neighbour of a chamfered or filleted rim.
+        if plane is not None and abs(plane.normal.dotProduct(axis)) > 1 - 1e-6:
+            return face
+    return None
+
+
+def _joint_occurrence_chain(entity):
+    """Return `[leaf occurrence, ..., top-level child of root]` for a picked entity.
+
+    An as-built joint names two Occurrences, and the pick is usually a proxy several levels
+    deep (`Shooter_Base:1+Side_Plate:1`). The leaf is what the shaft should actually joint
+    to -- jointing to the top-level group instead would leave the shaft behind whenever a
+    sub-assembly pivots -- but the rest of the chain is kept as a fallback. An entity native
+    to the root component belongs to no occurrence and yields an empty list.
+    """
+    chain = []
+    occ = getattr(entity, 'assemblyContext', None)
+    while occ is not None:
+        chain.append(occ)
+        occ = occ.assemblyContext
+    return chain
+
+
 def _extrude_one_side(comp: adsk.fusion.Component,
                       profile: adsk.fusion.Profile,
                       operation: adsk.fusion.FeatureOperations,
@@ -431,171 +494,83 @@ def _extrude_one_side(comp: adsk.fusion.Component,
     return extrudes.add(extInput)
 
 
-# How far the shaft's occurrence transform may drift from the identity it was built at
-# before the joint counts as having moved it. `Matrix3D.isEqualTo` is an exact
-# element-by-element compare with no tolerance at all, so it rejects a *correctly*
-# corrected joint over the ~1e-16 of floating-point dust Fusion's solver leaves behind
-# whenever it actually has to compute a rotation -- confirmed live as the direct cause of
-# a wrongly-flipped shaft shipping to the user. A real flip reads as a rotation error of
-# 2.0, so there is an enormous margin between "solver noise" and "pointing backwards".
-_IDENTITY_ROT_TOL   = 1e-6   # unitless, per rotation-matrix element
-_IDENTITY_TRANS_TOL = 1e-6   # cm
-
-
-def _identity_deviation(m: adsk.core.Matrix3D):
-    """Return `(rot_err, trans_err_cm)` -- how far `m` is from the identity.
-
-    `Matrix3D.asArray()` is 16 row-major floats; indices 3/7/11 are the translation column
-    and the other nine are the rotation block. The two errors stay separate rather than
-    being summed because they carry different units, and because orientation is what
-    actually matters here: a 180-degree rotation points the shaft the wrong way, while a
-    tiny translation only nudges it.
-    """
-    a     = m.asArray()
-    rot   = (a[0], a[1], a[2], a[4], a[5], a[6], a[8], a[9], a[10])
-    ident = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    return (max(abs(r - i) for r, i in zip(rot, ident)),
-            math.sqrt(a[3] ** 2 + a[7] ** 2 + a[11] ** 2))
-
-
-def _frame_correction(shaft_geom: adsk.fusion.JointGeometry,
-                      other_geom: adsk.fusion.JointGeometry):
-    """Return the `(isFlipped, angle_rad)` that makes the two joint geometries' coordinate
-    systems already agree, so `Joints.add()` has no reorienting left to do.
-
-    A `JointGeometry` publishes its computed frame *before* the joint exists --
-    `primaryAxisVector` is its Z, `secondaryAxisVector` its X, both in world space -- so
-    the flip can be computed outright instead of hunted for by trial and error. That
-    matters because from the user's side the ambiguity is a coin flip: a hole through a
-    tube wall has two coincident circular edges, one per wall face, whose circle normals
-    point opposite ways (confirmed live -- the same hole offers Z=(0,-1,0) and Z=(0,1,0)).
-    Whichever one the mouse landed on decided whether the shaft came out backwards.
-    """
-    z1 = shaft_geom.primaryAxisVector
-    z2 = other_geom.primaryAxisVector
-    is_flipped = z1.dotProduct(z2) < 0.0
-
-    # Whatever is left once the flip is accounted for is an in-plane rotation about the
-    # shaft's own axis -- invisible on a round shaft, visible as re-clocked flats on a hex
-    # one. The sign convention isn't documented, so the caller probes both signs.
-    angle_rad = 0.0
-    try:
-        x1        = shaft_geom.secondaryAxisVector
-        x2        = other_geom.secondaryAxisVector
-        angle_rad = x1.angleTo(x2)
-        cross     = x1.crossProduct(x2)
-        if cross.dotProduct(z2) < 0.0:
-            angle_rad = -angle_rad
-    except Exception:
-        futil.log('PartsGen: could not read joint secondary axes, using angle 0')
-    return is_flipped, angle_rad
-
-
 def _create_reference_joint(workingOcc: adsk.fusion.Occurrence,
                             ref_face: adsk.fusion.BRepFace,
                             other_entity,
                             joint_type: str):
-    """Joint between the shaft's reference face (its own centre) and an explicit point or
-    circular edge on the other part -- either a BRepVertex/SketchPoint/ConstructionPoint, or
-    a circular BRepEdge (a real hole's boundary, whose centre is used). A face's own "center"
-    keypoint is its area centroid, which is wrong for any face that isn't fully symmetric (e.g.
-    a plate face with other holes cut into it), and a real part rarely already has a
-    construction/sketch point sitting exactly at its hole's centre -- but the hole's edge is
-    right there to click.
+    """As-built joint between the shaft and the part its Reference Point belongs to.
 
-    The shaft is already exactly where it belongs before this runs: its occurrence is created
-    with an identity transform and every sketch/extrude is built in world coordinates, so a
-    correct joint is one that leaves that transform alone. `_frame_correction` computes the
-    `isFlipped`/`angle` that achieve that up front; the probe loop below is only a safety net.
+    An **as-built** joint, not a regular one, and that is the whole point. `Joints.add()`
+    always repositions its first occurrence to make the two joint frames coincide, so the
+    only way to keep a shaft that is already exactly where it belongs was to hunt for an
+    `isFlipped`/`angle` pair whose repositioning happened to be a no-op. That hunt is
+    unwinnable whenever the picked entity sits 2+ occurrence levels deep, because Fusion then
+    reads -- and internally uses -- that entity's local component-native axis instead of the
+    world one: confirmed live as a ~48 degree residual on every single candidate. Worse, the
+    probe joints' `deleteMe()` did *not* restore the occurrence transform (also confirmed
+    live, against a shaft left behind by a failed run), so the shaft kept the last probe's
+    180-degree flip -- invisible on a symmetric hex shaft, but real.
 
-    `pulley_gen.py`/`sprocket_gen.py` deliberately keep the plain unchecked joint pattern --
+    `AsBuiltJoints` adds the same revolute/rigid motion without moving either occurrence,
+    which deletes that whole problem rather than tolerating it.
+
+    `pulley_gen.py`/`sprocket_gen.py` deliberately keep the plain `Joints.add()` pattern --
     their joints are driven by a projected sketch circle that has to re-solve as centre
     distance changes -- so don't "fix" them the same way.
     """
     design   = adsk.fusion.Design.cast(app.activeProduct)
     rootComp = design.rootComponent
 
-    shaft_face = ref_face.createForAssemblyContext(workingOcc)
-    shaft_geom = adsk.fusion.JointGeometry.createByPlanarFace(
-        shaft_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
-    if other_entity.objectType == adsk.fusion.BRepEdge.classType():
-        other_geom = adsk.fusion.JointGeometry.createByCurve(
-            other_entity, adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
-    else:
-        other_geom = adsk.fusion.JointGeometry.createByPoint(other_entity)
-
-    def _build(is_flipped: bool, angle_rad: float) -> adsk.fusion.Joint:
-        joint_input = rootComp.joints.createInput(shaft_geom, other_geom)
-        joint_input.isFlipped = is_flipped
-        joint_input.angle     = adsk.core.ValueInput.createByReal(angle_rad)
-        if joint_type == JOINT_RIGID:
-            joint_input.setAsRigidJointMotion()
-        else:
-            joint_input.setAsRevoluteJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection)
-        return rootComp.joints.add(joint_input)
-
-    flip, angle = _frame_correction(shaft_geom, other_geom)
-
-    # The computed pair first, then fallbacks. `angle` can only ever re-clock the shaft --
-    # it rotates about the joint's primary (Z) axis, which *is* the shaft's axis -- so
-    # `isFlipped` is the only thing here that can change which way the shaft points, and the
-    # extra angle entries exist purely to cover an undocumented sign convention.
-    #
-    # `math.pi` is included explicitly, not just derived from `angle`, because of a confirmed-
-    # live Fusion bug: `JointGeometry.primaryAxisVector`/`secondaryAxisVector` report the picked
-    # entity's LOCAL (component-native) axes, not the true world-composed ones, whenever the
-    # entity sits 2+ occurrence levels deep (e.g. a bearing inside a sub-assembly group). When
-    # that happens, `_frame_correction`'s `angle` guess is computed from the same wrong axis and
-    # can land anywhere -- but `Joints.add()` still forces the two Z axes together via `isFlipped`
-    # (which happens to still come out right, since the bug is self-consistent), leaving only a
-    # clean half-turn residual about that shared axis, not a continuous one. `angle in {0, pi}`
-    # covers that regardless of what the (unreliable) computed `angle` said.
-    candidates = []
-    for cand in ((flip, angle), (flip, -angle), (flip, 0.0), (flip, math.pi),
-                 (not flip, angle), (not flip, -angle), (not flip, 0.0), (not flip, math.pi)):
-        if cand not in candidates:
-            candidates.append(cand)
-
-    best_key, best_combo = None, None
-    for is_flipped, angle_rad in candidates:
-        joint = _build(is_flipped, angle_rad)
-        rot_err, trans_err = _identity_deviation(workingOcc.transform)
-        if rot_err <= _IDENTITY_ROT_TOL and trans_err <= _IDENTITY_TRANS_TOL:
-            joint.name = f'{workingOcc.component.name}_joint'
-            return joint
-        # deleteMe() reverts the occurrence to its as-built transform -- confirmed live --
-        # so every probe starts from the same state.
-        joint.deleteMe()
-        key = (round(rot_err, 9), round(trans_err, 9))
-        if best_key is None or key < best_key:
-            best_key, best_combo = key, (is_flipped, angle_rad)
-
-    # Nothing landed cleanly. Orientation dominates the ranking, so if even the best probe
-    # rotated the shaft then a joint is worse than no joint: it would leave a shaft pointing
-    # the wrong way with only a log line to say so, where no joint leaves correct geometry
-    # the user can joint by hand. Say it out loud instead of shipping it silently.
-    if best_key[0] > _IDENTITY_ROT_TOL:
-        futil.log(
-            f'PartsGen: every joint attempt for {workingOcc.component.name} rotated the shaft '
-            f'(best rot_err={best_key[0]:.3g}); left unjointed.')
+    chain = _joint_occurrence_chain(other_entity)
+    if not chain:
         futil.popup_error(
-            f'Parts Gen: could not create a joint for {workingOcc.component.name} without '
-            'rotating the shaft out of position.\n\n'
-            'The shaft itself is correct -- it was left unjointed so it keeps pointing at '
-            'the second face. Add the joint by hand if you need one.')
+            f'Parts Gen: no joint was created for {workingOcc.component.name}.\n\n'
+            'The Reference Point belongs to the root component rather than to a component '
+            'occurrence, and a joint needs two components. The shaft itself is correct -- '
+            'move that geometry into its own component, or add the joint by hand.')
         return None
 
-    is_flipped, angle_rad = best_combo
-    joint = _build(is_flipped, angle_rad)
-    joint.name = f'{workingOcc.component.name}_joint'
-    # Re-measure rather than trusting the probe's score: Joints.add() is assumed
-    # deterministic for identical input, but that assumption is worth a log line if it breaks.
-    rot_err, trans_err = _identity_deviation(workingOcc.transform)
-    futil.log(
-        f'PartsGen: joint for {workingOcc.component.name} left a residual offset '
-        f'(rot {rot_err:.3g}, trans {trans_err:.3g} cm) with isFlipped={is_flipped}, '
-        f'angle={angle_rad:.4g}.')
-    return joint
+    # A rigid as-built joint takes no geometry at all (the API is explicit that the argument
+    # should be null). For revolute, use the shaft's OWN start face rather than the picked
+    # hole edge: `workingOcc` is a direct child of root with an identity transform, so it is
+    # outside the range of the deep-proxy axis bug above -- and since an as-built joint no
+    # longer moves anything, that bug would otherwise hide as a silently wrong rotation axis
+    # instead of a visibly wrong position. The face's centre is the Reference Point and its
+    # normal is the shaft's axis, so ZAxisJointDirection means "about the shaft".
+    if joint_type == JOINT_RIGID:
+        geom = None
+    else:
+        geom = adsk.fusion.JointGeometry.createByPlanarFace(
+            ref_face.createForAssemblyContext(workingOcc), None,
+            adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+
+    for occ2 in chain:
+        try:
+            joint_input = rootComp.asBuiltJoints.createInput(workingOcc, occ2, geom)
+            if joint_input is not None:
+                if joint_type == JOINT_RIGID:
+                    joint_input.setAsRigidJointMotion()
+                else:
+                    joint_input.setAsRevoluteJointMotion(
+                        adsk.fusion.JointDirections.ZAxisJointDirection)
+                # Documented to return null on failure rather than raising, so check it.
+                joint = rootComp.asBuiltJoints.add(joint_input)
+                if joint is not None:
+                    joint.name = f'{workingOcc.component.name}_joint'
+                    futil.log(f'PartsGen: as-built joint for {workingOcc.component.name} '
+                              f'against {occ2.name} ({joint_type})')
+                    return joint
+        except Exception:
+            # Logged, not raised: a deeper occurrence failing is exactly what the walk up
+            # the chain exists to absorb, and the final popup below still reports giving up.
+            futil.handle_error(f'PartsGen: as-built joint against {occ2.name}')
+        futil.log(f'PartsGen: as-built joint against {occ2.name} failed; '
+                  'trying its parent occurrence')
+
+    futil.popup_error(
+        f'Parts Gen: could not create a joint for {workingOcc.component.name}.\n\n'
+        'The shaft itself is correct -- add the joint by hand if you need one.')
+    return None
 
 
 # ===========================================================================
@@ -669,27 +644,48 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             centroid1       = _point_from_entity(ref_point_entity)
             centroid2       = _bbox_center(face2)
 
-            # Build the shaft's sketch on a construction plane through the Reference
-            # Point, parallel to Face 2 -- the natural orientation for a shaft spanning
-            # two roughly-facing mounting faces, and avoids needing a face pick at all.
-            plane_point = _plane_offset_point(workingComp, ref_point_entity)
-            plane_input = workingComp.constructionPlanes.createInput()
-            plane_input.setByOffsetThroughPoint(face2, plane_point)
-            ref_plane = workingComp.constructionPlanes.add(plane_input)
+            # Sketch straight onto the face the picked hole is drilled through, so the shaft
+            # comes out coaxial with that hole -- a shaft through a bearing should follow the
+            # bearing's axis, not whatever angle Face 2 happens to sit at. The Reference Point
+            # is the hole's centre and so lies exactly on this face, which is why no offset
+            # plane is needed (and a zero-distance setByOffsetThroughPoint isn't documented to
+            # be legal anyway). Fusion has no parametric "plane through a point normal to an
+            # axis", so the hole's own face is the only way to get this orientation.
+            ref_axis  = _ref_axis(ref_point_entity)
+            axis_face = _axis_plane_face(ref_point_entity, ref_axis)
+            if axis_face is not None:
+                sketch_plane = axis_face
+                futil.log('PartsGen: shaft built coaxial with the reference hole')
+            else:
+                # Nothing to take an axis from -- a plain vertex/sketch/construction point, or
+                # a rim with no perpendicular planar neighbour. Fall back to the original
+                # behaviour: a plane through the Reference Point, parallel to Face 2.
+                plane_point = _plane_offset_point(workingComp, ref_point_entity)
+                plane_input = workingComp.constructionPlanes.createInput()
+                plane_input.setByOffsetThroughPoint(face2, plane_point)
+                sketch_plane = workingComp.constructionPlanes.add(plane_input)
+                futil.log('PartsGen: no hole axis available; shaft built parallel to Face 2')
 
-            ext_dir         = _extrude_direction(ref_plane.geometry.normal, centroid1, centroid2)
-            sketch_plane    = ref_plane
             face2_target    = face2
             custom_len_expr = None
         else:
             face2_target    = None
             centroid1       = adsk.core.Point3D.create(0, 0, 0)
-            ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
             custom_len_expr = customLenInp.expression
             sketch_plane    = rootComp.xYConstructionPlane
 
         sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
         sketch.name = 'ShaftProfile'
+
+        # Ask the sketch for its own normal rather than reading it off the plane or face:
+        # ExtentDirections is measured against the sketch, while a BRepFace's normal flips
+        # with isParamReversed, so taking it from the face would be a latent 180-degree bug.
+        sk_normal = None
+        if len_type == LEN_FACES:
+            sk_normal = sketch.xDirection.crossProduct(sketch.yDirection)
+            ext_dir   = _extrude_direction(sk_normal, centroid1, centroid2)
+        else:
+            ext_dir   = adsk.fusion.ExtentDirections.PositiveExtentDirection
 
         c1_sk  = sketch.modelToSketchSpace(centroid1)
         center = adsk.core.Point3D.create(c1_sk.x, c1_sk.y, 0.0)
@@ -795,16 +791,32 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             elif shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
             if len_type == LEN_FACES:
-                # Perpendicular distance from the Reference Point to Face 2's plane -- the
-                # shaft's real length. This used to be the straight-line distance to the
-                # face's bounding-box centre, which overstates it whenever Face 2 is wider
-                # than the shaft and the pick sits off its centre.
+                # The shaft's centreline length. Start from the perpendicular distance from
+                # the Reference Point to Face 2's plane (this used to be the straight-line
+                # distance to the face's bounding-box centre, which overstates it whenever
+                # Face 2 is wider than the shaft and the pick sits off its centre), then
+                # divide by cos(theta) when the shaft runs along the hole's axis rather than
+                # perpendicular to Face 2 -- a tilted shaft travels further than the gap.
+                # The far end is a slanted ellipse in that case, so "the length" is genuinely
+                # ambiguous; the centreline is the one the Custom-Length rebuild on
+                # right-click Edit can actually reproduce.
                 f2_plane = adsk.core.Plane.cast(face2_entity.geometry)
                 f2_org   = f2_plane.origin
                 f2_nrm   = f2_plane.normal
                 d = abs((centroid1.x - f2_org.x) * f2_nrm.x +
                         (centroid1.y - f2_org.y) * f2_nrm.y +
                         (centroid1.z - f2_org.z) * f2_nrm.z)
+                # `sk_normal` rather than the entity-derived axis: a sketch's xDirection and
+                # yDirection are documented to be in model space, so their cross product is
+                # unambiguously the shaft's world axis, while a proxy's `.geometry` has been
+                # seen reporting component-native values while the design is mid-recompute.
+                if sk_normal is not None:
+                    cos_t = abs(sk_normal.dotProduct(f2_nrm))
+                    if cos_t > 1e-6:
+                        d /= cos_t
+                    else:
+                        futil.log('PartsGen: shaft axis is nearly parallel to Face 2; '
+                                  'storing the perpendicular distance as its length')
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
                 # Remember both picks so right-click Edit can rebuild the shaft where it
                 # stands (and re-create its joint) instead of falling back to a Custom

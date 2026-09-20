@@ -23,7 +23,99 @@ session.
 
 ## Lessons
 
-### A picked entity 2+ occurrence levels deep makes `JointGeometry`'s axis wrong -- but `isFlipped` still comes out right, so add `angle=pi` to the candidate sweep instead of trying to fix the axis
+### A picked face 2+ occurrence levels deep can report a wrong Plane (origin AND normal) from `.geometry` -- confirmed for a plain `BRepFace`, not just `JointGeometry`
+Live-debugged a real user report: PartsGen Shaft "Between Two Faces" with the Reference Point set
+to a hex bushing's bore rim, 2 occurrence levels deep (`Shooter_Base:1+Bushing ...:2`), built the
+hex shaft **1.9 cm (~0.75 in) away from the true bore axis** -- confirmed live via the Fusion MCP
+server that the bushing's own bore is a single, perfectly straight axis (three stepped-diameter
+rims along it all reduce to one line once each is transformed by the occurrence chain), so there
+was no "picked the wrong hole" ambiguity to blame. Re-running the real, already-loaded
+`_create_shaft` against the exact same stored `entityToken` reproduced the identical wrong offset
+down to 4 decimal places -- not a one-off recompute race, a deterministic bug. Root cause, isolated
+by comparing `_axis_plane_face`'s returned face against the same face read a different way
+(`occurrence.bRepBodies` proxy): `Plane.cast(candidate_face.geometry)` on the face returned by
+`_axis_plane_face(entity, axis)` (which walks `entity.faces` off the picked, already-proxied
+`BRepEdge`) reported `normal=(0,-1,0)`, `origin=(8.91,-10.96,16.75)` -- while the *same face*, read
+by indexing `occurrence.bRepBodies[i].faces` directly, correctly reported `normal=(-0.163,-0.987,0)`,
+`origin=(7.01,-12.26,16.75)` (the true world plane, confirmed against the bore's own known-good
+axis). Both faces have `area == 2.3964` and the same `assemblyContext.fullPathName`, so it's the
+exact same face -- only the access path differs. **This generalizes the existing "2+ levels deep
+reads a local, component-native frame" finding (previously only confirmed for `JointGeometry`'s
+computed axis) to a plain `BRepFace.geometry` Plane reached via `edge.faces` on a proxy.** **Fix
+status: not yet fixed** -- `_axis_plane_face`'s face is still usable for the *is-it-perpendicular*
+test (that only compares directions, and happened to still pass here), but sketching directly on
+it (`workingComp.sketches.addWithoutEdges(sketch_plane)`) bakes in whatever wrong frame
+`.geometry` returned. A fix needs to get the plane's true world origin/normal from a source proven
+reliable at 2+ levels (e.g. re-fetch the face through `occurrence.bRepBodies`/`.faces` indexing
+instead of `edge.faces`, or derive the plane from the already-correct `ref_axis` + `centroid1`
+instead of trusting the found face's own `.geometry`) before this ships to more users than the one
+who reported it.
+`commands/PartsGen/shaft_gen.py` (`_axis_plane_face`, `_create_shaft`)
+
+### Don't fight `Joints.add()` to keep a part still -- use an `AsBuiltJoint`, which never moves either occurrence
+`Joints.add()` **always** repositions its first occurrence so the two joint frames coincide, so
+jointing a part that is already exactly where it belongs means hunting for an `isFlipped`/`angle`
+pair whose repositioning happens to be a no-op. The four entries below are that hunt; it is
+unwinnable whenever the picked entity is 2+ occurrence levels deep, because Fusion reads (and
+internally uses) its local component-native axis -- live, every candidate rotated the shaft by the
+same ~48 degrees (`rot_err=0.744`) and the user got a popup instead of a joint. Worse, probing is
+not free: `joint.deleteMe()` does **not** restore the occurrence transform (confirmed live on a
+shaft left behind by a failed run -- it was still carrying the last probe's 180-degree flip, which
+a symmetric hex shaft hides perfectly). **Fix:** `rootComp.asBuiltJoints.createInput(occ1, occ2,
+geometry)` -> `setAsRevoluteJointMotion(ZAxisJointDirection)` / `setAsRigidJointMotion()` ->
+`add()`. It adds the same motion without moving anything, which deletes the whole problem rather
+than tolerating it. Notes confirmed live: geometry must be `None` for rigid; `add()` returns null
+on failure instead of raising; a `createByPlanarFace` JointGeometry **is** accepted; the
+`AsBuiltJoint` doc's `rollTo` requirement applies only to the post-creation `setAs*JointMotion`
+methods, not to `AsBuiltJointInput`'s; `AsBuiltJoint.timelineObject` exists, so timeline grouping
+needs no change; and deleting the occurrence cascades the joint away, so right-click Edit's
+delete-and-rebuild needs no sweep. Pass the **leaf** occurrence as `occurrenceTwo` (walk
+`entity.assemblyContext` up only if it fails) -- jointing to the top-level group instead leaves the
+shaft behind when a sub-assembly pivots.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`, `_joint_occurrence_chain`)
+
+### Take a joint's axis from geometry you built at root, not from the user's deep pick
+Follows from the entry above: since an as-built joint no longer *moves* anything, the deep-proxy
+axis bug (entry below) stops showing up as a visibly wrong position and starts hiding as a silently
+wrong rotation axis -- much harder to notice or report. **Fix:** build the revolute geometry from
+the **shaft's own** start face (`ref_face.createForAssemblyContext(workingOcc)`), not the picked
+hole edge. The shaft's occurrence is a direct child of root with an identity transform, so its axes
+are reliably world-space; its face centre is the Reference Point and its normal is the shaft axis,
+so `ZAxisJointDirection` means "about the shaft". Verified live: rotation axis came out exactly
+along the shaft, joint bound to the bearing itself.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### To sketch normal to a hole's axis, sketch on the face the hole is drilled through
+Fusion has no parametric "construction plane through a point, normal to an axis":
+`ConstructionPlaneInput.setByPlane` is direct-modeling only, and nothing else in
+`ConstructionPlaneInput`/`ConstructionAxisInput` derives orientation from a bare vector.
+**Fix:** a circular edge's own planar neighbour is by definition perpendicular to its axis, so
+find it (`edge.faces`, keep the one whose `Plane.cast(f.geometry).normal` is parallel to
+`Circle3D.cast(edge.geometry).normal`; the parallel test also rejects a chamfered rim) and sketch
+straight onto it. The Reference Point is the circle's centre and lies exactly on that face, so no
+offset plane is needed at all -- which also avoids a zero-distance `setByOffsetThroughPoint`.
+This is what makes a PartsGen shaft coaxial with the bearing it passes through instead of merely
+perpendicular to Face 2.
+`commands/PartsGen/shaft_gen.py` (`_ref_axis`, `_axis_plane_face`, `_create_shaft`)
+
+### Read an extrude's direction off the *sketch*, never off the face or plane it sits on
+`ExtentDirections.Positive/Negative` is measured against the sketch's own normal, while a
+`BRepFace.geometry.normal` flips with `isParamReversed` -- so deriving the direction from the face
+is a latent 180-degree bug that only shows up on some faces. **Fix:**
+`sketch.xDirection.crossProduct(sketch.yDirection)`; both are documented to be in model space.
+`commands/PartsGen/shaft_gen.py` (`_extrude_direction` callers)
+
+### A proxy's `.geometry` can report component-native values while the design is mid-recompute
+Reading a picked circular edge's normal right after an undo gave `(-0.744, 0.668, 0)`; the same
+read on the same entity after the design settled gave the true world `(0, 1, 0)`. Self-consistent
+comparisons between two reads of the *same* entity stay fine (which is why the face search above is
+safe), but don't mix such a read with one from a different component. **Fix:** where a world vector
+really matters, take it from something unambiguous -- a sketch's `xDirection`/`yDirection`, or a
+`SurfaceEvaluator` normal.
+`commands/PartsGen/shaft_gen.py` (`_create_shaft` length attribute)
+
+### SUPERSEDED (shaft joints are as-built now, see top) -- A picked entity 2+ occurrence levels deep makes `JointGeometry`'s axis wrong -- but `isFlipped` still comes out right, so add `angle=pi` to the candidate sweep instead of trying to fix the axis
+*The sweep it feeds is gone -- an as-built joint moves nothing, so no axis has to agree. The live finding about `JointGeometry`'s axis being local for a deep pick still holds and is why the joint geometry now comes from the shaft itself.*
 Live-debugged a real user report: Shaft's "Create Joint at Reference Face" against a bearing bore
 picked through `Hood_Group:1+Bearing ... :13` (two occurrence levels deep) failed every single
 time, not intermittently -- the existing 6-candidate `isFlipped`/`angle` sweep (see the three joint
@@ -57,7 +149,8 @@ when the *rotation* can't be resolved, and logs+ships a rotation-correct joint w
 translation), so it wasn't chased further here.
 `commands/PartsGen/shaft_gen.py` (`_create_reference_joint` candidate list)
 
-### The shaft-joint 180-degree flip, actually solved: read both `JointGeometry` frames *before* `Joints.add()` and compute `isFlipped`
+### SUPERSEDED (shaft joints are as-built now, see top) -- The shaft-joint 180-degree flip, actually solved: read both `JointGeometry` frames *before* `Joints.add()` and compute `isFlipped`
+*No joint of this kind is created any more. The live finding -- a hole has a rim edge at each end with opposite circle normals -- still holds.*
 The two entries below chased this by trial and error and never got it. Real cause: a hole has a rim
 edge at each end, with **opposite circle normals** (confirmed live -- the same hole offers
 Z=(0,-1,0) and Z=(0,1,0)), so which rim the user clicked decided whether the solver flipped the
@@ -68,7 +161,8 @@ rims of one hole x Rigid/Revolute: 8/8 left the occurrence at exactly `rot_err=0
 with `isFlipped` False for the matching rim and True for the opposed one.
 `commands/PartsGen/shaft_gen.py` (`_frame_correction`, `_create_reference_joint`)
 
-### `Matrix3D.isEqualTo` is an exact float compare -- it rejects a *correctly* corrected joint
+### SUPERSEDED (shaft joints are as-built now, see top) -- `Matrix3D.isEqualTo` is an exact float compare -- it rejects a *correctly* corrected joint
+*The identity-probing this describes is deleted. Its general warning about `Matrix3D.isEqualTo` having no tolerance still holds.*
 This was what actually shipped the wrong shaft. The no-op case (`isFlipped=False`, nothing to
 solve) is bit-exact and passes; the corrected case makes Fusion compute a rotation, which leaves
 ~1e-16 of dust, so `occ.transform.isEqualTo(Matrix3D.create())` says "still wrong" and the retry
@@ -78,7 +172,8 @@ what matters (a flip reads as `rot_err == 2.0`). Rank probes by `(rot_err, trans
 *best*, never the last.
 `commands/PartsGen/shaft_gen.py` (`_identity_deviation`)
 
-### `JointInput.angle` rotates about the joint's *primary* axis, so it can never undo a direction reversal
+### SUPERSEDED (shaft joints are as-built now, see top) -- `JointInput.angle` rotates about the joint's *primary* axis, so it can never undo a direction reversal
+*Still true of `Joints`, but PartsGen no longer uses `isFlipped`/`angle` at all.*
 `angle` spins about the joint's Z -- for a shaft joint that is the shaft's own axis -- so a
 half-turn only re-clocks the flats. Sweeping `isFlipped x angle in {0, pi}` therefore has just two
 distinct orientations, two wasted probes, and a fallback (`isFlipped=True, angle=pi`) that composes
