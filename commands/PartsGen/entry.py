@@ -154,6 +154,7 @@ ATTR_CUSTOM_NAME          = 'custom_name'
 
 ATTR_CREATE_JOINT = 'shaft_create_joint'
 ATTR_JOINT_TYPE   = 'shaft_joint_type'
+ATTR_JOINT_FLIP   = 'shaft_joint_flip'
 
 # Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
 # where it was instead of dropping back to a Custom Length at the world origin.
@@ -321,17 +322,18 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # Reference Point -- Shaft only. Defines both where the shaft is built from AND
     # (when "Create Joint" is checked) the joint's target on the other part -- one
-    # selection serves both roles, like Fusion's own Joint picker. A circular edge (a
-    # real hole's boundary) is usually what's actually available to click on a real
-    # part -- a construction/sketch point rarely already exists there.
+    # selection serves both roles, picked exactly like Fusion's own Joint command: a
+    # point, edge, or face, snapping to its center/midpoint/centroid keypoint.
     refPointSel = inputs.addSelectionInput(
         'ref_point_selection', 'Reference Point',
-        'Select a point, or a circular edge (its center is used), that the shaft is built from'
+        'Select a point, edge, or face that the shaft is built from -- just like picking a '
+        'joint origin in the Joint command'
     )
     refPointSel.addSelectionFilter('Vertices')
     refPointSel.addSelectionFilter('SketchPoints')
     refPointSel.addSelectionFilter('ConstructionPoints')
-    refPointSel.addSelectionFilter('CircularEdges')
+    refPointSel.addSelectionFilter('Edges')
+    refPointSel.addSelectionFilter('Faces')
     refPointSel.setSelectionLimits(1, 1)
     refPointSel.isVisible = True
 
@@ -361,6 +363,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     jointTypeInp.listItems.add(JOINT_REVOLUTE, True, '')
     jointTypeInp.listItems.add(JOINT_RIGID, False, '')
     jointTypeInp.isVisible = True
+
+    # Flip -- exactly the native Joint command's own Flip checkbox: no attempt is made to
+    # guess which of the two valid orientations is "correct" from the Reference Point pick,
+    # the user just toggles this if the shaft comes out backwards.
+    flipJointInp = inputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
+    flipJointInp.isVisible = True
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = inputs.addDropDownCommandInput(
@@ -500,6 +508,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     highlightRefFaceInp: adsk.core.BoolValueCommandInput = inputs.itemById('highlight_ref_face')
     createJointInp: adsk.core.BoolValueCommandInput  = inputs.itemById('create_joint')
     jointTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('joint_type')
+    flipJointInp:   adsk.core.BoolValueCommandInput  = inputs.itemById('flip_joint')
     refPointSel:    adsk.core.SelectionCommandInput  = inputs.itemById('ref_point_selection')
     beltTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('belt_type')
     toothCountInp:  adsk.core.ValueCommandInput      = inputs.itemById('tooth_count')
@@ -594,7 +603,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
 
     # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
-    # only for Tube; Shaft uses Reference Point instead (a point/circular-edge pick --
+    # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
     # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
     face1Sel.isVisible     = not hide_length and is_between_faces and part_is_tube
@@ -609,10 +618,13 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # mode, since that's the only mode where Reference Point touches another part.
     # It reuses Reference Point directly as the joint's target -- no separate pick.
     show_joint = part_is_shaft and is_between_faces
+    show_joint_options = (show_joint and createJointInp is not None and createJointInp.value)
     if createJointInp is not None:
         createJointInp.isVisible = show_joint
     if jointTypeInp is not None:
-        jointTypeInp.isVisible = show_joint and createJointInp is not None and createJointInp.value
+        jointTypeInp.isVisible = show_joint_options
+    if flipJointInp is not None:
+        flipJointInp.isVisible = show_joint_options
 
     # Sync selection limits with visibility
     if not hide_length and is_between_faces and part_is_tube:
@@ -1229,7 +1241,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
                     ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
-                    ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE,
+                    ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE, ATTR_JOINT_FLIP,
                     ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
@@ -1288,6 +1300,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
     create_joint_val     = _b(ATTR_CREATE_JOINT, False)
     joint_type_val       = _s(ATTR_JOINT_TYPE,  JOINT_REVOLUTE)
+    joint_flip_val       = _b(ATTR_JOINT_FLIP,  False)
 
     # Recover the original Between-Two-Faces picks. When both still resolve the shaft can be
     # rebuilt exactly where it stands, joint and all; when either is gone (the other part was
@@ -1511,12 +1524,14 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 
     refPointSelEdit = inputs.addSelectionInput(
         'ref_point_selection', 'Reference Point',
-        'Select a point, or a circular edge (its center is used), that the shaft is built from'
+        'Select a point, edge, or face that the shaft is built from -- just like picking a '
+        'joint origin in the Joint command'
     )
     refPointSelEdit.addSelectionFilter('Vertices')
     refPointSelEdit.addSelectionFilter('SketchPoints')
     refPointSelEdit.addSelectionFilter('ConstructionPoints')
-    refPointSelEdit.addSelectionFilter('CircularEdges')
+    refPointSelEdit.addSelectionFilter('Edges')
+    refPointSelEdit.addSelectionFilter('Faces')
     refPointSelEdit.setSelectionLimits(0, 1)
     refPointSelEdit.isVisible = keep_faces
 
@@ -1549,6 +1564,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     jointTypeInpEdit.listItems.add(JOINT_REVOLUTE, joint_type_val != JOINT_RIGID, '')
     jointTypeInpEdit.listItems.add(JOINT_RIGID, joint_type_val == JOINT_RIGID, '')
     jointTypeInpEdit.isVisible = keep_faces and create_joint_val
+
+    flipJointInpEdit = inputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
+    flipJointInpEdit.isVisible = keep_faces and create_joint_val
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)

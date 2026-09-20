@@ -23,6 +23,56 @@ session.
 
 ## Lessons
 
+### `Joints.add()`'s default `isFlipped=False` does not mean "leave the part where it was built" -- and `BRepFace.geometry.normal` lies about direction even at zero occurrence depth
+A regular Joint's default orientation is not "unflipped relative to how the part was already
+placed" -- it's just whichever of the two valid alignments falls out of each side's own,
+arbitrary raw axis sign. Live-tested with fully controlled geometry (two identical blocks, known
+face orientations): joining two faces whose *true* outward normals point the same way needs
+`isFlipped=False` to stay put and `isFlipped=True` to flip 180; two faces whose true normals
+point opposite ways need the reverse. Confirmed the same rule holds for a real planar-face
+(shaft end) vs. circular-edge (bearing bore) pair -- the actual PartsGen case. **The "true
+normal" part is its own trap:** `Plane.cast(face.geometry).normal` can report the *identical*
+raw vector for a shape's two opposite faces (confirmed live: a block's top and bottom both came
+back `(0,0,1)`) -- this is the documented `isParamReversed` gotcha (see the extrude-direction
+entry below), and it bites here **regardless of occurrence depth**, unlike the other proxy-depth
+findings in this file. **Fix:** correct every raw face normal with
+`if face.isParamReversed: normal.scaleBy(-1)` before comparing anything, then compute the
+"no-op" `isFlipped` as `(sideA_true_normal.dotProduct(sideB_axis) < 0)` -- verified live to
+floating-point precision (an exact identity rotation matrix), so a dialog's Flip checkbox can be
+defined as "flip away from the already-built preview" instead of an unexplained coin flip.
+`commands/PartsGen/shaft_gen.py` (`_true_face_normal`, `_natural_joint_axis`, `_create_reference_joint`)
+
+### Fusion has no parametric "point at an edge's midpoint" or "point at a face's centroid" construction-point input
+Widening PartsGen Shaft's Reference Point picker to accept any edge/face (to match the native
+Joint tool's picking, not just points and circular edges) broke the existing "plane through the
+point, parallel to Face 2" fallback: `ConstructionPointInput` only has `setByCenter` (circular/
+spherical only), `setByPoint` (existing vertex/SketchPoint only -- a raw `Point3D` is rejected
+outside direct-edit mode), `setByTwoEdges`, `setByThreePlanes`, and `setByEdgePlane` -- nothing
+that takes an arbitrary edge or face and returns its midpoint/centroid as a parametric point.
+`ConstructionPlaneInput.setByOffsetThroughPoint` has the same restriction on its `point` arg.
+**Fix:** for the entity types that already have a real parametric point (vertex/sketch/
+construction point, or a circular edge via `setByCenter`), keep using
+`setByOffsetThroughPoint` (fully associative). For a straight/general edge or any face, resolve
+the already-computed world `Point3D` (`_point_from_entity`, using `BRepFace.centroid` -- which
+works for planar *and* non-planar faces alike, confirmed live -- and `BRepEdge.evaluator`'s
+parameter-extents midpoint for a non-circular edge) and feed it to
+`ConstructionPlaneInput.setByOffset(face2, ValueInput.createByReal(signedDistance))` instead,
+computing `signedDistance` as `plane.origin.vectorTo(worldPoint).dotProduct(plane.normal)`. This
+still places the shaft correctly, it just isn't associative if the picked geometry moves later
+(verified live: residual distance came out exact to 1e-6 cm on a known offset).
+`commands/PartsGen/shaft_gen.py` (`_offset_plane_parallel_to_face2`, `_plane_offset_point`, `_point_from_entity`)
+
+### A regular `Joints.createInput`/`.add()` needs `JointGeometry` on both sides -- no `None` shortcut like `AsBuiltJoint` has for rigid
+Confirmed via `apiDocumentation`: `Joints.createInput(geometryOrOriginOne, geometryOrOriginTwo)`
+always takes two real `JointGeometry`/`JointOrigin` objects, unlike `AsBuiltJoints.createInput`
+which accepts `None` for a rigid joint. Build geometry for both sides unconditionally, then still
+call `setAsRigidJointMotion()`/`setAsRevoluteJointMotion(...)` the same way afterward. Also
+confirmed live: `JointGeometry.createByNonPlanarFace` requires `MiddleKeyPoint` for a
+cylindrical/conical face and `CenterKeyPoint` for a spherical/toroidal one -- passing
+`CenterKeyPoint` for a cylinder is invalid per the API docs, so branch on the face's surface type
+(`adsk.core.Sphere`/`Torus` vs. everything else), not a single hardcoded keypoint.
+`commands/PartsGen/shaft_gen.py` (`_joint_geometry_from_entity`)
+
 ### A picked face 2+ occurrence levels deep can report a wrong Plane (origin AND normal) from `.geometry` -- confirmed for a plain `BRepFace`, not just `JointGeometry`
 Live-debugged a real user report: PartsGen Shaft "Between Two Faces" with the Reference Point set
 to a hex bushing's bore rim, 2 occurrence levels deep (`Shooter_Base:1+Bushing ...:2`), built the
@@ -52,7 +102,13 @@ instead of trusting the found face's own `.geometry`) before this ships to more 
 who reported it.
 `commands/PartsGen/shaft_gen.py` (`_axis_plane_face`, `_create_shaft`)
 
-### Don't fight `Joints.add()` to keep a part still -- use an `AsBuiltJoint`, which never moves either occurrence
+### SUPERSEDED (shaft joint is a regular Joint again by explicit product decision) -- Don't fight `Joints.add()` to keep a part still -- use an `AsBuiltJoint`, which never moves either occurrence
+*The shaft's joint moved back to a regular `Joints.add()` -- the user explicitly wants the joint-point
+picking AND the resulting joint to behave exactly like Fusion's native Joint command, which includes
+accepting that the shaft may reposition/rotate to align the two joint frames. That was the whole
+problem this entry was fighting; it's now the intended behavior, not something to avoid. See
+`_create_reference_joint` and `_joint_geometry_from_entity` in `shaft_gen.py`. The technical findings
+below (proxy/axis behavior) are still accurate and worth knowing if this ever needs revisiting.*
 `Joints.add()` **always** repositions its first occurrence so the two joint frames coincide, so
 jointing a part that is already exactly where it belongs means hunting for an `isFlipped`/`angle`
 pair whose repositioning happens to be a no-op. The four entries below are that hunt; it is
@@ -74,7 +130,12 @@ delete-and-rebuild needs no sweep. Pass the **leaf** occurrence as `occurrenceTw
 shaft behind when a sub-assembly pivots.
 `commands/PartsGen/shaft_gen.py` (`_create_reference_joint`, `_joint_occurrence_chain`)
 
-### Take a joint's axis from geometry you built at root, not from the user's deep pick
+### SUPERSEDED (shaft joint is a regular Joint again, see entry above) -- Take a joint's axis from geometry you built at root, not from the user's deep pick
+*Moot now that the shaft's occurrence is expected to move/reorient when the joint is created --
+there's no longer a "silently wrong rotation axis" to hide, since a wrong axis would now show up
+as a visibly wrong final position, same as it would with the native Joint tool. Still keeping the
+shaft's own start face as one side of the joint geometry (see `_create_reference_joint`), since it
+costs nothing and is reliably root-adjacent -- just not required for correctness anymore.*
 Follows from the entry above: since an as-built joint no longer *moves* anything, the deep-proxy
 axis bug (entry below) stops showing up as a visibly wrong position and starts hiding as a silently
 wrong rotation axis -- much harder to notice or report. **Fix:** build the revolute geometry from
