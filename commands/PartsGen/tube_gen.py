@@ -199,13 +199,14 @@ def _extrude_one_side(comp: adsk.fusion.Component,
 
 def _add_face_holes(comp: adsk.fusion.Component,
                     body: adsk.fusion.BRepBody,
-                    wall_thickness_cm: float,
                     hole_diam_cm: float,
                     extrusion_axis: adsk.core.Vector3D,
                     custom_len_expr=None):
-    """Drill holes on each outer long face.
+    """Drill holes through each pair of opposite tube walls.
 
-    One seed hole is sketched and extruded, then a **feature** rectangular
+    Only two adjacent outer faces are sketched (one per wall direction); each
+    seed hole is cut through-all, so it passes through both the near wall and
+    the opposite wall.  One seed hole is sketched and extruded, then a **feature** rectangular
     pattern replicates that cut.  Because the replication lives at the
     feature level (not the sketch level), Fusion re-drives every cut
     instance on each recompute — so when ``custom_len_expr`` is a user
@@ -222,9 +223,12 @@ def _add_face_holes(comp: adsk.fusion.Component,
     body_cy = (bb.minPoint.y + bb.maxPoint.y) / 2.0
     body_cz = (bb.minPoint.z + bb.maxPoint.z) / 2.0
 
-    # --- Collect outer wall faces -------------------------------------------
-    outer_faces = []
-    seen_ids    = set()
+    # --- Collect one outer wall face per wall direction ---------------------
+    # A through-all cut from one face also drills the opposite wall, so a face
+    # parallel to one already kept is skipped -- leaving two adjacent faces.
+    outer_faces  = []
+    kept_normals = []
+    seen_ids     = set()
 
     for face in body.faces:
         _, face_normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
@@ -242,9 +246,12 @@ def _add_face_holes(comp: adsk.fusion.Component,
         if fid in seen_ids:
             continue
         seen_ids.add(fid)
+        if any(abs(face_normal.dotProduct(n)) > 0.5 for n in kept_normals):
+            continue
+        kept_normals.append(face_normal)
         outer_faces.append(face)
 
-    futil.log(f'_add_face_holes: {len(outer_faces)} outer faces')
+    futil.log(f'_add_face_holes: {len(outer_faces)} outer faces (one per wall direction)')
 
     holeArea = hole_diam_cm ** 2 * math.pi / 4.0
 
@@ -367,9 +374,9 @@ def _add_face_holes(comp: adsk.fusion.Component,
             cutInput = extrudes.createInput(
                 seed_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
             )
-            cutExtent = adsk.fusion.DistanceExtentDefinition.create(
-                adsk.core.ValueInput.createByReal(wall_thickness_cm)
-            )
+            # Through-all into the tube: drills this wall and the opposite one.
+            # participantBodies keeps it from cutting anything else.
+            cutExtent = adsk.fusion.ThroughAllExtentDefinition.create()
             cutInput.setOneSideExtent(
                 cutExtent, adsk.fusion.ExtentDirections.NegativeExtentDirection
             )
@@ -553,7 +560,7 @@ def _create_tube(inputs: adsk.core.CommandInputs, constrain: bool = True):
                     hole_diam_cm = inputs.itemById('hole_diameter').value
                 else:
                     hole_diam_cm = HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
-                _add_face_holes(workingComp, body, t_cm, hole_diam_cm, extrusion_axis, custom_len_expr)
+                _add_face_holes(workingComp, body, hole_diam_cm, extrusion_axis, custom_len_expr)
         except Exception:
             futil.handle_error('PartsGen _add_face_holes', show_message_box=True)
 

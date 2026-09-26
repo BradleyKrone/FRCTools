@@ -544,6 +544,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     is_spacer_shaft  = (shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
+
+    # Length dropdown is shared across part types. Tube is most often cut to a specific
+    # custom length (e.g. a spacer), while Shaft is most often built Between Two Faces so
+    # its joint has both faces to reference -- default each part type to whichever is more
+    # common as soon as it's selected, same spirit as the customOD reset below.
+    if args.input.id == 'part_type':
+        if part_is_tube:
+            lenTypeInp.listItems.item(1).isSelected = True  # Custom Length
+        elif part_is_shaft:
+            lenTypeInp.listItems.item(0).isSelected = True  # Between Two Faces
+
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
     hide_length      = part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
 
@@ -618,12 +629,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
     face1Sel.isVisible     = not hide_length and is_between_faces and part_is_tube
-    # Reference Point is offered in both Shaft length modes now: it's required in
-    # Between-Two-Faces (positions the shaft) and optional in Custom Length (positions the
-    # shaft AND/OR gives the joint below something to target) -- see the selection-limits
-    # sync further down for the required-vs-optional split.
+    # Reference Point is required in Between-Two-Faces (positions the shaft). In Custom
+    # Length it only exists to give the joint below a target, so it's shown only while
+    # "Create Joint" is checked -- and cleared when hidden, so a stale pick can't silently
+    # keep placing the shaft somewhere the user can no longer see.
+    show_ref_point = (not hide_length and part_is_shaft
+                      and (is_between_faces
+                           or (createJointInp is not None and createJointInp.value)))
     if refPointSel is not None:
-        refPointSel.isVisible = not hide_length and part_is_shaft
+        refPointSel.isVisible = show_ref_point
+        if not show_ref_point and refPointSel.selectionCount > 0:
+            refPointSel.clearSelection()
     face2Sel.isVisible     = not hide_length and is_between_faces
     customLenInp.isVisible = not hide_length and not is_between_faces
     if reverseDirInp is not None:
@@ -689,8 +705,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # Auto-focus Face 1 (Tube) / Reference Point (Shaft) when switching length mode --
     # Reference Point is now offered (optionally) in Custom Length too, so focus it there
     # as well rather than only when switching to Between Two Faces.
-    if args.input.id == 'length_type':
-        if part_is_shaft and refPointSel is not None:
+    if args.input.id in ('length_type', 'create_joint'):
+        if part_is_shaft and refPointSel is not None and show_ref_point:
             refPointSel.hasFocus = True
         elif part_is_tube and is_between_faces:
             face1Sel.hasFocus = True
@@ -1567,11 +1583,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     refPointSelEdit.addSelectionFilter('Edges')
     refPointSelEdit.addSelectionFilter('Faces')
     refPointSelEdit.setSelectionLimits(0, 1)
-    # Matches the create dialog's rule (command_input_changed): offered for a Shaft in
-    # either length mode, not just when a prior pick still resolves -- a shaft that was
-    # originally built as a plain Custom Length can still have a Reference Point (and a
-    # joint) added on Edit.
-    refPointSelEdit.isVisible = has_len and is_shaft
+    # Matches the create dialog's rule (command_input_changed): always shown in
+    # Between-Two-Faces, and in Custom Length only while "Create Joint" is checked -- a
+    # shaft originally built as a plain Custom Length can still get a Reference Point (and
+    # a joint) on Edit by ticking the checkbox.
+    refPointSelEdit.isVisible = has_len and is_shaft and (keep_faces or create_joint_val)
 
     face2Sel = inputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
@@ -1666,7 +1682,9 @@ def edit_command_activate(args: adsk.core.CommandEventArgs):
     refPointSel = inputs.itemById('ref_point_selection')
     face2Sel    = inputs.itemById('face2_selection')
     try:
-        if refPointSel is not None and ref_point is not None:
+        # Skip a hidden input (Custom Length with "Create Joint" off) -- a pick there would
+        # silently place the shaft with nothing in the dialog showing why.
+        if refPointSel is not None and ref_point is not None and refPointSel.isVisible:
             refPointSel.addSelection(ref_point)
         if face2Sel is not None and face2 is not None:
             face2Sel.addSelection(face2)

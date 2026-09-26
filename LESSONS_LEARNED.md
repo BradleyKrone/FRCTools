@@ -23,6 +23,13 @@ session.
 
 ## Lessons
 
+### Drilling a tube: one through-all seed cut per wall *direction*, not one wall-thick cut per face
+Tube holes were sketched/cut/patterned on all 4 outer faces, each cut only `wall_thickness` deep. **Fix:**
+keep one outer face per normal direction (skip faces with `|n·kept_n| > 0.5`) and cut with
+`ThroughAllExtentDefinition` + `participantBodies=[body]` so it drills both walls without touching
+other bodies — 2 sketches + 2 patterns. Verify by counting cylinder faces (2×1×10": 60, 2×2×10": 80).
+`commands/PartsGen/tube_gen.py` (`_add_face_holes`)
+
 ### `ConstructionPlaneInput.setByOffset`/`setByOffsetThroughPoint` take a ConstructionPlane, not just a BRepFace -- reuse the same fallback-plane helper for a picked point with no face to be parallel to
 Extending PartsGen Shaft's "Create Joint" to Custom Length mode (previously Between-Two-Faces
 only) meant a Reference Point could now be positioned with no Face 2 around to be parallel to.
