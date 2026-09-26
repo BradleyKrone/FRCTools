@@ -10,10 +10,12 @@ import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
 from ..CCDistance.CCLine import getCCLineFromEntity
-from .pulley_gen import (create_pulley_for_belt,
+from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, _belt_width_mm,
                           ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_BELT_COMP_TOKEN,
                           ATTR_PULLEY_PITCH_CIRCLE_IDX, ATTR_PULLEY_TOOTH_COUNT,
-                          ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH)
+                          ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH,
+                          ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
+                          BORE_HALF_HEX, BORE_OFFSET_DEFAULT_IN)
 
 app = adsk.core.Application.get()
 
@@ -27,7 +29,9 @@ ATTR_BELT_WIDTH      = 'belt_width_expr'
 ATTR_BELT_SUPPRESS   = 'belt_suppress_teeth'
 ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
-ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+ATTR_BELT_BORE_TYPE    = 'belt_pulley_bore_type'    # stored per pulley, suffixed _1 / _2
+ATTR_BELT_BORE_OFFSET  = 'belt_pulley_bore_offset'
+ATTR_BELT_ADAPTER      = 'belt_pulley_adapter'      # stored per pulley, suffixed _1 / _2
 ATTR_BELT_LOOP_LENGTH  = 'belt_loop_length'
 ATTR_CUSTOM_NAME       = 'custom_name'
 
@@ -184,6 +188,13 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
         teeth_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH)
         width_mm   = int(width_attr.value.split()[0]) if width_attr else 9
         show_teeth = teeth_attr is not None and teeth_attr.value.lower() == 'true'
+        bore_attr    = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_BORE_TYPE)
+        offset_attr  = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_BORE_OFFSET)
+        adapter_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_ADAPTER)
+        bore_type    = bore_attr.value if bore_attr else BORE_HALF_HEX
+        bore_offset_cm = (design.unitsManager.evaluateExpression(offset_attr.value, 'in')
+                          if offset_attr else BORE_OFFSET_DEFAULT_IN * 2.54)
+        use_adapter  = adapter_attr is not None and adapter_attr.value.lower() == 'true'
         old_token  = old_comp.entityToken
 
         belt_comp = _find_comp_by_token(design, belt_comp_token)
@@ -201,11 +212,13 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
 
         rebuild_start = design.timeline.markerPosition
 
-        pulley_occ.deleteMe()  # removes the component and any associated joints
+        # Its "<pulley>_Group" when it has an adapter; removes any associated joints too.
+        pulley_outer_occurrence(pulley_occ).deleteMe()
 
         create_pulley_for_belt(belt_pitch_mm, new_n_teeth, width_mm / 10.0,
                                belt_occ, proj_circle, show_teeth, circle_idx,
-                               parent_comp=belt_comp)
+                               parent_comp=belt_comp, bore_type=bore_type,
+                               bore_offset_cm=bore_offset_cm, use_adapter=use_adapter)
 
         # Wrap the delete + recreation into one named timeline group
         prefix   = 'Pulley_HTD_5mm' if belt_pitch_mm == 5 else 'Pulley_GT2_3mm'
@@ -439,11 +452,26 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
     pitchLineSelection: adsk.core.SelectionCommandInput = inputs.itemById('tb_pitch_circles')
     beltTypeInp:        adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_type')
-    beltWidthInp:       adsk.core.ValueCommandInput     = inputs.itemById('tb_belt_width')
+    beltWidthInp:       adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_width')
     suppressTeethInp:   adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
     genPulleysInp:      adsk.core.BoolValueCommandInput  = inputs.itemById('tb_gen_pulleys')
     pulleyTeethInp:     adsk.core.BoolValueCommandInput  = inputs.itemById('tb_pulley_teeth')
-    pulleyWidthInp:     adsk.core.ValueCommandInput      = inputs.itemById('tb_pulley_width')
+    boreOffsetInp:      adsk.core.ValueCommandInput      = inputs.itemById('tb_bore_offset')
+
+    # One width drives both the belt and its pulleys.
+    width_mm      = _belt_width_mm(beltWidthInp)
+    belt_width_cm = width_mm / 10.0
+    bore_offset_cm = (boreOffsetInp.value if boreOffsetInp is not None
+                      else BORE_OFFSET_DEFAULT_IN * 2.54)
+    # Bore and 3D print adapter are chosen per pulley: index 0 = the first End Circle.
+    bore_types, use_adapters = [], []
+    for i in (1, 2):
+        boreTypeInp: adsk.core.DropDownCommandInput  = inputs.itemById(f'tb_bore_type_{i}')
+        adapterInp:  adsk.core.BoolValueCommandInput = inputs.itemById(f'tb_adapter_{i}')
+        bore_types.append(boreTypeInp.selectedItem.name
+                          if boreTypeInp is not None and boreTypeInp.selectedItem is not None
+                          else BORE_HALF_HEX)
+        use_adapters.append(adapterInp is not None and adapterInp.value)
 
     if pitchLineSelection.selectionCount < 2:
         futil.popup_error('Parts Gen: please select two pitch circles for the Timing Belt.')
@@ -516,9 +544,9 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
 
         if beltPitchLength == 5:
-            comp_name = f'Belt_HTD_5mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
+            comp_name = f'Belt_HTD_5mm-{toothCount}Tx{width_mm}mm'
         else:
-            comp_name = f'Belt_GT2_3mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
+            comp_name = f'Belt_GT2_3mm-{toothCount}Tx{width_mm}mm'
         workingComp.name = comp_name
 
         customNameInp = inputs.itemById('custom_name')
@@ -570,26 +598,30 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
         # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
         if is_preview and not (suppressTeethInp and suppressTeethInp.value):
-            extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
+            extrudeBeltPreview(sketch, pathCurves, belt_width_cm)
             return
 
         # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
         if suppressTeethInp and suppressTeethInp.value:
-            extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
+            extrudeBeltPreview(sketch, pathCurves, belt_width_cm)
         else:
-            extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
+            extrudeBelt(sketch, pathCurves, belt_width_cm, toothCount, beltPitchLength)
 
         # Save attributes so the right-click Edit command can restore the dialog
         try:
             attrs = workingComp.attributes
             attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
             attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
-            attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    f'{width_mm} mm')
             attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
             attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
             attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
             attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
-            attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+            if boreOffsetInp is not None:
+                attrs.add(ATTR_GROUP, ATTR_BELT_BORE_OFFSET, boreOffsetInp.expression)
+            for i in (1, 2):
+                attrs.add(ATTR_GROUP, f'{ATTR_BELT_BORE_TYPE}_{i}', bore_types[i - 1])
+                attrs.add(ATTR_GROUP, f'{ATTR_BELT_ADAPTER}_{i}',   str(use_adapters[i - 1]))
             if custom_name:
                 attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
         except Exception:
@@ -609,10 +641,12 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
                     if n_pulley_teeth < 8:
                         futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
                         continue
-                    pulley_width_cm = pulleyWidthInp.value if pulleyWidthInp is not None else beltWidthInp.value
-                    create_pulley_for_belt(beltPitchLength, n_pulley_teeth, pulley_width_cm,
+                    create_pulley_for_belt(beltPitchLength, n_pulley_teeth, belt_width_cm,
                                            workingOcc, proj_circles[i], pulley_teeth,
-                                           circle_index=i, parent_comp=workingComp)
+                                           circle_index=i, parent_comp=workingComp,
+                                           bore_type=bore_types[i],
+                                           bore_offset_cm=bore_offset_cm,
+                                           use_adapter=use_adapters[i], is_preview=is_preview)
                 except Exception:
                     futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
 

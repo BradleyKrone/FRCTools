@@ -13,6 +13,7 @@ from ...lib import fusionAddInUtils as futil
 from ... import config
 from .pulley_gen import (
     _engrave_label_face,
+    _offset_xy_plane,
     HEX_BORE_FLATS_CM,
     LABEL_TEXT_HEIGHT_CM,
     LABEL_ENGRAVE_CM,
@@ -110,17 +111,24 @@ def _add_hex_bore_sprocket(comp: adsk.fusion.Component, width_cm: float, tip_od_
 def _add_sprocket_label(comp: adsk.fusion.Component, width_cm: float, n_teeth: int):
     try:
         label = f'{n_teeth}T'
+        # Just above the 1/2in hex bore's corners.
+        y_bot = HEX_BORE_FLATS_CM / 2 / math.cos(math.radians(30)) + 0.02
+        y_top = y_bot + LABEL_TEXT_HEIGHT_CM * 1.2
         _engrave_label_face(
             comp, label,
-            z_offset_cm  = width_cm,
+            plane         = _offset_xy_plane(comp, width_cm),
             cut_direction = adsk.fusion.ExtentDirections.NegativeExtentDirection,
             mirror        = False,
+            y_bot         = y_bot,
+            y_top         = y_top,
         )
         _engrave_label_face(
             comp, label,
-            z_offset_cm  = 0.0,
+            plane         = comp.xYConstructionPlane,
             cut_direction = adsk.fusion.ExtentDirections.PositiveExtentDirection,
             mirror        = True,
+            y_bot         = y_bot,
+            y_top         = y_top,
         )
     except Exception:
         futil.handle_error('PartsGen _add_sprocket_label', show_message_box=True)

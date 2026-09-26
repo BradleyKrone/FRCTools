@@ -23,12 +23,118 @@ session.
 
 ## Lessons
 
+### Solver-built profiles (rough geometry + tangents + `dim.value =`) fail at some sizes -- place points in closed form and fix them
+The timing-pulley tooth sketches threw `VCS_SKETCH_OVER_CONSTRAINTS` for GT2 36-60T and `SOLVING_FAILED` for HTD 64/100T:
+the solver had to drag rough guesses too far. **Fix:** solve one tooth in Python (tangent circles/lines, a bisection
+for HTD's flank), fix its points, `addCircularPattern` about `sketch.originPoint`. Matched the old geometry to 1e-9 mm,
+works 8-120T, 3-7x faster. Two traps: `addByThreePoints` rejects a ~0.008 mm arc (use `addByCenterStartSweep`), and
+`JointGeometry.createByCurve(arc, CenterKeyPoint)` refuses an open arc -- keep a construction circle for joints.
+`commands/PartsGen/pulley_gen.py` (`_htd_tooth_curves`, `_gt2_tooth_curves`, `_draw_tooth_profile`)
+
+### Engrave text without exploding it: pin `SketchText.definition.rectangleLines` and extrude the SketchText
+An exploded "18T" is ~50 loose curves (sketch never fully constrained) and was cut one profile per feature (~0.15 s
+each, and the 8's counters got cut out too). **Fix:** fix each `rectangleLines[i].startSketchPoint` (4 calls ->
+`isFullyConstrained` True), then `extrudes.createInput(sketchText, Cut)` + `participantBodies` in one feature. Pulley
+build 3.7 s -> 0.5 s. Check `healthState` (text off the body = "No target body").
+`commands/PartsGen/pulley_gen.py` (`_engrave_label_face`)
+
+### A jointed part + adapter nested in another part's component: build both at identity, joint last
+Belt-generated pulleys live inside the belt component and are revolute-jointed to its pitch circles; adding the
+3D print adapter there worked (checked live, both bore types) by building the "<pulley>_Group" at identity in
+the belt comp, passing `_add_adapter` root-context proxies (`group.createForAssemblyContext(belt_occ)`, then the
+pulley through that), and adding the revolute joint *after* -- it moves pulley + rigidly-jointed adapter together.
+The joint side must be the pulley as seen from the belt comp (`pulley.createForAssemblyContext(native_group)`).
+`commands/PartsGen/pulley_gen.py` (`create_pulley_for_belt`)
+
+### A planar-face joint (CenterKeyPoint) undoes a part's pre-placed clocking -- pass it as `JointInput.angle`
+The SplineXS pulley adapter was pre-rotated 12 deg to line up its bore; `Joints.add()` snapped it back to 0 because
+both faces' joint X axes read world X (`secondaryAxisVector` ignored the occurrence's rotation). **Fix:**
+`joint_input.angle = clock * target_n.z` -- the angle is about the joint's Z (the target face's normal, -Z for the
+pulley's bottom face), so it's the negated +Z turn. Confirmed live: transform unchanged by the joint.
+`commands/PartsGen/pulley_gen.py` (`_add_adapter`)
+
+### Combine Cut across components: add it in the *target's* component with root-context proxies
+Pocketing a pulley with a linked 3D-print adapter: `pulleyOcc.component.features.combineFeatures.createInput(
+pulleyOcc.bRepBodies.item(0), [adapter_proxy_body])`, `CutFeatureOperation`, `isKeepToolBodies = True` works with
+both occurrences inside a group component (healthy; volume drops by exactly the adapter's). Check `healthState`.
+`commands/PartsGen/pulley_gen.py` (`_add_adapter`)
+
+### A cut extrude in a new component also cuts *other* components' bodies it overlaps
+Pulleys are built at the origin; a second pulley's bore/label cuts went through the first one (and into a user's
+existing pulley), and deleting the test occurrence left broken cached-geometry cuts behind. **Fix:** always set
+`ext_in.participantBodies = [comp.bRepBodies.item(0)]` on cuts (`addSimple` can't). Test in a scratch doc
+(`app.documents.add(...)`, `close(False)`) — MCP `undo` after scripts that build several parts only partially undoes.
+`commands/PartsGen/pulley_gen.py` (`_add_bore`, `_engrave_label_face`)
+
+### WCP SplineXS geometry isn't published — measure it off WCP's own STEP
+WCP docs only give Ø0.313 (8 mm); their drawings are rasters. **Fix:** open a WCP part with the bore (e.g. WCP-1021
+SplineXS to 3D Print Adapter) and section it with `TemporaryBRepManager.planeIntersection`: 15 lands on Ø0.2808",
+involute flanks ≈ straight lines tangent to an R0.0105" bottom arc (≤0.0006" error). Offset = grow both radii, shift
+flank along its normal (stays tangent).
+`commands/PartsGen/pulley_gen.py` (`SPLINEXS_*`, `_splinexs_bore_points`)
+
+### In a big assembly every API call costs ~0.1 s -- count calls on the preview path
+Tube preview took 4.9 s in a 314-feature doc (0.9 s in a small one). **Fix:** fewer calls, not smarter geometry:
+`sketches.add(face)` already projects the face's edges (don't `project()` them again); draw geometry at its final spot
+and add dimensions only on the committed build (no `.value =`); wrap drawing in `sketch.isComputeDeferred`; merge
+sketches/features where one profile does the job (outer+inner rect -> one sketch, extrude the 2-loop profile). Profile
+with cProfile via the MCP script tool; `adsk._fusion.*` tottime shows the expensive calls. Got 4.9 s -> 1.8 s.
+`commands/PartsGen/tube_gen.py` (`_create_tube`, `_add_face_holes`)
+
+### Don't use a sketch line as a rectangular-pattern direction and flip it with a negative spacing
+Which way the pattern runs along a (projected) sketch line doesn't reliably follow start->end, and `-1 in` flipped it on
+one face but not another; instances off the body are silently dropped (health stays OK). **Fix:** draw a construction
+line from the corner pointing the way you want. Verify patterns by counting cylinder faces, not `healthState`.
+`commands/PartsGen/tube_gen.py` (`_add_face_holes`)
+
+### MCP `readOnly` scripts can still add an undo step
+Cleaning up test geometry with `fusion_mcp_update undo` once undid an empty step instead of the test script's
+transaction. **Fix:** after each undo, re-check the timeline count/names before undoing again.
+
+### `ThroughAllExtentDefinition` cuts can fail with "No target body!" -- use a sized `DistanceExtentDefinition`
+In a big assembly doc, tube seed-hole cuts from a sketch on the body's face computed as "No target body!"
+(health warning, nothing cut) whatever the direction or participantBodies; the feature pattern of that cut then
+throws `PATTERN_FEATURES_NO_PASTE_INT_EDGES`. **Fix:** a distance cut of the body's depth along the face normal
+(+ margin) works. Check `feature.healthState` after `add()` -- a failed cut doesn't raise.
+`commands/PartsGen/tube_gen.py` (`_add_face_holes`)
+
+### Hide a generated joint with `joint.isLightBulbOn = False` on the object `Joints.add()` returns
+Setting it while walking `design.allJoints` / `rootComponent.joints` throws `InternalValidationError :
+parentJointOccs` for many existing joints (nested/imported). **Fix:** set it right after `add()` on the
+returned joint -- works for root and group-component joints alike; wrap it, it's cosmetic.
+`commands/PartsGen/shaft_gen.py` (`_hide_joint`)
+
+### "Joint left the shaft unrotated" is not "joint kept it as built" when the build frame was native
+Shaft came out backwards: the profile-joint safety net saw a rotated occurrence and re-added the joint flipped,
+but the shaft had been built in the hole's native frame (entry below), so the *correct* joint rotates it by the
+plate's tilt. **Fix:** compare which side of the hole the body lies on -- raw hole read + as-built body before the
+joint, `_world_circle` + body through `transform2` after -- and only fall back to `_is_unrotated` without a hole.
+`commands/PartsGen/shaft_gen.py` (`_shaft_side`, `_create_reference_joint`)
+
+### In the live dialog a deep pick's `.geometry` comes back native -- rebuild world values from `nativeObject` + `assemblyContext.transform2`
+Bearing seats silently came out 0 (flanges sunk into the plate): the picked hole on `Hood_Group:1+Hood_Plates:1`
+reported its centre in Hood_Plates' native frame inside the dialog, while the proxy body's edges read world, so
+no rim matched. A script run never reproduces it. **Fix:** never mix proxy reads across entities; take
+`entity.nativeObject` geometry and transform it by `entity.assemblyContext.transform2` (full world transform,
+confirmed 0.0 error 3 levels deep), and run B-Rep searches on the native body with world inputs mapped back.
+`commands/PartsGen/shaft_gen.py` (`_world_xform`, `_world_circle`, `_bearing_seat_depth`)
+
+### To group generated parts in a parent component, build them inside it -- don't `moveToComponent` afterwards
+`Occurrence.moveToComponent()` on a jointed shaft + bearings reset the shaft to its pre-joint transform
+and left the bearing joints with `occurrenceOne/Two = None`. **Fix:** create the group occurrence first
+(identity transform), add children via `group.component.occurrences.addNewComponent/addByInsert`, and
+use `child.createForAssemblyContext(group)` everywhere a root-level occurrence was used -- joints,
+face proxies and `transform2` then work unchanged (Fusion files the bearing joints under the group).
+`commands/PartsGen/shaft_gen.py` (`_create_shaft`, `_insert_bearing`, `shaft_outer_occurrence`)
+
 ### Adding a library part (e.g. a bearing): insert by lineage URN, pre-place it, then use a no-op rigid joint
 `app.data.findFileById('urn:adsk.wipprod:dm.lineage:...')` (no `?version=` = latest) +
 `occurrences.addByInsert(file, identity, True)` took ~0.2 s live. Linked insert fails across projects,
-so fall back to `isReferencedComponent=False`. **Fix:** find the mating face by geometry (planar,
-circle radii, coplanar with the flange face) via `occ.childOccurrences[..].bRepBodies` (reliable
-2 levels deep); set `transform2` from `Matrix3D.setToRotateTo(n_part, n_shaft)` + translation; then
+so fall back to `isReferencedComponent=False`. **Fix:** find the mating face by generic geometry, not
+per-part radii, so one finder serves every bearing/bushing: largest circle = flange → its planar face
+at the part's axial extreme = outer flange face → smallest coplanar annulus (`loops.count >= 2`, min
+area) = bearing inner race / bushing flange face. Walk `occ.childOccurrences[..].bRepBodies` (reliable
+2 levels deep). Set `transform2` from `Matrix3D.setToRotateTo(n_part, n_shaft)` + translation; then
 `Joints.add` with `isFlipped = true_n_a · true_n_b < 0` moves nothing. Tag the occurrence with an
 attribute so Edit can delete it (deleting the shaft only cascades away the joint).
 `commands/PartsGen/shaft_gen.py` (`_add_bearing`, `_find_bearing_face`, `delete_shaft_bearings`)

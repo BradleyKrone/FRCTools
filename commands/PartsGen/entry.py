@@ -3,9 +3,12 @@ import adsk.fusion
 import os
 from ...lib import fusionAddInUtils as futil
 from ... import config
-from .shaft_gen import _create_shaft, _hex_spacer_bore_dims_cm, delete_shaft_bearings
+from .shaft_gen import (_create_shaft, _hex_spacer_bore_dims_cm, delete_shaft_bearings,
+                        shaft_outer_occurrence, BEARING_NONE, bearing_choices, bearing_part_name)
 from .tube_gen import _create_tube
-from .pulley_gen import _create_pulley
+from .pulley_gen import (_create_pulley, BORE_HALF_HEX, BORE_TYPES, BORE_OFFSET_DEFAULT_IN,
+                         ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
+                         PULLEY_BELT_WIDTH_ITEMS, pulley_outer_occurrence)
 from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
 from .sprocket_gen import _create_sprocket
 from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
@@ -108,13 +111,8 @@ LEN_CUSTOM = 'Custom Length'
 JOINT_REVOLUTE = 'Revolute (Spins Freely)'
 JOINT_RIGID    = 'Rigid (Fixed)'
 
-# Optional WCP-0785 bearings on a 1/2" hex shaft's ends. Must match shaft_gen.py's
-# BEARING_* exactly -- both files independently read/write the same list-item names.
-BEARING_NONE  = 'None'
-BEARING_BOTH  = 'Both Ends'
-BEARING_REF   = 'Reference End Only'
-BEARING_FACE2 = 'Face 2 End Only'
-BEARING_CHOICES = (BEARING_NONE, BEARING_BOTH, BEARING_REF, BEARING_FACE2)
+# The shaft's optional "Add Bearing" parts (BEARING_NONE, bearing_choices,
+# bearing_part_name) are defined once in shaft_gen.py's BEARING_PARTS table.
 
 # ---------------------------------------------------------------------------
 # Edit command  (shown only via the right-click marking menu)
@@ -146,7 +144,9 @@ ATTR_BELT_WIDTH        = 'belt_width_expr'
 ATTR_BELT_SUPPRESS     = 'belt_suppress_teeth'
 ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
-ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+ATTR_BELT_BORE_TYPE    = 'belt_pulley_bore_type'
+ATTR_BELT_BORE_OFFSET  = 'belt_pulley_bore_offset'
+ATTR_BELT_ADAPTER      = 'belt_pulley_adapter'
 
 ATTR_SPROCKET_TOOTH_COUNT = 'sprocket_tooth_count'
 ATTR_SPROCKET_WIDTH       = 'sprocket_width_expr'
@@ -227,36 +227,186 @@ def stop():
 # command_created  –  build the dialog
 # ===========================================================================
 
-def _add_bearing_ends_input(placeInputs: adsk.core.CommandInputs, selected: str):
-    """Add the shaft's 'Bearings' dropdown (shared by the create and edit dialogs)."""
+def _add_bearing_ends_input(placeInputs: adsk.core.CommandInputs, selected: str,
+                            shaft_type: str):
+    """Add the shaft's 'Add Bearing' dropdown (shared by the create and edit dialogs)."""
     bearingEndsInp = placeInputs.addDropDownCommandInput(
-        'bearing_ends', 'Bearings (WCP-0785)', adsk.core.DropDownStyles.TextListDropDownStyle
+        'bearing_ends', 'Add Bearing', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    for name in BEARING_CHOICES:
-        bearingEndsInp.listItems.add(name, name == selected, '')
-    bearingEndsInp.tooltip = ('Add WCP-0785 1/2" hex flanged bearings to the shaft ends, '
+    bearingEndsInp.tooltip = ('Add a flanged bearing or bushing to both ends of the shaft, '
                               'rigidly jointed with the flange flush to the shaft end')
+    _refresh_bearing_items(bearingEndsInp, shaft_type, bearing_part_name(selected))
     return bearingEndsInp
 
 
+def _refresh_bearing_items(bearingEndsInp: adsk.core.DropDownCommandInput, shaft_type: str,
+                           selected: str = None):
+    """Refill the 'Add Bearing' list with the parts that fit `shaft_type`, keeping the
+    current pick (or `selected`) when it still fits, else falling back to None."""
+    if selected is None:
+        item = bearingEndsInp.selectedItem
+        selected = item.name if item is not None else BEARING_NONE
+    choices = bearing_choices(shaft_type)
+    if selected not in choices:
+        selected = BEARING_NONE
+    bearingEndsInp.listItems.clear()
+    for name in choices:
+        bearingEndsInp.listItems.add(name, name == selected, '')
+
+
 def _add_dialog_groups(inputs: adsk.core.CommandInputs):
-    """Add the dialog's two groups and return their child collections.
+    """Add the dialog's three groups and return their child collections.
 
     "Part" holds what to build (type, name, size, length); "Placement" holds where it goes
-    (reference picks, direction, joint). Inputs live inside the groups, but itemById on the
-    command's top-level inputs still finds them -- in inputChanged, though, `args.inputs` is
-    only the changed input's own group, so look inputs up from the command instead.
+    (joint, reference picks, direction, bearings); "Display" holds preview-only options.
+    Inputs live inside the groups, but itemById on the command's top-level inputs still
+    finds them -- in inputChanged, though, `args.inputs` is only the changed input's own
+    group, so look inputs up from the command instead.
     """
     partGroup = inputs.addGroupCommandInput('part_group', 'Part')
     partGroup.isExpanded = True
     placeGroup = inputs.addGroupCommandInput('placement_group', 'Placement')
     placeGroup.isExpanded = True
-    return partGroup.children, placeGroup.children
+    displayGroup = inputs.addGroupCommandInput('display_group', 'Display')
+    displayGroup.isExpanded = True
+    return partGroup.children, placeGroup.children, displayGroup.children
+
+
+def _add_pulley_belt_width_input(partInputs: adsk.core.CommandInputs,
+                                 width_name: str, visible: bool):
+    """Add the Timing Pulley's Belt Width dropdown (shared by the create and edit dialogs).
+    A saved width that isn't one of the options (older pulleys) falls back to the first."""
+    beltWidthInp = partInputs.addDropDownCommandInput(
+        'belt_width', 'Belt Width', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in PULLEY_BELT_WIDTH_ITEMS:
+        beltWidthInp.listItems.add(name, name == width_name, '')
+    if beltWidthInp.selectedItem is None:
+        beltWidthInp.listItems.item(0).isSelected = True
+    beltWidthInp.isVisible = visible
+
+
+def _add_pulley_bore_inputs(partInputs: adsk.core.CommandInputs,
+                            bore_type: str, offset_expr: str, visible: bool,
+                            adapter: bool = False):
+    """Add the Timing Pulley's Bore Type dropdown, Bore Offset input and 3D Print Adapter
+    checkbox (shared by the create and edit dialogs)."""
+    boreTypeInp = partInputs.addDropDownCommandInput(
+        'pulley_bore_type', 'Bore', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in BORE_TYPES:
+        boreTypeInp.listItems.add(name, name == bore_type, '')
+    if boreTypeInp.selectedItem is None:
+        boreTypeInp.listItems.item(0).isSelected = True
+    boreTypeInp.isVisible = visible
+
+    boreOffsetInp = partInputs.addValueInput(
+        'pulley_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(offset_expr)
+    )
+    boreOffsetInp.tooltip = ('Added to every side of the bore: positive = looser, '
+                             'negative = tighter.')
+    boreOffsetInp.isVisible = visible
+
+    adapterInp = partInputs.addBoolValueInput('pulley_adapter', '3D Print Adapter', True, '',
+                                              adapter)
+    adapterInp.tooltip = ('Press a 3D-printed hub adapter into the bottom of the pulley: '
+                          'WCP-1121 for 1/2" Hex, WCP-1021 for SplineXS. The pulley is '
+                          'pocketed to fit it, and both are placed in their own group.')
+    adapterInp.isVisible = visible
+
+
+def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
+                     belt_type: str = 'HTD 5mm Pitch',
+                     width_name: str = PULLEY_BELT_WIDTH_ITEMS[0],
+                     suppress_teeth: bool = True, belt_type_enabled: bool = False,
+                     gen_pulleys: bool = True, pulley_teeth: bool = False,
+                     bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
+                     bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
+                     adapters=(False, False)):
+    """Add the Timing Belt's "Belt", "Pulleys", "Pulley 1" and "Pulley 2" groups (shared
+    by the create and edit dialogs). The one Width dropdown sizes both the belt and its
+    generated pulleys, and the pulley options mirror the Timing Pulley part's, with Bore
+    and 3D Print Adapter chosen per pulley. command_input_changed shows the groups only
+    for Timing Belt, and the pulley options only with Generate Pulleys on."""
+    beltGroup = inputs.addGroupCommandInput('belt_group', 'Belt')
+    beltGroup.isExpanded = True
+    beltGroup.isVisible  = visible
+    beltInputs = beltGroup.children
+
+    tbCirclesInp = beltInputs.addSelectionInput(
+        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
+    )
+    tbCirclesInp.addSelectionFilter('SketchCurves')
+    tbCirclesInp.setSelectionLimits(2 if visible else 0, 2)
+
+    tbBeltTypeInp = beltInputs.addDropDownCommandInput(
+        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', belt_type == 'HTD 5mm Pitch', '')
+    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', belt_type == 'GT2 3mm Pitch', '')
+    if tbBeltTypeInp.selectedItem is None:
+        tbBeltTypeInp.listItems.item(0).isSelected = True
+    tbBeltTypeInp.isEnabled = belt_type_enabled
+
+    tbBeltWidthInp = beltInputs.addDropDownCommandInput(
+        'tb_belt_width', 'Width', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in PULLEY_BELT_WIDTH_ITEMS:
+        tbBeltWidthInp.listItems.add(name, name == width_name, '')
+    if tbBeltWidthInp.selectedItem is None:
+        tbBeltWidthInp.listItems.item(0).isSelected = True
+    tbBeltWidthInp.tooltip = 'Belt width -- the generated pulleys are made to match.'
+
+    beltInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '',
+                                 suppress_teeth)
+
+    pulleyGroup = inputs.addGroupCommandInput('belt_pulley_group', 'Pulleys')
+    pulleyGroup.isExpanded = True
+    pulleyGroup.isVisible  = visible
+    pulleyInputs = pulleyGroup.children
+
+    pulleyInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', gen_pulleys)
+    tbPulleyTeethInp = pulleyInputs.addBoolValueInput('tb_pulley_teeth', 'Show Teeth', True, '',
+                                                      pulley_teeth)
+    tbPulleyTeethInp.isVisible = gen_pulleys
+
+    boreOffsetInp = pulleyInputs.addValueInput(
+        'tb_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(bore_offset_expr)
+    )
+    boreOffsetInp.tooltip = ('Added to every side of both pulleys\' bores: positive = looser, '
+                             'negative = tighter.')
+    boreOffsetInp.isVisible = gen_pulleys
+
+    # One group per pulley so each can have its own bore (and adapter, which depends on
+    # the bore). Input names can't change at runtime, so the group says which End Circle.
+    for i in (1, 2):
+        group = inputs.addGroupCommandInput(
+            f'belt_pulley{i}_group',
+            f'Pulley {i} ({"first" if i == 1 else "second"} End Circle)')
+        group.isExpanded = True
+        group.isVisible  = visible and gen_pulleys
+        children = group.children
+
+        boreTypeInp = children.addDropDownCommandInput(
+            f'tb_bore_type_{i}', 'Bore', adsk.core.DropDownStyles.TextListDropDownStyle
+        )
+        for name in BORE_TYPES:
+            boreTypeInp.listItems.add(name, name == bore_types[i - 1], '')
+        if boreTypeInp.selectedItem is None:
+            boreTypeInp.listItems.item(0).isSelected = True
+
+        adapterInp = children.addBoolValueInput(f'tb_adapter_{i}', '3D Print Adapter', True,
+                                                '', adapters[i - 1])
+        adapterInp.tooltip = ('Press a 3D-printed hub adapter into the bottom of this pulley: '
+                              'WCP-1121 for 1/2" Hex, WCP-1021 for SplineXS. The pulley is '
+                              'pocketed to fit it, and both are placed in their own group.')
 
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
-    partInputs, placeInputs = _add_dialog_groups(inputs)
+    partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
 
     # --- Part type -----------------------------------------------------------
     partTypeInp = partInputs.addDropDownCommandInput(
@@ -348,6 +498,19 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     lenTypeInp.listItems.add(LEN_FACES, True, '')
     lenTypeInp.listItems.add(LEN_CUSTOM, False, '')
 
+    customLenInp = partInputs.addValueInput(
+        'custom_length', 'Length', 'in',
+        adsk.core.ValueInput.createByString('6 in')
+    )
+    customLenInp.isVisible = False
+
+    # --- Placement group -----------------------------------------------------
+    # Order: Create Joint, Reference Face/Point, Face 2, Reverse Direction, Joint Type,
+    # Flip, Add Bearing.
+    createJointInp = placeInputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', True)
+    createJointInp.isVisible = True
+
     # Face 1 -- used only by Tube now. Shaft uses Reference Point instead (below): a
     # face's own "center" is its area centroid, which is wrong for any face that isn't
     # fully symmetric (e.g. a plate face with other holes in it), so Shaft needs an
@@ -383,11 +546,6 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     face2Sel.setSelectionLimits(1, 1)
     face2Sel.isVisible = True
 
-    customLenInp = partInputs.addValueInput(
-        'custom_length', 'Length', 'in',
-        adsk.core.ValueInput.createByString('6 in')
-    )
-
     # Custom Length has no Face 2 to derive an extrude direction from, so once a Reference
     # Point is picked (to place the shaft and/or joint it), which way the sketch plane's own
     # normal happens to point is arbitrary -- this is a plain manual override for that, same
@@ -395,14 +553,6 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     reverseDirInp = placeInputs.addBoolValueInput(
         'reverse_direction', 'Reverse Direction', True, '', False)
     reverseDirInp.isVisible = False
-
-    highlightRefFaceInp = placeInputs.addBoolValueInput(
-        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
-    customLenInp.isVisible = False
-
-    createJointInp = placeInputs.addBoolValueInput(
-        'create_joint', 'Create Joint at Reference Face', True, '', True)
-    createJointInp.isVisible = True
 
     jointTypeInp = placeInputs.addDropDownCommandInput(
         'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
@@ -417,7 +567,11 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     flipJointInp = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
     flipJointInp.isVisible = True
 
-    _add_bearing_ends_input(placeInputs, BEARING_NONE)
+    _add_bearing_ends_input(placeInputs, BEARING_NONE, shaftTypeInp.selectedItem.name)
+
+    # --- Display group -------------------------------------------------------
+    displayInputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = partInputs.addDropDownCommandInput(
@@ -434,51 +588,15 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     toothCountInp.isVisible = False
 
-    beltWidthInp = partInputs.addValueInput(
-        'belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString('0.394 in')
-    )
-    beltWidthInp.isVisible = False
+    _add_pulley_belt_width_input(partInputs, PULLEY_BELT_WIDTH_ITEMS[0], False)
 
     pulleyShowTeethInp = partInputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
     pulleyShowTeethInp.isVisible = False
 
-    # --- Timing Belt group ---------------------------------------------------
-    tbCirclesInp = partInputs.addSelectionInput(
-        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
-    )
-    tbCirclesInp.addSelectionFilter('SketchCurves')
-    tbCirclesInp.setSelectionLimits(0, 2)
-    tbCirclesInp.isVisible = False
+    _add_pulley_bore_inputs(partInputs, BORE_HALF_HEX, f'{BORE_OFFSET_DEFAULT_IN} in', False)
 
-    tbBeltTypeInp = partInputs.addDropDownCommandInput(
-        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
-    )
-    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', True,  '')
-    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', False, '')
-    tbBeltTypeInp.isEnabled = False
-    tbBeltTypeInp.isVisible = False
-
-    tbBeltWidthInp = partInputs.addValueInput(
-        'tb_belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString('9')
-    )
-    tbBeltWidthInp.isVisible = False
-
-    tbSuppressInp = partInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', True)
-    tbSuppressInp.isVisible = False
-
-    tbGenPulleysInp = partInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', True)
-    tbGenPulleysInp.isVisible = False
-
-    tbPulleyTeethInp = partInputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', False)
-    tbPulleyTeethInp.isVisible = False
-
-    tbPulleyWidthInp = partInputs.addValueInput(
-        'tb_pulley_width', 'Pulley Width', 'mm',
-        adsk.core.ValueInput.createByString('0.394 in')
-    )
-    tbPulleyWidthInp.isVisible = False
+    # --- Timing Belt ("Belt" and "Pulleys" groups) ----------------------------
+    _add_belt_groups(inputs, False)
 
     # --- Chain Sprocket group ------------------------------------------------
     sprocketToothCountInp = partInputs.addValueInput(
@@ -563,14 +681,9 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     refPointSel:    adsk.core.SelectionCommandInput  = inputs.itemById('ref_point_selection')
     beltTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('belt_type')
     toothCountInp:  adsk.core.ValueCommandInput      = inputs.itemById('tooth_count')
-    beltWidthInp:   adsk.core.ValueCommandInput      = inputs.itemById('belt_width')
+    beltWidthInp:   adsk.core.DropDownCommandInput   = inputs.itemById('belt_width')
     tbCirclesInp:   adsk.core.SelectionCommandInput  = inputs.itemById('tb_pitch_circles')
-    tbBeltTypeInp:  adsk.core.DropDownCommandInput   = inputs.itemById('tb_belt_type')
-    tbBeltWidthInp: adsk.core.ValueCommandInput      = inputs.itemById('tb_belt_width')
-    tbSuppressInp:       adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
     tbGenPulleysInp:     adsk.core.BoolValueCommandInput = inputs.itemById('tb_gen_pulleys')
-    tbPulleyTeethInp:    adsk.core.BoolValueCommandInput = inputs.itemById('tb_pulley_teeth')
-    tbPulleyWidthInp:    adsk.core.ValueCommandInput     = inputs.itemById('tb_pulley_width')
     pulleyShowTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
 
     part_type        = partTypeInp.selectedItem.name
@@ -627,22 +740,23 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     beltWidthInp.isVisible   = part_is_pulley
     if pulleyShowTeethInp is not None:
         pulleyShowTeethInp.isVisible = part_is_pulley
+    for bore_inp_id in ('pulley_bore_type', 'pulley_bore_offset', 'pulley_adapter'):
+        bore_inp = inputs.itemById(bore_inp_id)
+        if bore_inp is not None:
+            bore_inp.isVisible = part_is_pulley
 
-    # Timing Belt inputs
-    if tbCirclesInp is not None:
-        tbCirclesInp.isVisible  = part_is_belt
-    if tbBeltTypeInp is not None:
-        tbBeltTypeInp.isVisible = part_is_belt
-    if tbBeltWidthInp is not None:
-        tbBeltWidthInp.isVisible = part_is_belt
-    if tbSuppressInp is not None:
-        tbSuppressInp.isVisible = part_is_belt
-    if tbGenPulleysInp is not None:
-        tbGenPulleysInp.isVisible = part_is_belt
-    if tbPulleyTeethInp is not None:
-        tbPulleyTeethInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
-    if tbPulleyWidthInp is not None:
-        tbPulleyWidthInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
+    # Timing Belt groups -- the pulley options only matter when pulleys are generated
+    gen_pulleys = tbGenPulleysInp is not None and tbGenPulleysInp.value
+    for group_id, show in (('belt_group', part_is_belt), ('belt_pulley_group', part_is_belt),
+                           ('belt_pulley1_group', part_is_belt and gen_pulleys),
+                           ('belt_pulley2_group', part_is_belt and gen_pulleys)):
+        group = inputs.itemById(group_id)
+        if group is not None:
+            group.isVisible = show
+    for pulley_inp_id in ('tb_pulley_teeth', 'tb_bore_offset'):
+        pulley_inp = inputs.itemById(pulley_inp_id)
+        if pulley_inp is not None:
+            pulley_inp.isVisible = gen_pulleys
 
     # Chain Sprocket inputs
     sprocketToothCountInp = inputs.itemById('sprocket_tooth_count')
@@ -677,9 +791,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
     # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
-    placeGroup = inputs.itemById('placement_group')
-    if placeGroup is not None:
-        placeGroup.isVisible = not hide_length
+    for group_id in ('placement_group', 'display_group'):
+        group = inputs.itemById(group_id)
+        if group is not None:
+            group.isVisible = not hide_length
     face1Sel.isVisible    = not hide_length and is_between_faces and part_is_tube
     # Reference Point is required in Between-Two-Faces (positions the shaft). In Custom
     # Length it only exists to give the joint below a target, so it's shown only while
@@ -713,11 +828,15 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     if flipJointInp is not None:
         flipJointInp.isVisible = show_joint_options
 
-    # Bearings are WCP-0785s, which only fit 1/2" hex.
+    # "Add Bearing" lists only the parts that fit the chosen shaft type, and hides when no
+    # part fits it at all.
     bearingEndsInp = inputs.itemById('bearing_ends')
     if bearingEndsInp is not None:
+        shaft_type_name = shaftTypeInp.selectedItem.name
+        if args.input.id == 'shaft_type':
+            _refresh_bearing_items(bearingEndsInp, shaft_type_name)
         bearingEndsInp.isVisible = (not hide_length and part_is_shaft
-                                    and shaftTypeInp.selectedItem.name == SHAFT_HALF_HEX)
+                                    and len(bearing_choices(shaft_type_name)) > 1)
 
     # Sync selection limits with visibility
     if not hide_length and is_between_faces and part_is_tube:
@@ -811,7 +930,9 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
         elif part_type == PART_TUBE:
             ref_face = _create_tube(inputs, constrain=not is_preview)
         elif part_type == PART_PULLEY:
-            _create_pulley(inputs)
+            # The pulley reports its own errors (quietly in preview) and returns False.
+            if not _create_pulley(inputs, is_preview=is_preview):
+                return False, None
         elif part_type == PART_SPROCKET:
             _create_sprocket(inputs)
         elif part_type == PART_CHAIN:
@@ -834,8 +955,14 @@ def command_preview(args: adsk.core.CommandEventArgs):
     part_type = partTypeInp.selectedItem.name
     if part_type == PART_BELT:
         _create_belt(inputs, is_preview=True)
+        # A toothless-belt preview is the full result -- unless its pulleys need 3D print
+        # adapters, which the preview skips (a cloud insert per tick).
         suppressTeethInp = inputs.itemById('tb_suppress_teeth')
-        if suppressTeethInp and suppressTeethInp.value:
+        genPulleysInp    = inputs.itemById('tb_gen_pulleys')
+        belt_adapter = (genPulleysInp is not None and genPulleysInp.value
+                        and any(inputs.itemById(f'tb_adapter_{i}') is not None
+                                and inputs.itemById(f'tb_adapter_{i}').value for i in (1, 2)))
+        if suppressTeethInp and suppressTeethInp.value and not belt_adapter:
             args.isValidResult = True
         _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
@@ -848,7 +975,12 @@ def command_preview(args: adsk.core.CommandEventArgs):
         ok, ref_face = _run_part_creation(inputs, show_message_box=False, is_preview=True)
         # A shaft/tube preview skips sketch constraining to stay responsive, so it must
         # not be reused as the result — let command_execute rebuild it fully constrained.
-        args.isValidResult = ok and part_type not in (PART_SHAFT, PART_TUBE)
+        # Likewise a pulley preview skips its 3D print adapter (a cloud insert per tick).
+        adapterInp = inputs.itemById('pulley_adapter')
+        pulley_adapter = (part_type == PART_PULLEY and adapterInp is not None
+                          and adapterInp.value)
+        args.isValidResult = (ok and part_type not in (PART_SHAFT, PART_TUBE)
+                              and not pulley_adapter)
         highlightRefFaceInp = inputs.itemById('highlight_ref_face')
         highlight_enabled = highlightRefFaceInp is None or highlightRefFaceInp.value
         try:
@@ -883,11 +1015,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # --- Timing Pulley validation -------------------------------------------
     if part_type == PART_PULLEY:
         toothCountInp:  adsk.core.ValueCommandInput     = inputs.itemById('tooth_count')
-        beltWidthInp:   adsk.core.ValueCommandInput     = inputs.itemById('belt_width')
+        beltWidthInp:   adsk.core.DropDownCommandInput  = inputs.itemById('belt_width')
         if toothCountInp is None or toothCountInp.value < 8:
             args.areInputsValid = False
             return
-        if beltWidthInp is None or beltWidthInp.value <= 0:
+        if beltWidthInp is None or beltWidthInp.selectedItem is None:
+            args.areInputsValid = False
+            return
+        # Bore offset is per side; keep it to a sane clearance/interference range.
+        boreOffsetInp = inputs.itemById('pulley_bore_offset')
+        if boreOffsetInp is not None and abs(boreOffsetInp.value) > 0.05 * 2.54:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -909,11 +1046,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # --- Timing Belt validation ---------------------------------------------
     if part_type == PART_BELT:
         tbCirclesInp:   adsk.core.SelectionCommandInput = inputs.itemById('tb_pitch_circles')
-        tbBeltWidthInp: adsk.core.ValueCommandInput     = inputs.itemById('tb_belt_width')
+        tbBeltWidthInp: adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_width')
         if tbCirclesInp is None or tbCirclesInp.selectionCount < 2:
             args.areInputsValid = False
             return
-        if tbBeltWidthInp is None or tbBeltWidthInp.value <= 0:
+        if tbBeltWidthInp is None or tbBeltWidthInp.selectedItem is None:
+            args.areInputsValid = False
+            return
+        # Same per-side bore offset range as the Timing Pulley.
+        tbBoreOffsetInp = inputs.itemById('tb_bore_offset')
+        if tbBoreOffsetInp is not None and abs(tbBoreOffsetInp.value) > 0.05 * 2.54:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -1337,9 +1479,12 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_TUBE_WIDTH, ATTR_TUBE_HEIGHT, ATTR_TUBE_THICK, ATTR_CUSTOM_THICK,
                     ATTR_ADD_HOLES, ATTR_HOLE_SIZE, ATTR_HOLE_DIAM, ATTR_LEN_EXPR,
                     ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_TOOTH_COUNT, ATTR_PULLEY_BELT_WIDTH,
-                    ATTR_PULLEY_SHOW_TEETH,
+                    ATTR_PULLEY_SHOW_TEETH, ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET,
+                    ATTR_PULLEY_ADAPTER,
                     ATTR_BELT_TYPE, ATTR_BELT_WIDTH, ATTR_BELT_SUPPRESS,
-                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_PULLEY_WIDTH,
+                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_BORE_TYPE,
+                    ATTR_BELT_BORE_OFFSET, ATTR_BELT_ADAPTER,
+                    *(f'{k}_{i}' for k in (ATTR_BELT_BORE_TYPE, ATTR_BELT_ADAPTER) for i in (1, 2)),
                     ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
@@ -1385,14 +1530,30 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     hole_diam_expr  = _s(ATTR_HOLE_DIAM,          '0.25 in')
     pulley_belt       = _s(ATTR_PULLEY_BELT_TYPE,   'HTD 5mm Pitch')
     pulley_teeth      = _s(ATTR_PULLEY_TOOTH_COUNT, '18')
-    pulley_width      = _s(ATTR_PULLEY_BELT_WIDTH,  '0.394 in')
+    pulley_width      = _s(ATTR_PULLEY_BELT_WIDTH,  PULLEY_BELT_WIDTH_ITEMS[0])
     pulley_show_teeth = _b(ATTR_PULLEY_SHOW_TEETH,  False)
+    pulley_adapter    = _b(ATTR_PULLEY_ADAPTER,     False)
+    pulley_bore_type  = _s(ATTR_PULLEY_BORE_TYPE,   BORE_HALF_HEX)
+    pulley_bore_off   = _s(ATTR_PULLEY_BORE_OFFSET, f'{BORE_OFFSET_DEFAULT_IN} in')
     belt_type_val     = _s(ATTR_BELT_TYPE,          'HTD 5mm Pitch')
     belt_width_val    = _s(ATTR_BELT_WIDTH,         '9 mm')
     belt_suppress     = _b(ATTR_BELT_SUPPRESS,       False)
     belt_gen_pulleys  = _b(ATTR_BELT_GEN_PULLEYS,   True)
     belt_pulley_teeth = _b(ATTR_BELT_PULLEY_TEETH,  False)
-    belt_pulley_width = _s(ATTR_BELT_PULLEY_WIDTH,  '0.394 in')
+    belt_bore_off     = _s(ATTR_BELT_BORE_OFFSET,   f'{BORE_OFFSET_DEFAULT_IN} in')
+    # Per-pulley bore/adapter; belts saved before that fall back to the one shared value.
+    belt_bore_types   = tuple(_s(f'{ATTR_BELT_BORE_TYPE}_{i}', _s(ATTR_BELT_BORE_TYPE, BORE_HALF_HEX))
+                              for i in (1, 2))
+    belt_adapters     = tuple(_b(f'{ATTR_BELT_ADAPTER}_{i}', _b(ATTR_BELT_ADAPTER, False))
+                              for i in (1, 2))
+    # Older belts stored a free-typed width expression ('9', '9 mm'); map it onto the
+    # Width dropdown (falls back to its first item when it isn't one of the options).
+    try:
+        belt_width_mm = round(adsk.fusion.Design.cast(app.activeProduct).unitsManager
+                              .evaluateExpression(belt_width_val, 'mm') * 10)
+        belt_width_name = f'{belt_width_mm} mm'
+    except Exception:
+        belt_width_name = PULLEY_BELT_WIDTH_ITEMS[0]
     sprocket_teeth    = _s(ATTR_SPROCKET_TOOTH_COUNT, '12')
     sprocket_width_val = _s(ATTR_SPROCKET_WIDTH,     '0.375 in')
     sprocket_show_teeth_val = _b(ATTR_SPROCKET_SHOW_TEETH, False)
@@ -1420,10 +1581,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     keep_ref_point = is_shaft and edit_ref_point is not None
     _edit_ref_entities = (edit_ref_point, edit_face2) if keep_ref_point else None
 
-    # Same two groups as the create dialog (see command_created).
+    # Same three groups as the create dialog (see command_created).
     has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
-    partInputs, placeInputs = _add_dialog_groups(inputs)
+    partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
     inputs.itemById('placement_group').isVisible = has_len
+    inputs.itemById('display_group').isVisible = has_len
 
     # --- Part type ---
     partTypeInp = partInputs.addDropDownCommandInput(
@@ -1523,52 +1685,20 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     )
     toothCountInp.isVisible = is_pulley
 
-    beltWidthInp = partInputs.addValueInput(
-        'belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString(pulley_width)
-    )
-    beltWidthInp.isVisible = is_pulley
+    _add_pulley_belt_width_input(partInputs, pulley_width, is_pulley)
 
     pulleyShowTeethInp = partInputs.addBoolValueInput(
         'pulley_show_teeth', 'Show Teeth', True, '', pulley_show_teeth)
     pulleyShowTeethInp.isVisible = is_pulley
 
-    # --- Timing Belt group — circles must be re-selected; other values pre-filled ---
-    tbCirclesInp = partInputs.addSelectionInput(
-        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
-    )
-    tbCirclesInp.addSelectionFilter('SketchCurves')
-    tbCirclesInp.setSelectionLimits(0, 2)
-    tbCirclesInp.isVisible = is_belt
+    _add_pulley_bore_inputs(partInputs, pulley_bore_type, pulley_bore_off, is_pulley,
+                            pulley_adapter)
 
-    tbBeltTypeInp = partInputs.addDropDownCommandInput(
-        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
-    )
-    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', belt_type_val == 'HTD 5mm Pitch', '')
-    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', belt_type_val == 'GT2 3mm Pitch', '')
-    tbBeltTypeInp.isEnabled = True   # always enabled in edit mode (no CCLine auto-lock)
-    tbBeltTypeInp.isVisible = is_belt
-
-    tbBeltWidthInp = partInputs.addValueInput(
-        'tb_belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString(belt_width_val)
-    )
-    tbBeltWidthInp.isVisible = is_belt
-
-    tbSuppressInp = partInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', belt_suppress)
-    tbSuppressInp.isVisible = is_belt
-
-    tbGenPulleysInp = partInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', belt_gen_pulleys)
-    tbGenPulleysInp.isVisible = is_belt
-
-    tbPulleyTeethInp = partInputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', belt_pulley_teeth)
-    tbPulleyTeethInp.isVisible = is_belt and belt_gen_pulleys
-
-    tbPulleyWidthInp = partInputs.addValueInput(
-        'tb_pulley_width', 'Pulley Width', 'mm',
-        adsk.core.ValueInput.createByString(belt_pulley_width)
-    )
-    tbPulleyWidthInp.isVisible = is_belt and belt_gen_pulleys
+    # --- Timing Belt groups — circles must be re-selected; other values pre-filled ---
+    # Belt type is always enabled in edit mode (no CCLine auto-lock).
+    _add_belt_groups(inputs, is_belt, belt_type_val, belt_width_name, belt_suppress, True,
+                     belt_gen_pulleys, belt_pulley_teeth, belt_bore_off, belt_bore_types,
+                     belt_adapters)
 
     # --- Chain Sprocket group ---
     sprocketToothCountInp = partInputs.addValueInput(
@@ -1628,6 +1758,20 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     lenTypeInp.listItems.add(LEN_CUSTOM, not keep_faces,  '')
     lenTypeInp.isVisible = has_len
 
+    customLenInp = partInputs.addValueInput(
+        'custom_length', 'Length', 'in',
+        adsk.core.ValueInput.createByString(len_expr)
+    )
+    customLenInp.isVisible = has_len and not keep_faces
+
+    # Placement order matches the create dialog (see command_created).
+    # Reference-face joint -- offered for a Shaft in either length mode (matches the create
+    # dialog); actually creating one still needs a Reference Point pick, enforced the same
+    # way as the create dialog in command_validate_input.
+    createJointInpEdit = placeInputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', create_joint_val)
+    createJointInpEdit.isVisible = is_shaft
+
     face1Sel = placeInputs.addSelectionInput(
         'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
@@ -1659,26 +1803,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     face2Sel.setSelectionLimits(0, 1)
     face2Sel.isVisible = keep_faces
 
-    customLenInp = partInputs.addValueInput(
-        'custom_length', 'Length', 'in',
-        adsk.core.ValueInput.createByString(len_expr)
-    )
-    customLenInp.isVisible = has_len and not keep_faces
-
     reverseDirInpEdit = placeInputs.addBoolValueInput(
         'reverse_direction', 'Reverse Direction', True, '', reverse_dir_val)
     reverseDirInpEdit.isVisible = has_len and not keep_faces and is_shaft
-
-    highlightRefFaceInpEdit = placeInputs.addBoolValueInput(
-        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
-    highlightRefFaceInpEdit.isVisible = has_len
-
-    # Reference-face joint -- offered for a Shaft in either length mode (matches the create
-    # dialog); actually creating one still needs a Reference Point pick, enforced the same
-    # way as the create dialog in command_validate_input.
-    createJointInpEdit = placeInputs.addBoolValueInput(
-        'create_joint', 'Create Joint at Reference Face', True, '', create_joint_val)
-    createJointInpEdit.isVisible = is_shaft
 
     jointTypeInpEdit = placeInputs.addDropDownCommandInput(
         'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
@@ -1690,8 +1817,12 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     flipJointInpEdit = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
     flipJointInpEdit.isVisible = is_shaft and create_joint_val
 
-    bearingEndsInpEdit = _add_bearing_ends_input(placeInputs, bearing_ends_val)
-    bearingEndsInpEdit.isVisible = has_len and is_shaft and shaft_type == SHAFT_HALF_HEX
+    bearingEndsInpEdit = _add_bearing_ends_input(placeInputs, bearing_ends_val, shaft_type)
+    bearingEndsInpEdit.isVisible = has_len and is_shaft and len(bearing_choices(shaft_type)) > 1
+
+    highlightRefFaceInpEdit = displayInputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
+    highlightRefFaceInpEdit.isVisible = has_len
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)
@@ -1710,14 +1841,18 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     global _edit_target_occ, _edit_ref_entities
 
     if _edit_target_occ:
-        # A shaft's bearings are separate root occurrences -- deleting the shaft only
-        # cascades away their joints -- so remove them first; the rebuild re-adds them.
+        # A shaft built with bearings lives in a "<shaft>_Group" with them, so delete the
+        # whole group. Older shafts have their bearings as separate root occurrences --
+        # deleting the shaft only cascades away their joints -- so remove those first; the
+        # rebuild re-adds them either way.
         try:
             delete_shaft_bearings(_edit_target_occ.component)
         except Exception:
             futil.log('PartsGen edit: could not delete old shaft bearings')
         try:
-            _edit_target_occ.deleteMe()
+            # A shaft's or pulley's group (bearings / adapter included), else the part.
+            outer = pulley_outer_occurrence(shaft_outer_occurrence(_edit_target_occ))
+            outer.deleteMe()
         except Exception:
             futil.log('PartsGen edit: could not delete old occurrence')
         _edit_target_occ = None
