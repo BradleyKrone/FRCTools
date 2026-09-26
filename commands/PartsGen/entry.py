@@ -218,11 +218,27 @@ def stop():
 # command_created  –  build the dialog
 # ===========================================================================
 
+def _add_dialog_groups(inputs: adsk.core.CommandInputs):
+    """Add the dialog's two groups and return their child collections.
+
+    "Part" holds what to build (type, name, size, length); "Placement" holds where it goes
+    (reference picks, direction, joint). Inputs live inside the groups, but itemById on the
+    command's top-level inputs still finds them -- in inputChanged, though, `args.inputs` is
+    only the changed input's own group, so look inputs up from the command instead.
+    """
+    partGroup = inputs.addGroupCommandInput('part_group', 'Part')
+    partGroup.isExpanded = True
+    placeGroup = inputs.addGroupCommandInput('placement_group', 'Placement')
+    placeGroup.isExpanded = True
+    return partGroup.children, placeGroup.children
+
+
 def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
+    partInputs, placeInputs = _add_dialog_groups(inputs)
 
     # --- Part type -----------------------------------------------------------
-    partTypeInp = inputs.addDropDownCommandInput(
+    partTypeInp = partInputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     partTypeInp.listItems.add(PART_SHAFT,    True,  '')
@@ -233,11 +249,11 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_CHAIN,   False, '')
 
     # --- Component name (optional override; blank = auto-generated name) -----
-    customNameInp = inputs.addStringValueInput('custom_name', 'Component Name', '')
+    customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', '')
     customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---------------------------------------------------------
-    shaftTypeInp = inputs.addDropDownCommandInput(
+    shaftTypeInp = partInputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     shaftTypeInp.listItems.add(SHAFT_HALF_HEX, True, '')
@@ -247,32 +263,32 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_SPACER, False, '')
     shaftTypeInp.listItems.add(SHAFT_CUSTOM, False, '')
 
-    customOD = inputs.addValueInput(
+    customOD = partInputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
         adsk.core.ValueInput.createByString('0.75 in')
     )
     customOD.isVisible = False
 
-    customID = inputs.addValueInput(
+    customID = partInputs.addValueInput(
         'custom_id', 'Bore Diameter', 'in',
         adsk.core.ValueInput.createByString('0.159 in')
     )
     customID.isVisible = False
 
     # --- Tube group ----------------------------------------------------------
-    tubeWidthInp = inputs.addValueInput(
+    tubeWidthInp = partInputs.addValueInput(
         'tube_width', 'Width', 'in',
         adsk.core.ValueInput.createByString('2 in')
     )
     tubeWidthInp.isVisible = False
 
-    tubeHeightInp = inputs.addValueInput(
+    tubeHeightInp = partInputs.addValueInput(
         'tube_height', 'Height', 'in',
         adsk.core.ValueInput.createByString('1 in')
     )
     tubeHeightInp.isVisible = False
 
-    tubeThickInp = inputs.addDropDownCommandInput(
+    tubeThickInp = partInputs.addDropDownCommandInput(
         'tube_thickness', 'Wall Thickness', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tubeThickInp.listItems.add(THICK_1_16, True, '')
@@ -280,17 +296,17 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     tubeThickInp.listItems.add(THICK_CUSTOM, False, '')
     tubeThickInp.isVisible = False
 
-    customThickInp = inputs.addValueInput(
+    customThickInp = partInputs.addValueInput(
         'custom_thickness', 'Custom Thickness', 'in',
         adsk.core.ValueInput.createByString('0.1 in')
     )
     customThickInp.isVisible = False
 
     # --- Tube face holes -----------------------------------------------------
-    tubeHolesInp = inputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', True)
+    tubeHolesInp = partInputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', True)
     tubeHolesInp.isVisible = False
 
-    holeSizeInp = inputs.addDropDownCommandInput(
+    holeSizeInp = partInputs.addDropDownCommandInput(
         'hole_size', 'Hole Size', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     holeSizeInp.listItems.add(HOLE_RIVENUT, True, '')
@@ -298,14 +314,14 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     holeSizeInp.listItems.add(HOLE_CUSTOM, False, '')
     holeSizeInp.isVisible = False
 
-    holeDiamInp = inputs.addValueInput(
+    holeDiamInp = partInputs.addValueInput(
         'hole_diameter', 'Custom Hole Diameter', 'in',
         adsk.core.ValueInput.createByString('0.25 in')
     )
     holeDiamInp.isVisible = False
 
     # --- Length group (shared) -----------------------------------------------
-    lenTypeInp = inputs.addDropDownCommandInput(
+    lenTypeInp = partInputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     lenTypeInp.listItems.add(LEN_FACES, True, '')
@@ -315,7 +331,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # face's own "center" is its area centroid, which is wrong for any face that isn't
     # fully symmetric (e.g. a plate face with other holes in it), so Shaft needs an
     # explicit point or circular edge to build from, not a face-center guess.
-    face1Sel = inputs.addSelectionInput(
+    face1Sel = placeInputs.addSelectionInput(
         'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
@@ -326,7 +342,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # (when "Create Joint" is checked) the joint's target on the other part -- one
     # selection serves both roles, picked exactly like Fusion's own Joint command: a
     # point, edge, or face, snapping to its center/midpoint/centroid keypoint.
-    refPointSel = inputs.addSelectionInput(
+    refPointSel = placeInputs.addSelectionInput(
         'ref_point_selection', 'Reference Point',
         'Select a point, edge, or face that the shaft is built from -- just like picking a '
         'joint origin in the Joint command'
@@ -339,14 +355,14 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     refPointSel.setSelectionLimits(1, 1)
     refPointSel.isVisible = True
 
-    face2Sel = inputs.addSelectionInput(
+    face2Sel = placeInputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
     face2Sel.setSelectionLimits(1, 1)
     face2Sel.isVisible = True
 
-    customLenInp = inputs.addValueInput(
+    customLenInp = partInputs.addValueInput(
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString('6 in')
     )
@@ -355,19 +371,19 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # Point is picked (to place the shaft and/or joint it), which way the sketch plane's own
     # normal happens to point is arbitrary -- this is a plain manual override for that, same
     # spirit as the joint's own Flip checkbox below.
-    reverseDirInp = inputs.addBoolValueInput(
+    reverseDirInp = placeInputs.addBoolValueInput(
         'reverse_direction', 'Reverse Direction', True, '', False)
     reverseDirInp.isVisible = False
 
-    highlightRefFaceInp = inputs.addBoolValueInput(
+    highlightRefFaceInp = placeInputs.addBoolValueInput(
         'highlight_ref_face', 'Highlight Reference Face', True, '', True)
     customLenInp.isVisible = False
 
-    createJointInp = inputs.addBoolValueInput(
+    createJointInp = placeInputs.addBoolValueInput(
         'create_joint', 'Create Joint at Reference Face', True, '', True)
     createJointInp.isVisible = True
 
-    jointTypeInp = inputs.addDropDownCommandInput(
+    jointTypeInp = placeInputs.addDropDownCommandInput(
         'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     jointTypeInp.listItems.add(JOINT_REVOLUTE, True, '')
@@ -377,11 +393,11 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # Flip -- exactly the native Joint command's own Flip checkbox: no attempt is made to
     # guess which of the two valid orientations is "correct" from the Reference Point pick,
     # the user just toggles this if the shaft comes out backwards.
-    flipJointInp = inputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
+    flipJointInp = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
     flipJointInp.isVisible = True
 
     # --- Pulley group --------------------------------------------------------
-    beltTypeInp = inputs.addDropDownCommandInput(
+    beltTypeInp = partInputs.addDropDownCommandInput(
         'belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     beltTypeInp.listItems.add('HTD 5mm Pitch', True,  '')
@@ -389,30 +405,30 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     beltTypeInp.isVisible = False
 
     defaultLengthUnits = ''
-    toothCountInp = inputs.addValueInput(
+    toothCountInp = partInputs.addValueInput(
         'tooth_count', 'Tooth Count', defaultLengthUnits,
         adsk.core.ValueInput.createByString('18')
     )
     toothCountInp.isVisible = False
 
-    beltWidthInp = inputs.addValueInput(
+    beltWidthInp = partInputs.addValueInput(
         'belt_width', 'Belt Width', 'mm',
         adsk.core.ValueInput.createByString('0.394 in')
     )
     beltWidthInp.isVisible = False
 
-    pulleyShowTeethInp = inputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
+    pulleyShowTeethInp = partInputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
     pulleyShowTeethInp.isVisible = False
 
     # --- Timing Belt group ---------------------------------------------------
-    tbCirclesInp = inputs.addSelectionInput(
+    tbCirclesInp = partInputs.addSelectionInput(
         'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
     )
     tbCirclesInp.addSelectionFilter('SketchCurves')
     tbCirclesInp.setSelectionLimits(0, 2)
     tbCirclesInp.isVisible = False
 
-    tbBeltTypeInp = inputs.addDropDownCommandInput(
+    tbBeltTypeInp = partInputs.addDropDownCommandInput(
         'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tbBeltTypeInp.listItems.add('HTD 5mm Pitch', True,  '')
@@ -420,45 +436,45 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     tbBeltTypeInp.isEnabled = False
     tbBeltTypeInp.isVisible = False
 
-    tbBeltWidthInp = inputs.addValueInput(
+    tbBeltWidthInp = partInputs.addValueInput(
         'tb_belt_width', 'Belt Width', 'mm',
         adsk.core.ValueInput.createByString('9')
     )
     tbBeltWidthInp.isVisible = False
 
-    tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', True)
+    tbSuppressInp = partInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', True)
     tbSuppressInp.isVisible = False
 
-    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', True)
+    tbGenPulleysInp = partInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', True)
     tbGenPulleysInp.isVisible = False
 
-    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', False)
+    tbPulleyTeethInp = partInputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', False)
     tbPulleyTeethInp.isVisible = False
 
-    tbPulleyWidthInp = inputs.addValueInput(
+    tbPulleyWidthInp = partInputs.addValueInput(
         'tb_pulley_width', 'Pulley Width', 'mm',
         adsk.core.ValueInput.createByString('0.394 in')
     )
     tbPulleyWidthInp.isVisible = False
 
     # --- Chain Sprocket group ------------------------------------------------
-    sprocketToothCountInp = inputs.addValueInput(
+    sprocketToothCountInp = partInputs.addValueInput(
         'sprocket_tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString('12')
     )
     sprocketToothCountInp.isVisible = False
 
-    sprocketWidthInp = inputs.addValueInput(
+    sprocketWidthInp = partInputs.addValueInput(
         'sprocket_width', 'Sprocket Width', 'in',
         adsk.core.ValueInput.createByString('0.375 in')
     )
     sprocketWidthInp.isVisible = False
 
-    sprocketShowTeethInp = inputs.addBoolValueInput(
+    sprocketShowTeethInp = partInputs.addBoolValueInput(
         'sprocket_show_teeth', 'Show Teeth', True, '', False)
     sprocketShowTeethInp.isVisible = False
 
-    sprocketChainTypeInp = inputs.addDropDownCommandInput(
+    sprocketChainTypeInp = partInputs.addDropDownCommandInput(
         'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     sprocketChainTypeInp.listItems.add('#25 Chain', True,  '')
@@ -466,24 +482,24 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInp.isVisible = False
 
     # --- Chain group ---------------------------------------------------------
-    chainCirclesInp = inputs.addSelectionInput(
+    chainCirclesInp = partInputs.addSelectionInput(
         'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
     )
     chainCirclesInp.addSelectionFilter('SketchCurves')
     chainCirclesInp.setSelectionLimits(0, 2)
     chainCirclesInp.isVisible = False
 
-    chainSprocketWidthInp = inputs.addValueInput(
+    chainSprocketWidthInp = partInputs.addValueInput(
         'chain_sprocket_width', 'Chain Width', 'in',
         adsk.core.ValueInput.createByString('0.375 in')
     )
     chainSprocketWidthInp.isVisible = False
 
-    chainGenSprocketsInp = inputs.addBoolValueInput(
+    chainGenSprocketsInp = partInputs.addBoolValueInput(
         'chain_gen_sprockets', 'Generate Sprockets', True, '', True)
     chainGenSprocketsInp.isVisible = False
 
-    chainSprocketTeethInp = inputs.addBoolValueInput(
+    chainSprocketTeethInp = partInputs.addBoolValueInput(
         'chain_sprocket_teeth', 'Sprocket Teeth', True, '', False)
     chainSprocketTeethInp.isVisible = False
     futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
@@ -498,7 +514,8 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 # ===========================================================================
 
 def command_input_changed(args: adsk.core.InputChangedEventArgs):
-    inputs = args.inputs
+    # Not args.inputs -- that's only the changed input's own group (see _add_dialog_groups).
+    inputs = args.input.parentCommand.commandInputs
 
     partTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('part_type')
     shaftTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('shaft_type')
@@ -557,6 +574,15 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
     hide_length      = part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
+
+    # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
+    # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
+    # inputs stay invalid, executePreview never fires and the shaft never shows up. Turn it
+    # off on entering Custom Length unless a Reference Point is already there to joint to.
+    if (args.input.id in ('part_type', 'length_type') and part_is_shaft
+            and not is_between_faces and createJointInp is not None
+            and (refPointSel is None or refPointSel.selectionCount < 1)):
+        createJointInp.value = False
 
     # Shaft inputs
     shaftTypeInp.isVisible   = part_is_shaft
@@ -628,7 +654,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
     # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
-    face1Sel.isVisible     = not hide_length and is_between_faces and part_is_tube
+    placeGroup = inputs.itemById('placement_group')
+    if placeGroup is not None:
+        placeGroup.isVisible = not hide_length
+    face1Sel.isVisible    = not hide_length and is_between_faces and part_is_tube
     # Reference Point is required in Between-Two-Faces (positions the shaft). In Custom
     # Length it only exists to give the joint below a target, so it's shown only while
     # "Create Joint" is checked -- and cleared when hidden, so a stale pick can't silently
@@ -1360,8 +1389,13 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     keep_ref_point = is_shaft and edit_ref_point is not None
     _edit_ref_entities = (edit_ref_point, edit_face2) if keep_ref_point else None
 
+    # Same two groups as the create dialog (see command_created).
+    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    partInputs, placeInputs = _add_dialog_groups(inputs)
+    inputs.itemById('placement_group').isVisible = has_len
+
     # --- Part type ---
-    partTypeInp = inputs.addDropDownCommandInput(
+    partTypeInp = partInputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     partTypeInp.listItems.add(PART_SHAFT,    is_shaft,    '')
@@ -1372,11 +1406,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_CHAIN,   is_chain,    '')
 
     # --- Component name (optional override; blank = auto-generated name) -----
-    customNameInp = inputs.addStringValueInput('custom_name', 'Component Name', custom_name_val)
+    customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', custom_name_val)
     customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---
-    shaftTypeInp = inputs.addDropDownCommandInput(
+    shaftTypeInp = partInputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     shaftTypeInp.listItems.add(SHAFT_HALF_HEX,            shaft_type == SHAFT_HALF_HEX,            '')
@@ -1387,32 +1421,32 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     shaftTypeInp.listItems.add(SHAFT_CUSTOM,              is_custom_shaft,                         '')
     shaftTypeInp.isVisible = is_shaft
 
-    customOD = inputs.addValueInput(
+    customOD = partInputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
         adsk.core.ValueInput.createByString(od_expr)
     )
     customOD.isVisible = is_shaft and (is_custom_shaft or is_spacer_shaft)
 
-    customID = inputs.addValueInput(
+    customID = partInputs.addValueInput(
         'custom_id', 'Bore Diameter', 'in',
         adsk.core.ValueInput.createByString(id_expr)
     )
     customID.isVisible = is_shaft and is_custom_shaft
 
     # --- Tube group ---
-    tubeWidthInp = inputs.addValueInput(
+    tubeWidthInp = partInputs.addValueInput(
         'tube_width', 'Width', 'in',
         adsk.core.ValueInput.createByString(w_expr)
     )
     tubeWidthInp.isVisible = is_tube
 
-    tubeHeightInp = inputs.addValueInput(
+    tubeHeightInp = partInputs.addValueInput(
         'tube_height', 'Height', 'in',
         adsk.core.ValueInput.createByString(h_expr)
     )
     tubeHeightInp.isVisible = is_tube
 
-    tubeThickInp = inputs.addDropDownCommandInput(
+    tubeThickInp = partInputs.addDropDownCommandInput(
         'tube_thickness', 'Wall Thickness', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tubeThickInp.listItems.add(THICK_1_16,   tube_thick == THICK_1_16,    '')
@@ -1420,17 +1454,17 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     tubeThickInp.listItems.add(THICK_CUSTOM, is_custom_thick,             '')
     tubeThickInp.isVisible = is_tube
 
-    customThickInp = inputs.addValueInput(
+    customThickInp = partInputs.addValueInput(
         'custom_thickness', 'Custom Thickness', 'in',
         adsk.core.ValueInput.createByString(thick_expr)
     )
     customThickInp.isVisible = is_tube and is_custom_thick
 
     # --- Tube face holes ---
-    tubeHolesInp = inputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', add_holes)
+    tubeHolesInp = partInputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', add_holes)
     tubeHolesInp.isVisible = is_tube
 
-    holeSizeInp = inputs.addDropDownCommandInput(
+    holeSizeInp = partInputs.addDropDownCommandInput(
         'hole_size', 'Hole Size', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     holeSizeInp.listItems.add(HOLE_RIVENUT, hole_size == HOLE_RIVENUT, '')
@@ -1438,45 +1472,45 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     holeSizeInp.listItems.add(HOLE_CUSTOM,  is_custom_hole,            '')
     holeSizeInp.isVisible = is_tube and add_holes
 
-    holeDiamInp = inputs.addValueInput(
+    holeDiamInp = partInputs.addValueInput(
         'hole_diameter', 'Custom Hole Diameter', 'in',
         adsk.core.ValueInput.createByString(hole_diam_expr)
     )
     holeDiamInp.isVisible = is_tube and add_holes and is_custom_hole
 
     # --- Pulley group — values pre-filled from stored attributes ---
-    beltTypeInp = inputs.addDropDownCommandInput(
+    beltTypeInp = partInputs.addDropDownCommandInput(
         'belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     beltTypeInp.listItems.add('HTD 5mm Pitch', pulley_belt == 'HTD 5mm Pitch', '')
     beltTypeInp.listItems.add('GT2 3mm Pitch', pulley_belt == 'GT2 3mm Pitch', '')
     beltTypeInp.isVisible = is_pulley
 
-    toothCountInp = inputs.addValueInput(
+    toothCountInp = partInputs.addValueInput(
         'tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString(pulley_teeth)
     )
     toothCountInp.isVisible = is_pulley
 
-    beltWidthInp = inputs.addValueInput(
+    beltWidthInp = partInputs.addValueInput(
         'belt_width', 'Belt Width', 'mm',
         adsk.core.ValueInput.createByString(pulley_width)
     )
     beltWidthInp.isVisible = is_pulley
 
-    pulleyShowTeethInp = inputs.addBoolValueInput(
+    pulleyShowTeethInp = partInputs.addBoolValueInput(
         'pulley_show_teeth', 'Show Teeth', True, '', pulley_show_teeth)
     pulleyShowTeethInp.isVisible = is_pulley
 
     # --- Timing Belt group — circles must be re-selected; other values pre-filled ---
-    tbCirclesInp = inputs.addSelectionInput(
+    tbCirclesInp = partInputs.addSelectionInput(
         'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
     )
     tbCirclesInp.addSelectionFilter('SketchCurves')
     tbCirclesInp.setSelectionLimits(0, 2)
     tbCirclesInp.isVisible = is_belt
 
-    tbBeltTypeInp = inputs.addDropDownCommandInput(
+    tbBeltTypeInp = partInputs.addDropDownCommandInput(
         'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tbBeltTypeInp.listItems.add('HTD 5mm Pitch', belt_type_val == 'HTD 5mm Pitch', '')
@@ -1484,45 +1518,45 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     tbBeltTypeInp.isEnabled = True   # always enabled in edit mode (no CCLine auto-lock)
     tbBeltTypeInp.isVisible = is_belt
 
-    tbBeltWidthInp = inputs.addValueInput(
+    tbBeltWidthInp = partInputs.addValueInput(
         'tb_belt_width', 'Belt Width', 'mm',
         adsk.core.ValueInput.createByString(belt_width_val)
     )
     tbBeltWidthInp.isVisible = is_belt
 
-    tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', belt_suppress)
+    tbSuppressInp = partInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', belt_suppress)
     tbSuppressInp.isVisible = is_belt
 
-    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', belt_gen_pulleys)
+    tbGenPulleysInp = partInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', belt_gen_pulleys)
     tbGenPulleysInp.isVisible = is_belt
 
-    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', belt_pulley_teeth)
+    tbPulleyTeethInp = partInputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', belt_pulley_teeth)
     tbPulleyTeethInp.isVisible = is_belt and belt_gen_pulleys
 
-    tbPulleyWidthInp = inputs.addValueInput(
+    tbPulleyWidthInp = partInputs.addValueInput(
         'tb_pulley_width', 'Pulley Width', 'mm',
         adsk.core.ValueInput.createByString(belt_pulley_width)
     )
     tbPulleyWidthInp.isVisible = is_belt and belt_gen_pulleys
 
     # --- Chain Sprocket group ---
-    sprocketToothCountInp = inputs.addValueInput(
+    sprocketToothCountInp = partInputs.addValueInput(
         'sprocket_tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString(sprocket_teeth)
     )
     sprocketToothCountInp.isVisible = is_sprocket
 
-    sprocketWidthInpEdit = inputs.addValueInput(
+    sprocketWidthInpEdit = partInputs.addValueInput(
         'sprocket_width', 'Sprocket Width', 'in',
         adsk.core.ValueInput.createByString(sprocket_width_val)
     )
     sprocketWidthInpEdit.isVisible = is_sprocket
 
-    sprocketShowTeethInpEdit = inputs.addBoolValueInput(
+    sprocketShowTeethInpEdit = partInputs.addBoolValueInput(
         'sprocket_show_teeth', 'Show Teeth', True, '', sprocket_show_teeth_val)
     sprocketShowTeethInpEdit.isVisible = is_sprocket
 
-    sprocketChainTypeInpEdit = inputs.addDropDownCommandInput(
+    sprocketChainTypeInpEdit = partInputs.addDropDownCommandInput(
         'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     sprocketChainTypeInpEdit.listItems.add('#25 Chain', sprocket_chain_type_val == '#25 Chain', '')
@@ -1530,24 +1564,24 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInpEdit.isVisible = is_sprocket
 
     # --- Chain group ---
-    chainCirclesInpEdit = inputs.addSelectionInput(
+    chainCirclesInpEdit = partInputs.addSelectionInput(
         'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
     )
     chainCirclesInpEdit.addSelectionFilter('SketchCurves')
     chainCirclesInpEdit.setSelectionLimits(0, 2)
     chainCirclesInpEdit.isVisible = is_chain
 
-    chainSprocketWidthInpEdit = inputs.addValueInput(
+    chainSprocketWidthInpEdit = partInputs.addValueInput(
         'chain_sprocket_width', 'Chain Width', 'in',
         adsk.core.ValueInput.createByString(chain_spr_width_val)
     )
     chainSprocketWidthInpEdit.isVisible = is_chain
 
-    chainGenSprocketsInpEdit = inputs.addBoolValueInput(
+    chainGenSprocketsInpEdit = partInputs.addBoolValueInput(
         'chain_gen_sprockets', 'Generate Sprockets', True, '', chain_gen_spr_val)
     chainGenSprocketsInpEdit.isVisible = is_chain
 
-    chainSprocketTeethInpEdit = inputs.addBoolValueInput(
+    chainSprocketTeethInpEdit = partInputs.addBoolValueInput(
         'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
     chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
 
@@ -1556,23 +1590,21 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     # shaft rebuilds where it stands with its joint intact. Otherwise fall back to editing
     # it as a Custom Length, which rebuilds it at the world origin -- the old behaviour,
     # and all that is possible once the referenced geometry is gone.
-    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
-
-    lenTypeInp = inputs.addDropDownCommandInput(
+    lenTypeInp = partInputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     lenTypeInp.listItems.add(LEN_FACES,  keep_faces,      '')
     lenTypeInp.listItems.add(LEN_CUSTOM, not keep_faces,  '')
     lenTypeInp.isVisible = has_len
 
-    face1Sel = inputs.addSelectionInput(
+    face1Sel = placeInputs.addSelectionInput(
         'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
     face1Sel.setSelectionLimits(0, 1)
     face1Sel.isVisible = False
 
-    refPointSelEdit = inputs.addSelectionInput(
+    refPointSelEdit = placeInputs.addSelectionInput(
         'ref_point_selection', 'Reference Point',
         'Select a point, edge, or face that the shaft is built from -- just like picking a '
         'joint origin in the Joint command'
@@ -1589,42 +1621,42 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     # a joint) on Edit by ticking the checkbox.
     refPointSelEdit.isVisible = has_len and is_shaft and (keep_faces or create_joint_val)
 
-    face2Sel = inputs.addSelectionInput(
+    face2Sel = placeInputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
     face2Sel.setSelectionLimits(0, 1)
     face2Sel.isVisible = keep_faces
 
-    customLenInp = inputs.addValueInput(
+    customLenInp = partInputs.addValueInput(
         'custom_length', 'Length', 'in',
         adsk.core.ValueInput.createByString(len_expr)
     )
     customLenInp.isVisible = has_len and not keep_faces
 
-    reverseDirInpEdit = inputs.addBoolValueInput(
+    reverseDirInpEdit = placeInputs.addBoolValueInput(
         'reverse_direction', 'Reverse Direction', True, '', reverse_dir_val)
     reverseDirInpEdit.isVisible = has_len and not keep_faces and is_shaft
 
-    highlightRefFaceInpEdit = inputs.addBoolValueInput(
+    highlightRefFaceInpEdit = placeInputs.addBoolValueInput(
         'highlight_ref_face', 'Highlight Reference Face', True, '', True)
     highlightRefFaceInpEdit.isVisible = has_len
 
     # Reference-face joint -- offered for a Shaft in either length mode (matches the create
     # dialog); actually creating one still needs a Reference Point pick, enforced the same
     # way as the create dialog in command_validate_input.
-    createJointInpEdit = inputs.addBoolValueInput(
+    createJointInpEdit = placeInputs.addBoolValueInput(
         'create_joint', 'Create Joint at Reference Face', True, '', create_joint_val)
     createJointInpEdit.isVisible = is_shaft
 
-    jointTypeInpEdit = inputs.addDropDownCommandInput(
+    jointTypeInpEdit = placeInputs.addDropDownCommandInput(
         'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     jointTypeInpEdit.listItems.add(JOINT_REVOLUTE, joint_type_val != JOINT_RIGID, '')
     jointTypeInpEdit.listItems.add(JOINT_RIGID, joint_type_val == JOINT_RIGID, '')
     jointTypeInpEdit.isVisible = is_shaft and create_joint_val
 
-    flipJointInpEdit = inputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
+    flipJointInpEdit = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
     flipJointInpEdit.isVisible = is_shaft and create_joint_val
 
     # Wire events — reuse the same input-changed and validate handlers

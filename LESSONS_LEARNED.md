@@ -23,6 +23,19 @@ session.
 
 ## Lessons
 
+### A default-on option that validation rejects hides the whole preview
+`areInputsValid = False` suppresses `executePreview` entirely, so PartsGen Shaft in Custom Length
+(Create Joint defaults on, needs a Reference Point) showed no shaft at all in an empty design.
+**Fix:** don't let a *default* value fail validation -- uncheck Create Joint on entering Custom
+Length when no Reference Point is picked.
+`commands/PartsGen/entry.py` (`command_input_changed`)
+
+### Once inputs live in a GroupCommandInput, `InputChangedEventArgs.inputs` is only that group
+`args.inputs` in `inputChanged` is the collection holding the *changed* input, so `itemById` misses
+inputs in other groups. **Fix:** use `args.input.parentCommand.commandInputs` (or
+`args.command.commandInputs` in execute/preview), whose `itemById` searches every group.
+`commands/PartsGen/entry.py` (`_add_dialog_groups`), `commands/CCDistance/create_cmd.py`
+
 ### Drilling a tube: one through-all seed cut per wall *direction*, not one wall-thick cut per face
 Tube holes were sketched/cut/patterned on all 4 outer faces, each cut only `wall_thickness` deep. **Fix:**
 keep one outer face per normal direction (skip faces with `|n·kept_n| > 0.5`) and cut with
