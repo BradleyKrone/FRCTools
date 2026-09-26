@@ -3,7 +3,7 @@ import adsk.fusion
 import os
 from ...lib import fusionAddInUtils as futil
 from ... import config
-from .shaft_gen import _create_shaft, _hex_spacer_bore_dims_cm
+from .shaft_gen import _create_shaft, _hex_spacer_bore_dims_cm, delete_shaft_bearings
 from .tube_gen import _create_tube
 from .pulley_gen import _create_pulley
 from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
@@ -108,6 +108,14 @@ LEN_CUSTOM = 'Custom Length'
 JOINT_REVOLUTE = 'Revolute (Spins Freely)'
 JOINT_RIGID    = 'Rigid (Fixed)'
 
+# Optional WCP-0785 bearings on a 1/2" hex shaft's ends. Must match shaft_gen.py's
+# BEARING_* exactly -- both files independently read/write the same list-item names.
+BEARING_NONE  = 'None'
+BEARING_BOTH  = 'Both Ends'
+BEARING_REF   = 'Reference End Only'
+BEARING_FACE2 = 'Face 2 End Only'
+BEARING_CHOICES = (BEARING_NONE, BEARING_BOTH, BEARING_REF, BEARING_FACE2)
+
 # ---------------------------------------------------------------------------
 # Edit command  (shown only via the right-click marking menu)
 # ---------------------------------------------------------------------------
@@ -156,6 +164,7 @@ ATTR_CREATE_JOINT = 'shaft_create_joint'
 ATTR_JOINT_TYPE   = 'shaft_joint_type'
 ATTR_JOINT_FLIP   = 'shaft_joint_flip'
 ATTR_REVERSE_DIR  = 'shaft_reverse_direction'
+ATTR_BEARING_ENDS = 'shaft_bearing_ends'
 
 # Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
 # where it was instead of dropping back to a Custom Length at the world origin. A Custom
@@ -217,6 +226,18 @@ def stop():
 # ===========================================================================
 # command_created  –  build the dialog
 # ===========================================================================
+
+def _add_bearing_ends_input(placeInputs: adsk.core.CommandInputs, selected: str):
+    """Add the shaft's 'Bearings' dropdown (shared by the create and edit dialogs)."""
+    bearingEndsInp = placeInputs.addDropDownCommandInput(
+        'bearing_ends', 'Bearings (WCP-0785)', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in BEARING_CHOICES:
+        bearingEndsInp.listItems.add(name, name == selected, '')
+    bearingEndsInp.tooltip = ('Add WCP-0785 1/2" hex flanged bearings to the shaft ends, '
+                              'rigidly jointed with the flange flush to the shaft end')
+    return bearingEndsInp
+
 
 def _add_dialog_groups(inputs: adsk.core.CommandInputs):
     """Add the dialog's two groups and return their child collections.
@@ -395,6 +416,8 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # the user just toggles this if the shaft comes out backwards.
     flipJointInp = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
     flipJointInp.isVisible = True
+
+    _add_bearing_ends_input(placeInputs, BEARING_NONE)
 
     # --- Pulley group --------------------------------------------------------
     beltTypeInp = partInputs.addDropDownCommandInput(
@@ -689,6 +712,12 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         jointTypeInp.isVisible = show_joint_options
     if flipJointInp is not None:
         flipJointInp.isVisible = show_joint_options
+
+    # Bearings are WCP-0785s, which only fit 1/2" hex.
+    bearingEndsInp = inputs.itemById('bearing_ends')
+    if bearingEndsInp is not None:
+        bearingEndsInp.isVisible = (not hide_length and part_is_shaft
+                                    and shaftTypeInp.selectedItem.name == SHAFT_HALF_HEX)
 
     # Sync selection limits with visibility
     if not hide_length and is_between_faces and part_is_tube:
@@ -1316,7 +1345,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
                     ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
                     ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE, ATTR_JOINT_FLIP,
-                    ATTR_REVERSE_DIR, ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN):
+                    ATTR_REVERSE_DIR, ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN,
+                    ATTR_BEARING_ENDS):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -1373,6 +1403,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
     custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
     create_joint_val     = _b(ATTR_CREATE_JOINT, False)
+    bearing_ends_val     = _s(ATTR_BEARING_ENDS, BEARING_NONE)
     joint_type_val       = _s(ATTR_JOINT_TYPE,  JOINT_REVOLUTE)
     joint_flip_val       = _b(ATTR_JOINT_FLIP,  False)
     reverse_dir_val      = _b(ATTR_REVERSE_DIR, False)
@@ -1659,6 +1690,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     flipJointInpEdit = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
     flipJointInpEdit.isVisible = is_shaft and create_joint_val
 
+    bearingEndsInpEdit = _add_bearing_ends_input(placeInputs, bearing_ends_val)
+    bearingEndsInpEdit.isVisible = has_len and is_shaft and shaft_type == SHAFT_HALF_HEX
+
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)
     futil.add_handler(args.command.activate,       edit_command_activate,  local_handlers=edit_local_handlers)
@@ -1676,6 +1710,12 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     global _edit_target_occ, _edit_ref_entities
 
     if _edit_target_occ:
+        # A shaft's bearings are separate root occurrences -- deleting the shaft only
+        # cascades away their joints -- so remove them first; the rebuild re-adds them.
+        try:
+            delete_shaft_bearings(_edit_target_occ.component)
+        except Exception:
+            futil.log('PartsGen edit: could not delete old shaft bearings')
         try:
             _edit_target_occ.deleteMe()
         except Exception:

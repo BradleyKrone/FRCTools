@@ -1,6 +1,7 @@
 import adsk.core
 import adsk.fusion
 import math
+import uuid
 from ...lib import fusionAddInUtils as futil
 
 app = adsk.core.Application.get()
@@ -106,6 +107,36 @@ ATTR_REVERSE_DIR  = 'shaft_reverse_direction'
 # Length shaft built from a Reference Point (no Face 2) stores only the ref-point token.
 ATTR_REF_POINT_TOKEN = 'shaft_ref_point_token'
 ATTR_FACE2_TOKEN     = 'shaft_face2_token'
+
+# Optional bearings on the shaft's ends. Must match entry.py's BEARING_* list-item names
+# exactly -- both files independently read/write them.
+BEARING_NONE  = 'None'
+BEARING_BOTH  = 'Both Ends'
+BEARING_REF   = 'Reference End Only'
+BEARING_FACE2 = 'Face 2 End Only'
+
+ATTR_BEARING_ENDS  = 'shaft_bearing_ends'
+# A random id stored on the shaft's component and copied onto each of its bearing
+# occurrences, so right-click Edit can find and delete the old bearings before rebuilding
+# -- deleting the shaft alone only cascades away their joints, leaving the bearings behind.
+ATTR_SHAFT_UID     = 'shaft_uid'
+ATTR_BEARING_OWNER = 'bearing_owner_shaft_uid'
+
+# WCP-0785 1/2" rounded-hex flanged bearing, inserted as a linked component from Team
+# 1756's own library file (Argos CAD > Parts_1 > Parts_Gen), never redrawn. A lineage URN
+# (no ?version=) always resolves to the latest version.
+WCP_0785_LINEAGE_URN = 'urn:adsk.wipprod:dm.lineage:d9ZIwsI6QNWLT3Khg8p3Dw'
+# The face jointed to the shaft's end: the inner race's end face on the *flange* side -- a
+# planar annulus between these two circle radii. The same annulus also exists on the
+# non-flange side, so it's told apart by being coplanar with the flange's own face (the
+# planar face carrying the bearing's largest circle). Found by geometry rather than a face
+# index or token so it survives edits to the bearing file. Measured live off the file.
+BEARING_FACE_RADII_CM   = (0.7125, 0.9602)
+BEARING_FLANGE_RADIUS_CM = 1.531
+BEARING_RADIUS_TOL_CM   = 1e-3
+# Axial distance from the flange's seat (the face that sits against the plate) to that
+# inner-race face -- how far the shaft end sticks out past the plate. 1/16", measured live.
+BEARING_FLANGE_THICKNESS_CM = 0.1587
 
 # Must match entry.py's JOINT_REVOLUTE/JOINT_RIGID exactly -- both files independently
 # read/write the same dialog list-item names and component attribute values.
@@ -461,7 +492,12 @@ def _offset_plane_parallel_to(workingComp: adsk.fusion.Component,
         plane_input.setByOffsetThroughPoint(base_plane, plane_point)
     else:
         base_geom_plane = adsk.core.Plane.cast(base_plane.geometry)
-        offset_dist = base_geom_plane.origin.vectorTo(world_point).dotProduct(base_geom_plane.normal)
+        # setByOffset measures along a face's *true* outward normal, so correct the raw one
+        # for isParamReversed -- otherwise a reversed Face 2 puts the plane on its far side.
+        base_normal = (_true_face_normal(base_plane)
+                       if base_plane.objectType == adsk.fusion.BRepFace.classType()
+                       else base_geom_plane.normal)
+        offset_dist = base_geom_plane.origin.vectorTo(world_point).dotProduct(base_normal)
         plane_input.setByOffset(base_plane, adsk.core.ValueInput.createByReal(offset_dist))
     return workingComp.constructionPlanes.add(plane_input)
 
@@ -578,10 +614,16 @@ def _extrude_one_side(comp: adsk.fusion.Component,
                       operation: adsk.fusion.FeatureOperations,
                       face2_or_none,
                       custom_len_expr,
-                      ext_dir: adsk.fusion.ExtentDirections) -> adsk.fusion.ExtrudeFeature:
-    """Extrude `profile` either to face2 (parametric) or by a fixed length."""
+                      ext_dir: adsk.fusion.ExtentDirections,
+                      start_offset_cm: float = 0.0) -> adsk.fusion.ExtrudeFeature:
+    """Extrude `profile` either to face2 (parametric) or by a fixed length. A non-zero
+    `start_offset_cm` starts it that far from the sketch plane along the sketch's own z
+    (used to reach back past a bearing seat -- see `_bearing_seat_depth`)."""
     extrudes = comp.features.extrudeFeatures
     extInput = extrudes.createInput(profile, operation)
+    if start_offset_cm:
+        extInput.startExtent = adsk.fusion.OffsetStartDefinition.create(
+            adsk.core.ValueInput.createByReal(start_offset_cm))
     if face2_or_none is not None:
         extent = adsk.fusion.ToEntityExtentDefinition.create(face2_or_none, False)
     else:
@@ -592,12 +634,31 @@ def _extrude_one_side(comp: adsk.fusion.Component,
     return extrudes.add(extInput)
 
 
+def _is_unrotated(occ: adsk.fusion.Occurrence) -> bool:
+    """True if `occ`'s transform has no rotation (with a tolerance -- a solved joint leaves
+    ~1e-16 of float dust, so Matrix3D.isEqualTo's exact compare is useless here)."""
+    m = occ.transform2
+    err = sum(abs(m.getCell(i, j) - (1.0 if i == j else 0.0))
+              for i in range(3) for j in range(3))
+    return err < 1e-6
+
+
 def _create_reference_joint(workingOcc: adsk.fusion.Occurrence,
                             ref_face: adsk.fusion.BRepFace,
                             other_entity,
                             joint_type: str,
-                            flip: bool = False):
+                            flip: bool = False,
+                            shaft_profile: adsk.fusion.Profile = None,
+                            profile_axis: adsk.core.Vector3D = None):
     """Regular Joint between the shaft and the part its Reference Point belongs to.
+
+    `shaft_profile` is given when the shaft starts behind its sketch plane (extended past a
+    bearing seat), so its start face no longer sits on the Reference Point: the joint then
+    keys off the sketch profile, which still does. A profile's joint axis is its sketch's
+    normal (`profile_axis`), not the start face's outward normal -- using the face's gave
+    the flipped result live. As a safety net the result is checked afterwards; a joint's
+    flip can't be edited straight after creation ("Cannot be edited before rolling back"),
+    so a wrong one is deleted, the shaft put back, and the joint re-added flipped.
 
     A **regular** joint, by design -- `rootComp.joints.createInput()` is, per Fusion's own
     docs, "the API equivalent to the Joint command dialog", which is exactly the behaviour
@@ -627,35 +688,55 @@ def _create_reference_joint(workingOcc: adsk.fusion.Occurrence,
     rootComp = design.rootComponent
 
     shaft_face = ref_face.createForAssemblyContext(workingOcc)
-    shaft_geom = adsk.fusion.JointGeometry.createByPlanarFace(
-        shaft_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+    if shaft_profile is not None:
+        shaft_geom = adsk.fusion.JointGeometry.createByProfile(
+            shaft_profile.createForAssemblyContext(workingOcc), None,
+            adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+    else:
+        shaft_geom = adsk.fusion.JointGeometry.createByPlanarFace(
+            shaft_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
     other_geom = _joint_geometry_from_entity(other_entity)
 
     other_axis = _natural_joint_axis(other_entity)
     if other_axis is not None:
-        preserve_flip = _true_face_normal(shaft_face).dotProduct(other_axis) < 0
+        shaft_axis = (profile_axis if shaft_profile is not None and profile_axis is not None
+                      else _true_face_normal(shaft_face))
+        preserve_flip = shaft_axis.dotProduct(other_axis) < 0
         actual_flip = preserve_flip != flip
     else:
         # No reliable axis to compare against (a bare point, a straight edge, a non-planar
         # face) -- nothing to correct, so the checkbox is passed through as-is.
         actual_flip = flip
 
-    try:
+    def _add(is_flipped):
         joint_input = rootComp.joints.createInput(shaft_geom, other_geom)
-        if joint_input is not None:
-            joint_input.isFlipped = actual_flip
-            if joint_type == JOINT_RIGID:
-                joint_input.setAsRigidJointMotion()
-            else:
-                joint_input.setAsRevoluteJointMotion(
-                    adsk.fusion.JointDirections.ZAxisJointDirection)
-            # Documented to return null on failure rather than raising, so check it.
-            joint = rootComp.joints.add(joint_input)
-            if joint is not None:
-                joint.name = f'{workingOcc.component.name}_joint'
-                futil.log(f'PartsGen: joint for {workingOcc.component.name} '
-                          f'({joint_type}, flip={flip}, isFlipped={actual_flip})')
-                return joint
+        if joint_input is None:
+            return None
+        joint_input.isFlipped = is_flipped
+        if joint_type == JOINT_RIGID:
+            joint_input.setAsRigidJointMotion()
+        else:
+            joint_input.setAsRevoluteJointMotion(
+                adsk.fusion.JointDirections.ZAxisJointDirection)
+        # Documented to return null on failure rather than raising, so check it.
+        return rootComp.joints.add(joint_input)
+
+    try:
+        joint = _add(actual_flip)
+        if joint is not None:
+            # Unflipped should leave the shaft exactly as built; flipped should not.
+            if shaft_profile is not None and _is_unrotated(workingOcc) == flip:
+                futil.log('PartsGen: profile joint came out the wrong way; re-adding it flipped')
+                joint.deleteMe()
+                # deleteMe doesn't restore the occurrence (see LESSONS_LEARNED.md).
+                workingOcc.transform2 = adsk.core.Matrix3D.create()
+                actual_flip = not actual_flip
+                joint = _add(actual_flip)
+        if joint is not None:
+            joint.name = f'{workingOcc.component.name}_joint'
+            futil.log(f'PartsGen: joint for {workingOcc.component.name} '
+                      f'({joint_type}, flip={flip}, isFlipped={actual_flip})')
+            return joint
     except Exception:
         futil.handle_error(f'PartsGen: joint for {workingOcc.component.name}')
 
@@ -663,6 +744,271 @@ def _create_reference_joint(workingOcc: adsk.fusion.Occurrence,
         f'Parts Gen: could not create a joint for {workingOcc.component.name}.\n\n'
         'The shaft itself is correct -- add the joint by hand if you need one.')
     return None
+
+
+# ===========================================================================
+# Bearings
+# ===========================================================================
+
+def _occurrence_bodies_recursive(occ: adsk.fusion.Occurrence):
+    """Yield every body under `occ`, read through `Occurrence.bRepBodies` at each level --
+    the access path proven to report correct world geometry 2+ occurrence levels deep,
+    unlike walking `edge.faces` off a proxy (see LESSONS_LEARNED.md)."""
+    for body in occ.bRepBodies:
+        yield body
+    for child in occ.childOccurrences:
+        yield from _occurrence_bodies_recursive(child)
+
+
+def _reliable_body(entity):
+    """Return the body a picked entity lies on, re-fetched through its occurrence's
+    `bRepBodies` (the access path proven correct 2+ levels deep), or None for an entity
+    with no body (a sketch/construction point)."""
+    body = getattr(entity, 'body', None)
+    if body is None:
+        return None
+    occ = entity.assemblyContext
+    if occ is None:
+        return body
+    native = body.nativeObject
+    for candidate in occ.bRepBodies:
+        if candidate.nativeObject == native:
+            return candidate
+    return body
+
+
+def _bearing_seat_depth(entity, pick_pt: adsk.core.Point3D, outward: adsk.core.Vector3D):
+    """How far past `pick_pt`, along `outward` (unit, pointing away from the shaft's other
+    end), the outside face of the picked part is -- where a bearing's flange should sit.
+
+    The shaft's hole is found as the body's circular edges coaxial with the shaft. If the
+    material around the hole continues outward from the pick (the user picked the plate's
+    inner face), the seat is the nearest hole rim beyond it -- the same wall's outer face,
+    never a far wall of a tube. Otherwise the pick already is the outside face: 0.
+    Returns None when the part has no hole on the shaft's axis (nothing to seat into)."""
+    body = _reliable_body(entity)
+    if body is None:
+        return None
+    rims = []
+    for edge in body.edges:
+        circle = adsk.core.Circle3D.cast(edge.geometry)
+        if circle is None or abs(circle.normal.dotProduct(outward)) < 1 - 1e-4:
+            continue
+        v = pick_pt.vectorTo(circle.center)
+        t = v.dotProduct(outward)
+        along = outward.copy()
+        along.scaleBy(t)
+        v.subtract(along)
+        if v.length < 1e-3:
+            rims.append((t, circle.radius))
+
+    at_pick = [r for t, r in rims if abs(t) < 1e-4]
+    if not at_pick:
+        return None
+
+    # Probe just outside the hole wall, a hair outward from the pick.
+    perp = outward.crossProduct(adsk.core.Vector3D.create(1, 0, 0))
+    if perp.length < 1e-6:
+        perp = outward.crossProduct(adsk.core.Vector3D.create(0, 1, 0))
+    perp.normalize()
+    probe_r = min(at_pick) + 0.01
+    probe = adsk.core.Point3D.create(
+        pick_pt.x + outward.x * 0.01 + perp.x * probe_r,
+        pick_pt.y + outward.y * 0.01 + perp.y * probe_r,
+        pick_pt.z + outward.z * 0.01 + perp.z * probe_r)
+    if body.pointContainment(probe) != adsk.fusion.PointContainment.PointInsidePointContainment:
+        return 0.0
+    beyond = [t for t, _ in rims if t > 1e-4]
+    return min(beyond) if beyond else 0.0
+
+
+def _circle_radii(face: adsk.fusion.BRepFace):
+    radii = []
+    for edge in face.edges:
+        circle = adsk.core.Circle3D.cast(edge.geometry)
+        if circle is not None:
+            radii.append(circle.radius)
+    return radii
+
+
+def _has_radius(radii, target_cm) -> bool:
+    return any(abs(r - target_cm) < BEARING_RADIUS_TOL_CM for r in radii)
+
+
+def _find_bearing_face(bearing_occ: adsk.fusion.Occurrence):
+    """Return the WCP-0785's flange-side inner-race face (see BEARING_FACE_RADII_CM) as a
+    proxy in the root context, or None if the bearing file no longer has one."""
+    planar = []
+    for body in _occurrence_bodies_recursive(bearing_occ):
+        for face in body.faces:
+            plane = adsk.core.Plane.cast(face.geometry)
+            if plane is not None:
+                planar.append((face, plane, _circle_radii(face)))
+
+    flange_planes = [p for _, p, radii in planar if _has_radius(radii, BEARING_FLANGE_RADIUS_CM)]
+    for face, plane, radii in planar:
+        if not all(_has_radius(radii, r) for r in BEARING_FACE_RADII_CM):
+            continue
+        for fp in flange_planes:
+            if (abs(fp.normal.dotProduct(plane.normal)) > 1 - 1e-6
+                    and abs(fp.origin.vectorTo(plane.origin).dotProduct(fp.normal)) < 1e-4):
+                return face
+    return None
+
+
+def _face_circle_center(face: adsk.fusion.BRepFace) -> adsk.core.Point3D:
+    for edge in face.edges:
+        circle = adsk.core.Circle3D.cast(edge.geometry)
+        if circle is not None:
+            return circle.center
+    return face.centroid
+
+
+def _insert_bearing(rootComp: adsk.fusion.Component):
+    """Insert the WCP-0785 at the world origin, linked when possible. A linked insert fails
+    when the bearing file is in a different project than this document, so fall back to an
+    embedded copy rather than skipping the bearing."""
+    data_file = app.data.findFileById(WCP_0785_LINEAGE_URN)
+    if data_file is None:
+        futil.popup_error(
+            'Parts Gen: could not find the WCP-0785 bearing file '
+            '(Argos CAD > Parts_1 > Parts_Gen > Hex_Bearing_WCP-0785).\n\n'
+            'The shaft was built without bearings.')
+        return None
+    identity = adsk.core.Matrix3D.create()
+    try:
+        occ = rootComp.occurrences.addByInsert(data_file, identity, True)
+        if occ is not None:
+            return occ
+    except Exception:
+        pass
+    futil.log('PartsGen: linked bearing insert failed; inserting an embedded copy instead')
+    return rootComp.occurrences.addByInsert(data_file, identity, False)
+
+
+def _add_bearing(workingOcc: adsk.fusion.Occurrence,
+                 shaft_end_face: adsk.fusion.BRepFace,
+                 end_label: str,
+                 shaft_uid: str):
+    """Insert a WCP-0785 on one end of the shaft and rigidly joint it there, matching how
+    Team 1756 mounts them by hand: the bearing's flange-side inner-race face flush with the
+    shaft's end face, facing the same way, so the flange sits at the end and the bearing
+    body runs back along the shaft.
+
+    The bearing is placed there *before* the joint (rotate its face normal onto the shaft
+    end's, then translate its centre onto the end's centre), and the joint then uses the
+    same "no-op flip" rule as `_create_reference_joint`, so `Joints.add()` has nothing left
+    to move -- it only records the relationship. The bore is round, so the bearing's
+    clocking about the shaft axis doesn't matter.
+    """
+    design   = adsk.fusion.Design.cast(app.activeProduct)
+    rootComp = design.rootComponent
+    shaft_name = workingOcc.component.name
+
+    bearing_occ = _insert_bearing(rootComp)
+    if bearing_occ is None:
+        return None
+    try:
+        bearing_face = _find_bearing_face(bearing_occ)
+        if bearing_face is None:
+            raise RuntimeError('WCP-0785 flange-side inner-race face not found')
+
+        shaft_face = shaft_end_face.createForAssemblyContext(workingOcc)
+        target_pt  = shaft_face.centroid
+        target_n   = _true_face_normal(shaft_face)
+        source_pt  = _face_circle_center(bearing_face)
+        source_n   = _true_face_normal(bearing_face)
+
+        xform = adsk.core.Matrix3D.create()
+        if source_n.dotProduct(target_n) < -1 + 1e-9:
+            # Exactly opposed -- the rotation axis is ambiguous, so give it one.
+            perp = source_n.crossProduct(adsk.core.Vector3D.create(1, 0, 0))
+            if perp.length < 1e-6:
+                perp = source_n.crossProduct(adsk.core.Vector3D.create(0, 1, 0))
+            xform.setToRotateTo(source_n, target_n, perp)
+        else:
+            xform.setToRotateTo(source_n, target_n)
+        moved = source_pt.copy()
+        moved.transformBy(xform)
+        xform.translation = moved.vectorTo(target_pt)
+        bearing_occ.transform2 = xform
+
+        bearing_occ.attributes.add(ATTR_GROUP, ATTR_BEARING_OWNER, shaft_uid)
+
+        # Re-find the face after the move rather than trusting a proxy taken before it.
+        bearing_face = _find_bearing_face(bearing_occ)
+        joint_input = rootComp.joints.createInput(
+            adsk.fusion.JointGeometry.createByPlanarFace(
+                bearing_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint),
+            adsk.fusion.JointGeometry.createByPlanarFace(
+                shaft_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint))
+        joint_input.isFlipped = _true_face_normal(bearing_face).dotProduct(target_n) < 0
+        joint_input.setAsRigidJointMotion()
+        joint = rootComp.joints.add(joint_input)
+        if joint is None:
+            raise RuntimeError('Joints.add returned null')
+        joint.name = f'{shaft_name}_bearing_{end_label}'
+        futil.log(f'PartsGen: bearing added to {shaft_name} ({end_label} end)')
+        return bearing_occ
+    except Exception:
+        futil.handle_error(f'PartsGen: bearing for {shaft_name} ({end_label} end)')
+        futil.popup_error(
+            f'Parts Gen: could not add the {end_label}-end bearing to {shaft_name}.\n\n'
+            'The shaft itself is correct -- add the bearing by hand if you need one.')
+        try:
+            bearing_occ.deleteMe()
+        except Exception:
+            pass
+        return None
+
+
+def _add_bearings(workingOcc: adsk.fusion.Occurrence,
+                  outer_feat: adsk.fusion.ExtrudeFeature,
+                  bearing_ends: str,
+                  shaft_uid: str):
+    """Add bearings to whichever ends `bearing_ends` asks for. The reference end is the
+    extrude's start face, the Face 2 end its far face, in either length mode."""
+    start_face = outer_feat.startFaces.item(0) if outer_feat.startFaces.count > 0 else None
+    end_face   = outer_feat.endFaces.item(0)   if outer_feat.endFaces.count   > 0 else None
+    if start_face is None:
+        futil.log('PartsGen: shaft has no start face; skipping bearings')
+        return
+    shaft_axis = _true_face_normal(start_face)
+
+    ends = []
+    if bearing_ends in (BEARING_BOTH, BEARING_REF):
+        ends.append(('ref', start_face))
+    if bearing_ends in (BEARING_BOTH, BEARING_FACE2):
+        if end_face is None:
+            futil.log('PartsGen: shaft has no end face; skipping the Face 2 end bearing')
+        elif (adsk.core.Plane.cast(end_face.geometry) is None
+                or abs(_true_face_normal(end_face).dotProduct(shaft_axis)) < 1 - 1e-6):
+            # Face 2 tilted relative to the hole's axis leaves a slanted end -- no flat,
+            # square seat for a flange, so don't pretend there is one.
+            futil.popup_error(
+                'Parts Gen: the Face 2 end of the shaft is not square to the shaft, '
+                'so no bearing was added there.')
+        else:
+            ends.append(('face2', end_face))
+
+    for label, face in ends:
+        _add_bearing(workingOcc, face, label, shaft_uid)
+
+
+def delete_shaft_bearings(shaft_comp: adsk.fusion.Component):
+    """Delete the bearing occurrences `_add_bearings` created for this shaft (right-click
+    Edit rebuilds the shaft from scratch, and would otherwise leave them behind)."""
+    uid_attr = shaft_comp.attributes.itemByName(ATTR_GROUP, ATTR_SHAFT_UID)
+    if uid_attr is None:
+        return
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    for occ in list(design.rootComponent.occurrences):
+        attr = occ.attributes.itemByName(ATTR_GROUP, ATTR_BEARING_OWNER)
+        if attr is not None and attr.value == uid_attr.value:
+            try:
+                occ.deleteMe()
+            except Exception:
+                futil.log(f'PartsGen: could not delete old bearing {occ.name}')
 
 
 # ===========================================================================
@@ -813,6 +1159,62 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         c1_sk  = sketch.modelToSketchSpace(centroid1)
         center = adsk.core.Point3D.create(c1_sk.x, c1_sk.y, 0.0)
 
+        # --- Bearing seats ------------------------------------------------------
+        # Bearings are WCP-0785s, which only fit 1/2" hex.
+        bearingEndsInp = inputs.itemById('bearing_ends')
+        bearing_ends = (bearingEndsInp.selectedItem.name
+                        if bearingEndsInp is not None and bearingEndsInp.selectedItem is not None
+                        else BEARING_NONE)
+        if shaft_type != SHAFT_HALF_HEX:
+            bearing_ends = BEARING_NONE
+        shaft_uid = uuid.uuid4().hex
+
+        # Between Two Faces: a bearing's flange belongs on the *outside* of the picked part,
+        # its body in the part's hole -- whichever face of the part was picked -- and the
+        # shaft runs on past the flange to end flush with the bearing's outer face (where
+        # `_add_bearings` then seats it). So each bearing end is pushed out to that part's
+        # outside face plus the flange thickness: the reference end by starting the extrude
+        # behind the sketch plane, the Face 2 end by extruding to a plane offset past it.
+        # An end whose part has no hole on the shaft axis is left as picked.
+        ref_start_offset_cm = 0.0
+        ref_ext_cm = face2_ext_cm = 0.0
+        if len_type == LEN_FACES and bearing_ends != BEARING_NONE:
+            positive = ext_dir == adsk.fusion.ExtentDirections.PositiveExtentDirection
+            shaft_dir = sk_normal.copy()
+            if not positive:
+                shaft_dir.scaleBy(-1)
+            shaft_dir.normalize()
+            if bearing_ends in (BEARING_BOTH, BEARING_REF):
+                back = shaft_dir.copy()
+                back.scaleBy(-1)
+                seat = _bearing_seat_depth(ref_point_entity, centroid1, back)
+                if seat is not None:
+                    ref_ext_cm = seat + BEARING_FLANGE_THICKNESS_CM
+                    # OffsetStartDefinition is measured along the sketch's own z.
+                    ref_start_offset_cm = -ref_ext_cm if positive else ref_ext_cm
+            if bearing_ends in (BEARING_BOTH, BEARING_FACE2):
+                f2_plane = adsk.core.Plane.cast(face2_entity.geometry)
+                denom = shaft_dir.dotProduct(f2_plane.normal)
+                if abs(denom) > 1e-6:
+                    t = centroid1.vectorTo(f2_plane.origin).dotProduct(f2_plane.normal) / denom
+                    f2_pt = centroid1.copy()
+                    step = shaft_dir.copy()
+                    step.scaleBy(t)
+                    f2_pt.translateBy(step)
+                    seat = _bearing_seat_depth(face2_entity, f2_pt, shaft_dir)
+                    if seat is not None:
+                        face2_ext_cm = seat + BEARING_FLANGE_THICKNESS_CM
+                        end_pt = f2_pt.copy()
+                        step = shaft_dir.copy()
+                        step.scaleBy(face2_ext_cm)
+                        end_pt.translateBy(step)
+                        # Passing face2 itself as the "point" entity makes this a plain
+                        # numeric offset along Face 2's true normal.
+                        face2_target = _offset_plane_parallel_to(
+                            workingComp, face2, face2, end_pt)
+            futil.log(f'PartsGen: bearing seats extend the shaft {ref_ext_cm / IN_TO_CM:.4g} in '
+                      f'(ref end), {face2_ext_cm / IN_TO_CM:.4g} in (Face 2 end)')
+
         # --- Draw outer profile -------------------------------------------------
         if shaft_type == SHAFT_HALF_HEX:
             workingComp.name = 'Shaft_HalfInchHex'
@@ -858,7 +1260,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         outer_feat = _extrude_one_side(
             workingComp, outer_profile,
             adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-            face2_target, custom_len_expr, ext_dir
+            face2_target, custom_len_expr, ext_dir, ref_start_offset_cm
         )
         body = outer_feat.bodies.item(0)
 
@@ -900,6 +1302,9 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                 adsk.core.ValueInput.createByString(custom_len_expr)
             )
         bore_input.setOneSideExtent(bore_extent, ext_dir)
+        if ref_start_offset_cm:
+            bore_input.startExtent = adsk.fusion.OffsetStartDefinition.create(
+                adsk.core.ValueInput.createByReal(ref_start_offset_cm))
         bore_input.participantBodies = [body]
         bore_extrudes.add(bore_input)
 
@@ -940,6 +1345,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                     else:
                         futil.log('PartsGen: shaft axis is nearly parallel to Face 2; '
                                   'storing the perpendicular distance as its length')
+                d += ref_ext_cm + face2_ext_cm   # bearing-seat extensions, if any
                 comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
                 # Remember both picks so right-click Edit can rebuild the shaft where it
                 # stands (and re-create its joint) instead of falling back to a Custom
@@ -963,6 +1369,9 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
                                   '(custom length); Edit will fall back to world-origin placement')
             if custom_name:
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
+            if bearing_ends != BEARING_NONE:
+                comp_attrs.add(ATTR_GROUP, ATTR_BEARING_ENDS, bearing_ends)
+                comp_attrs.add(ATTR_GROUP, ATTR_SHAFT_UID,    shaft_uid)
             if createJointInp is not None and createJointInp.value:
                 jointTypeInp = inputs.itemById('joint_type')
                 joint_type = jointTypeInp.selectedItem.name if jointTypeInp is not None else JOINT_REVOLUTE
@@ -1010,10 +1419,23 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             joint_type = jointTypeInp.selectedItem.name if jointTypeInp is not None else JOINT_REVOLUTE
             joint_flip = flipJointInp.value if flipJointInp is not None else False
             try:
-                _create_reference_joint(workingOcc, ref_face, ref_point_entity, joint_type, joint_flip)
+                _create_reference_joint(
+                    workingOcc, ref_face, ref_point_entity, joint_type, joint_flip,
+                    shaft_profile=outer_profile if ref_start_offset_cm else None,
+                    profile_axis=sketch.xDirection.crossProduct(sketch.yDirection))
             except Exception:
                 futil.handle_error(
                     f'PartsGen: reference joint for {workingComp.name}', show_message_box=True)
+
+        # Optional bearings -- final build only, like the joint above: inserting a file is
+        # a real design mutation, and far too slow to redo on every preview tick. After the
+        # reference joint, so they're placed on the shaft where it finally ends up.
+        if constrain and bearing_ends != BEARING_NONE:
+            try:
+                _add_bearings(workingOcc, outer_feat, bearing_ends, shaft_uid)
+            except Exception:
+                futil.handle_error(
+                    f'PartsGen: bearings for {workingComp.name}', show_message_box=True)
 
         # Grouped last so the joint above lands inside the shaft's timeline group and is
         # deleted or suppressed along with it, instead of being orphaned outside it.

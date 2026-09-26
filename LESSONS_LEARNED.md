@@ -23,6 +23,39 @@ session.
 
 ## Lessons
 
+### Adding a library part (e.g. a bearing): insert by lineage URN, pre-place it, then use a no-op rigid joint
+`app.data.findFileById('urn:adsk.wipprod:dm.lineage:...')` (no `?version=` = latest) +
+`occurrences.addByInsert(file, identity, True)` took ~0.2 s live. Linked insert fails across projects,
+so fall back to `isReferencedComponent=False`. **Fix:** find the mating face by geometry (planar,
+circle radii, coplanar with the flange face) via `occ.childOccurrences[..].bRepBodies` (reliable
+2 levels deep); set `transform2` from `Matrix3D.setToRotateTo(n_part, n_shaft)` + translation; then
+`Joints.add` with `isFlipped = true_n_a · true_n_b < 0` moves nothing. Tag the occurrence with an
+attribute so Edit can delete it (deleting the shaft only cascades away the joint).
+`commands/PartsGen/shaft_gen.py` (`_add_bearing`, `_find_bearing_face`, `delete_shaft_bearings`)
+
+### Seat a flanged part on the *outside* of a plate, whichever plate face was picked
+Collect the body's circular edges coaxial with the shaft, then `body.pointContainment()` a probe
+just outside the hole wall, a hair outward from the pick: inside = material continues outward,
+so the seat is the nearest rim beyond the pick (never a tube's far wall); outside = the pick is
+already the outer face. Extend the ref end with `OffsetStartDefinition` (sign is along the
+*sketch's* z) and the far end with a plane offset past Face 2.
+`commands/PartsGen/shaft_gen.py` (`_bearing_seat_depth`, `_reliable_body`)
+
+### A joint on a `Profile` uses the sketch normal as its axis; a new joint's flip can't be edited
+Once the shaft starts behind its sketch plane, its start face is off the Reference Point, so
+joint via `JointGeometry.createByProfile(profile.createForAssemblyContext(occ), None, Center)`.
+Computing the no-op flip from the start face's outward normal gave a rotated shaft; the sketch
+normal (`xDirection × yDirection`) is correct (verified both sketch orientations). Setting
+`joint.isFlipped` right after `add()` raises "Cannot be edited before rolling back". **Fix:**
+delete, reset `occ.transform2` to identity, re-add flipped.
+`commands/PartsGen/shaft_gen.py` (`_create_reference_joint`)
+
+### `ConstructionPlaneInput.setByOffset(face, d)` offsets along the face's *true* normal
+The shaft fallback plane computed `d` from the raw `Plane.normal`, so a reversed Face 2 put the
+shaft on the far side of it (seen live: 10..19 instead of 1..10). **Fix:** use `_true_face_normal`
+for a BRepFace base plane when computing `d`.
+`commands/PartsGen/shaft_gen.py` (`_offset_plane_parallel_to`)
+
 ### A default-on option that validation rejects hides the whole preview
 `areInputsValid = False` suppresses `executePreview` entirely, so PartsGen Shaft in Custom Length
 (Create Joint defaults on, needs a Reference Point) showed no shaft at all in an empty design.
