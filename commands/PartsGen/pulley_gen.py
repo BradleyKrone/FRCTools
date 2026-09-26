@@ -500,18 +500,22 @@ def _adapter_fits(part: dict, belt_pitch_mm: int, tooth_od_cm: float) -> bool:
 
 def _bottom_flange_face(occ: adsk.fusion.Occurrence) -> adsk.fusion.BRepFace:
     """The pulley's bottom flange face (planar, facing -Z, at z = -FLANGE_THICKNESS_CM),
-    as a proxy through `occ`. `occ` is at identity, so its faces read world values."""
-    faces = [f for f in occ.bRepBodies.item(0).faces
+    as a proxy through `occ`. Searched on the component's own body, in the pulley's local
+    frame -- `occ` may sit anywhere (e.g. in a belt the user has jointed into place), and a
+    world-z search then matches the underside of the top flange instead."""
+    faces = [f for f in occ.component.bRepBodies.item(0).faces
              if adsk.core.Plane.cast(f.geometry) is not None
              and abs(f.pointOnFace.z + FLANGE_THICKNESS_CM) < 1e-4
              and _true_face_normal(f).z < -1 + 1e-6]
-    return max(faces, key=lambda f: f.area) if faces else None
+    if not faces:
+        return None
+    return max(faces, key=lambda f: f.area).createForAssemblyContext(occ)
 
 
 def _adapter_bottom_face(adapter_occ: adsk.fusion.Occurrence) -> adsk.fusion.BRepFace:
     """The adapter's lowest flat face that carries its bore (a planar face with an outer
-    and a bore loop), as a proxy through `adapter_occ`."""
-    faces = [f for body in adapter_occ.bRepBodies for f in body.faces
+    and a bore loop), in the adapter's local frame (returned native, not as a proxy)."""
+    faces = [f for body in adapter_occ.component.bRepBodies for f in body.faces
              if adsk.core.Plane.cast(f.geometry) is not None and f.loops.count >= 2]
     return min(faces, key=lambda f: f.pointOnFace.z) if faces else None
 
@@ -539,26 +543,34 @@ def _add_adapter(pulleyOcc: adsk.fusion.Occurrence, groupOcc: adsk.fusion.Occurr
             raise RuntimeError('pulley bottom flange face not found')
 
         # Turn it about Z, then drop it so its lowest point sits on the bottom flange face.
+        # Worked out in the pulley's local frame, then carried to world by the pulley's
+        # (root-proxy, i.e. world) transform -- transform2 can only be set through a root
+        # proxy, and the group may sit anywhere in the design.
         clock = math.radians(part['clock_deg'])
         xform = adsk.core.Matrix3D.create()
         xform.setToRotation(clock, adsk.core.Vector3D.create(0, 0, 1),
                             adsk.core.Point3D.create(0, 0, 0))
-        low_z = min(b.boundingBox.minPoint.z for b in adapter_occ.bRepBodies)
+        low_z = min(b.boundingBox.minPoint.z for b in adapter_occ.component.bRepBodies)
         xform.translation = adsk.core.Vector3D.create(0, 0, -FLANGE_THICKNESS_CM - low_z)
+        xform.transformBy(pulleyOcc.transform2)
         adapter_occ.transform2 = xform
 
         adapter_face = _adapter_bottom_face(adapter_occ)
         if adapter_face is None:
             raise RuntimeError(f'{part["file"]} flat face not found')
 
+        # Normals from the native faces: both parts' local Z axes line up, and the joint's
+        # angle is about the pulley face's own normal (-Z), whatever the group's rotation.
+        target_n  = _true_face_normal(pulley_face.nativeObject or pulley_face)
+        adapter_n = _true_face_normal(adapter_face)
         rootComp    = adsk.fusion.Design.cast(app.activeProduct).rootComponent
         joint_input = rootComp.joints.createInput(
             adsk.fusion.JointGeometry.createByPlanarFace(
-                adapter_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint),
+                adapter_face.createForAssemblyContext(adapter_occ), None,
+                adsk.fusion.JointKeyPointTypes.CenterKeyPoint),
             adsk.fusion.JointGeometry.createByPlanarFace(
                 pulley_face, None, adsk.fusion.JointKeyPointTypes.CenterKeyPoint))
-        target_n = _true_face_normal(pulley_face)
-        joint_input.isFlipped = _true_face_normal(adapter_face).dotProduct(target_n) < 0
+        joint_input.isFlipped = adapter_n.dotProduct(target_n) < 0
         joint_input.angle = adsk.core.ValueInput.createByReal(clock * target_n.z)
         joint_input.setAsRigidJointMotion()
         joint = rootComp.joints.add(joint_input)
@@ -607,6 +619,256 @@ def pulley_outer_occurrence(pulley_occ: adsk.fusion.Occurrence) -> adsk.fusion.O
     except Exception:
         pass
     return pulley_occ
+
+
+# ---------------------------------------------------------------------------
+# In-place tooth-count update (belt C-C edits)
+# ---------------------------------------------------------------------------
+
+def _pulley_features(comp: adsk.fusion.Component):
+    """Pick out the features _add_pulley_body / _add_flanges / _add_bore / _add_label made:
+    (body extrude, [bottom, top flange extrudes], bore cut or None, [label cuts]), told
+    apart by operation and depth so it also works on pulleys built before this existed.
+    None if the component doesn't look like a generated pulley."""
+    body_ext, flange_exts, bore_ext, label_exts = None, [], None, []
+    for f in comp.features.extrudeFeatures:
+        op = f.operation
+        if op == adsk.fusion.FeatureOperations.NewBodyFeatureOperation:
+            if body_ext is not None:
+                return None
+            body_ext = f
+        elif op == adsk.fusion.FeatureOperations.JoinFeatureOperation:
+            flange_exts.append(f)
+        elif op == adsk.fusion.FeatureOperations.CutFeatureOperation:
+            extent = adsk.fusion.DistanceExtentDefinition.cast(f.extentOne)
+            # (a Negative-direction extent reads back as a negative distance)
+            if extent is not None and abs(abs(extent.distance.value) - LABEL_ENGRAVE_CM) < 1e-6:
+                label_exts.append(f)
+            elif bore_ext is None:
+                bore_ext = f
+            else:
+                return None
+    if body_ext is None or len(flange_exts) != 2:
+        return None
+    return body_ext, flange_exts, bore_ext, label_exts
+
+
+def _feature_sketch(feature: adsk.fusion.ExtrudeFeature) -> adsk.fusion.Sketch:
+    """The sketch an extrude's profile (a Profile or a SketchText) lives in."""
+    prof = feature.profile
+    if isinstance(prof, adsk.core.ObjectCollection):
+        prof = prof.item(0)
+    return prof.parentSketch
+
+
+def _set_circle_diameter(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle,
+                         dia_cm: float):
+    """Drive `circle`'s diameter dimension (from _draw_circle) to `dia_cm`."""
+    token = circle.entityToken
+    for dim in sketch.sketchDimensions:
+        dia_dim = adsk.fusion.SketchDiameterDimension.cast(dim)
+        if dia_dim is not None and dia_dim.entity.entityToken == token:
+            dia_dim.parameter.value = dia_cm
+            return
+    raise RuntimeError(f'{sketch.name}: no diameter dimension on the circle')
+
+
+def update_pulley_teeth(pulley_occ: adsk.fusion.Occurrence, n_teeth: int,
+                        design: adsk.fusion.Design) -> bool:
+    """Change a generated pulley's tooth count by editing its features in place.
+
+    The occurrences (group, pulley, adapter), the flange extrudes and the belt's revolute
+    joint circle all survive, so joints the user made to the flange faces stay valid --
+    deleting and rebuilding the pulley deleted them. The teeth are redrawn in their sketch
+    with the timeline rolled back to the body extrude, the flange circle is re-dimensioned,
+    and the label is re-engraved. The bore and the adapter don't depend on the tooth count
+    (the bottom flange stays at z = -FLANGE_THICKNESS_CM), so they are left alone.
+
+    Returns False without changing anything when the pulley can't be updated this way
+    (unrecognised features, the bore or adapter no longer fits); the caller then rebuilds it.
+    """
+    comp  = pulley_occ.component
+    attrs = comp.attributes
+
+    def _attr(name, default=None):
+        a = attrs.itemByName(ATTR_GROUP, name)
+        return a.value if a is not None else default
+
+    belt_pitch_mm  = 5 if '5mm' in _attr(ATTR_PULLEY_BELT_TYPE, BELT_HTD) else 3
+    width_mm       = int(_attr(ATTR_PULLEY_BELT_WIDTH, '9 mm').split()[0])
+    belt_width_cm  = width_mm / 10.0
+    show_teeth     = _attr(ATTR_PULLEY_SHOW_TEETH, 'False').lower() == 'true'
+    bore_type      = _attr(ATTR_PULLEY_BORE_TYPE, BORE_HALF_HEX)
+    offset_expr    = _attr(ATTR_PULLEY_BORE_OFFSET)
+    bore_offset_cm = (design.unitsManager.evaluateExpression(offset_expr, 'in')
+                      if offset_expr else BORE_OFFSET_DEFAULT_IN * 2.54)
+    use_adapter    = _attr(ATTR_PULLEY_ADAPTER, 'False').lower() == 'true'
+    adapter_part   = ADAPTER_PARTS.get(bore_type) if use_adapter else None
+
+    tooth_od_cm = _outer_diameter_cm(belt_pitch_mm, n_teeth)
+    bore_radius = _bore_radius_cm(bore_type, bore_offset_cm)
+    if bore_radius >= tooth_od_cm / 2:
+        return False
+    if adapter_part is not None and not _adapter_fits(adapter_part, belt_pitch_mm, tooth_od_cm):
+        return False
+
+    feats = _pulley_features(comp)
+    if feats is None:
+        futil.log(f'PartsGen: {comp.name} features not recognised, rebuilding it instead')
+        return False
+    body_ext, flange_exts, bore_ext, label_exts = feats
+    if bore_ext is None:
+        return False    # built without a bore (too small); a rebuild adds it back
+    try:
+        teeth_sk  = _feature_sketch(body_ext)
+        flange_sk = _feature_sketch(flange_exts[0])
+        bore_sk   = _feature_sketch(bore_ext)
+    except Exception:
+        return False
+
+    def _joint_circle():
+        """The circle the belt's revolute joint is on: without teeth it's the body's own
+        profile circle; with teeth the pulley's only construction circle, at the origin
+        (in the original tooth sketch -- after an update the teeth live elsewhere).
+        Construction planes' entityTokens don't compare equal, so no plane test."""
+        if not show_teeth:
+            sk = _feature_sketch(comp.features.extrudeFeatures.itemByName(body_name))
+            circles = list(sk.sketchCurves.sketchCircles)
+            return (sk, circles[0]) if len(circles) == 1 else (None, None)
+        for sk in comp.sketches:
+            for c in sk.sketchCurves.sketchCircles:
+                if c.isConstruction and c.centerSketchPoint.geometry.distanceTo(
+                        adsk.core.Point3D.create(0, 0, 0)) < 1e-6:
+                    return sk, c
+        return None, None
+
+    # Handles taken before a rollTo don't work after it (drawing into one, the circular
+    # pattern then said "value not in this sketch"), so re-fetch everything by name.
+    body_name   = body_ext.name
+    label_names = [f.name for f in label_exts]
+    teeth_name, flange_name, bore_name = teeth_sk.name, flange_sk.name, bore_sk.name
+    if _joint_circle()[1] is None or flange_sk.sketchCurves.sketchCircles.count != 1:
+        return False
+
+    old_name  = comp.name
+    prefix    = 'Pulley_HTD_5mm' if belt_pitch_mm == 5 else 'Pulley_GT2_3mm'
+    new_name  = f'{prefix}-{n_teeth}Tx{width_mm}mm'
+    timeline  = design.timeline
+    try:
+        # --- teeth: with the timeline just before the body extrude ---
+        # Inside a collapsed timeline group an item has no index and rollTo raises
+        # "Associated feature is invalid", so open the pulley's group for the edit.
+        group = body_ext.timelineObject.parentGroup
+        reopen = group is not None and group.isCollapsed
+        if reopen:
+            group.isCollapsed = False
+        body_ext.timelineObject.rollTo(True)
+        try:
+            body_ext = comp.features.extrudeFeatures.itemByName(body_name)
+            joint_sk, joint_circle = _joint_circle()
+            if show_teeth:
+                # ExtrudeFeature.profile can't be set once its current profile is gone
+                # ("InternalValidationError : curProfile"), so draw the new teeth in a new
+                # sketch, swap the profile over, then clear the old teeth.
+                new_sk = comp.sketches.add(comp.xYConstructionPlane)
+                geometry_fn = (createHTDPulleyGeometry if belt_pitch_mm == 5
+                               else createGT2PulleyGeometry)
+                geometry_fn(new_sk, belt_pitch_mm, n_teeth)
+                if new_sk.profiles.count != 1:
+                    raise RuntimeError(f'tooth sketch has {new_sk.profiles.count} profiles')
+                body_ext.profile = new_sk.profiles.item(0)
+                old_sk = comp.sketches.itemByName(teeth_name)
+                stale = [c for c in old_sk.sketchCurves if not c.isConstruction]
+                old_sk.isComputeDeferred = True
+                try:
+                    for curve in stale:
+                        if curve.isValid:
+                            curve.deleteMe()
+                finally:
+                    old_sk.isComputeDeferred = False
+                if old_sk.sketchCurves.count == 0:
+                    old_sk.deleteMe()   # teeth only, no joint circle: nothing left to keep
+            _set_circle_diameter(joint_sk, joint_circle, tooth_od_cm)
+        finally:
+            timeline.moveToEnd()
+            if reopen:
+                group.isCollapsed = True
+        body_ext = comp.features.extrudeFeatures.itemByName(body_name)
+        if body_ext.healthState != adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState:
+            raise RuntimeError(f'body extrude: {body_ext.errorOrWarningMessage}')
+
+        # --- flanges: same features, new diameter ---
+        flange_sk = comp.sketches.itemByName(flange_name)
+        bore_sk   = comp.sketches.itemByName(bore_name)
+        _set_circle_diameter(flange_sk, flange_sk.sketchCurves.sketchCircles.item(0),
+                             tooth_od_cm + FLANGE_OD_OFFSET_CM)
+
+        # --- label: re-engrave (its position depends on the OD) ---
+        # The bottom label shares the bore's plane (keep it); the top label has its own
+        # plane above the pulley. Told apart by offset sign, by name -- construction
+        # planes' entityTokens don't compare equal.
+        bot_plane = adsk.fusion.ConstructionPlane.cast(bore_sk.referencePlane)
+        label_exts = [comp.features.extrudeFeatures.itemByName(n) for n in label_names]
+        label_sketches, label_planes = {}, {}
+        for f in label_exts:
+            sk = _feature_sketch(f)
+            label_sketches[sk.name] = sk
+            plane = adsk.fusion.ConstructionPlane.cast(sk.referencePlane)
+            offset = (adsk.fusion.ConstructionPlaneOffsetDefinition.cast(plane.definition)
+                      if plane is not None else None)
+            if offset is not None and offset.offset.value > 0:
+                label_planes[plane.name] = plane
+        for f in label_exts:
+            f.deleteMe()
+        for sk in label_sketches.values():
+            sk.deleteMe()
+        for plane in label_planes.values():
+            plane.deleteMe()
+        label_floor_cm = bore_radius
+        if adapter_part is not None:
+            label_floor_cm = max(label_floor_cm, adapter_part['radius_cm'])
+        # The new label lands at the end of the timeline (the other edits stay inside
+        # the pulley's own group), so group just those items.
+        label_start = timeline.markerPosition
+        _add_label(comp, belt_width_cm, n_teeth, tooth_od_cm, label_floor_cm, bot_plane)
+        _log_unconstrained(comp)
+        # A first build hides each sketch as a feature consumes it; the swapped-in tooth
+        # sketch and the re-engraved label's sketches stay visible, so hide them all.
+        for sk in comp.sketches:
+            sk.isLightBulbOn = False
+        futil.group_timeline_features(design, label_start, f'{new_name} label')
+    except Exception:
+        futil.handle_error(f'PartsGen: in-place update of {old_name}', show_message_box=False)
+        return False
+
+    # --- bookkeeping: tooth count, names ---
+    try:
+        old = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT)
+        if old is not None:
+            old.deleteMe()
+        attrs.add(ATTR_GROUP, ATTR_PULLEY_TOOTH_COUNT, str(n_teeth))
+        if attrs.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME) is None:
+            comp.name = new_name
+            outer = pulley_outer_occurrence(pulley_occ)
+            owners = [outer.assemblyContext.component if outer.assemblyContext is not None
+                      else design.rootComponent, design.rootComponent]
+            if outer is not pulley_occ:
+                outer.component.name = f'{new_name}_Group'
+                owners.append(outer.component)
+            # The generated joints are named after the pulley (_revolute / _adapter). Match
+            # them by the pulley they hold, not by name: both of a belt's pulleys start out
+            # with the same base name, so their joints are "X_revolute" and "X_revolute (1)".
+            for owner in owners:
+                for joint in owner.joints:
+                    suffix = next((s for s in ('_revolute', '_adapter')
+                                   if s in joint.name), None)
+                    occs = (joint.occurrenceOne, joint.occurrenceTwo)
+                    if suffix and any(o is not None and o.component == comp for o in occs):
+                        joint.name = new_name + suffix
+    except Exception:
+        futil.log(f'PartsGen: renaming {old_name} after its tooth-count update failed')
+    futil.log(f'PartsGen: {old_name} updated in place to {n_teeth}T')
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,33 @@ session.
 
 ## Lessons
 
+### Regenerating a part by delete + rebuild kills every joint the user made to it -- edit its features in place
+Edit C-C's tooth-count change deleted the belt pulley's group and rebuilt it; the user's joints to its flange faces
+went with it. **Fix:** keep the occurrences and features and edit them. The traps, all hit live:
+(1) an item in a *collapsed* timeline group has no index, so `rollTo` raises "Associated feature is invalid" --
+set `group.isCollapsed = False` first; (2) handles taken before `rollTo` misbehave after it ("value not in this
+sketch", `InternalValidationError : curProfile`) -- re-fetch features/sketches with `itemByName`; (3)
+`ExtrudeFeature.profile` can't be set once its current profile's curves are deleted -- draw the new profile in a
+*new* sketch, swap, then clear the old one; (4) construction planes' `entityToken`s never compare equal.
+Diameter changes via `SketchDiameterDimension.parameter.value` keep the flange faces, so joints to them survive.
+(5) A sketch is only auto-hidden when a feature is first built from it -- one swapped in via `.profile` stays
+visible, so set `sketch.isLightBulbOn = False` afterwards.
+`commands/PartsGen/pulley_gen.py` (`update_pulley_teeth`)
+
+### A world-space face search on a part inside a moved parent matches the wrong face
+The belt pulley's adapter was jointed 1.03 cm high: `_bottom_flange_face` looked for z = -flange thickness in world
+space, and with the user's belt jointed 1.03 cm down it matched the underside of the *top* flange (0.9 + 0.1346).
+**Fix:** search `occ.component.bRepBodies` (local frame) and return `face.createForAssemblyContext(occ)`. Place a
+child relative to a sibling with `local.transformBy(sibling_root_proxy.transform2)`, set on the root proxy --
+`transform2` on a native nested occurrence raises "can only be set on Occurrence proxy from root component".
+`commands/PartsGen/pulley_gen.py` (`_bottom_flange_face`, `_add_adapter`)
+
+### Walk the component tree first, then modify -- a rebuild mid-walk ends the scan silently
+`_scan_and_update_belt_names` rebuilt one pulley while walking, the deleted component threw, the blanket `except`
+swallowed it, and the belt's other pulley was never updated. **Fix:** collect `(comp, attr)` pairs, then process
+each (`comp.isValid` check).
+`commands/PartsGen/belt_gen.py` (`_scan_and_update_belt_names`)
+
 ### Solver-built profiles (rough geometry + tangents + `dim.value =`) fail at some sizes -- place points in closed form and fix them
 The timing-pulley tooth sketches threw `VCS_SKETCH_OVER_CONSTRAINTS` for GT2 36-60T and `SOLVING_FAILED` for HTD 64/100T:
 the solver had to drag rough guesses too far. **Fix:** solve one tooth in Python (tangent circles/lines, a bisection

@@ -10,7 +10,8 @@ import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
 from ..CCDistance.CCLine import getCCLineFromEntity
-from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, _belt_width_mm,
+from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, update_pulley_teeth,
+                          _belt_width_mm,
                           ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_BELT_COMP_TOKEN,
                           ATTR_PULLEY_PITCH_CIRCLE_IDX, ATTR_PULLEY_TOOTH_COUNT,
                           ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH,
@@ -100,7 +101,12 @@ def _find_comp_by_token(design: adsk.fusion.Design, token: str):
 
 
 def _scan_and_update_belt_names(design: adsk.fusion.Design):
-    """Walk every component in the design and fix belt and pulley names."""
+    """Walk every component in the design and fix belt and pulley names.
+
+    Collects the components first and updates them after: a pulley that has to be
+    rebuilt deletes its occurrence, and walking on through it used to throw and end the
+    scan early, leaving the belt's other pulley at its old tooth count."""
+    belts, pulleys = [], []
     try:
         root    = design.rootComponent
         visited: set = set()
@@ -114,16 +120,21 @@ def _scan_and_update_belt_names(design: adsk.fusion.Design):
 
             belt_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_TYPE)
             if belt_attr is not None:
-                _update_belt_name(comp, belt_attr.value)
+                belts.append((comp, belt_attr.value))
 
             pulley_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE)
             if pulley_attr is not None:
-                _update_pulley_name(comp, pulley_attr.value, design)
+                pulleys.append((comp, pulley_attr.value))
 
             for i in range(comp.occurrences.count):
                 queue.append(comp.occurrences.item(i).component)
     except Exception:
         pass
+    for comp, belt_type in belts:
+        _update_belt_name(comp, belt_type)
+    for comp, pulley_type in pulleys:
+        if comp.isValid:
+            _update_pulley_name(comp, pulley_type, design)
 
 
 def scan_and_rebuild_belts(design: adsk.fusion.Design):
@@ -212,6 +223,13 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
 
         rebuild_start = design.timeline.markerPosition
 
+        # Edit the pulley in place when possible: deleting it also deletes every joint
+        # the user made to it (e.g. to its flange faces).
+        if update_pulley_teeth(pulley_occ, new_n_teeth, design):
+            return
+
+        futil.log(f'PartsGen: rebuilding {old_comp.name} from scratch -- '
+                  'joints made to it will be lost')
         # Its "<pulley>_Group" when it has an adapter; removes any associated joints too.
         pulley_outer_occurrence(pulley_occ).deleteMe()
 
