@@ -2,7 +2,6 @@
 # This module serves as a way to share variables across different
 # modules (global variables).
 
-import os
 import adsk.core
 
 app = adsk.core.Application.get()
@@ -26,37 +25,35 @@ COMPANY_NAME = 'Team4698'
 
 # Toolbar stuff
 WORKSPACE_ID = 'FusionSolidEnvironment'
-SOLID_CREATE_ID = 'SolidCreatePanel'
+SOLID_TAB_ID = 'SolidTab'
 SKETCH_CREATE_ID = 'SketchCreatePanel'
 SKETCH_MODIFY_ID = 'SketchModifyPanel'
 FRC_TOOLS_DROPDOWN_ID = 'FRCToolsSubMenu'
 
-def get_sketch_create_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
+# Our own "FRC" panel in the SOLID tab, sitting alongside the stock Create /
+# Modify / Assemble panels. Fusion remembers ribbon layout per user, so the
+# position below only applies the first time the panel is created.
+FRC_PANEL_ID = f'{COMPANY_NAME}_{ADDIN_NAME}_SolidPanel'
+FRC_PANEL_NAME = 'FRC'
+FRC_PANEL_POSITION = 'SolidModifyPanel'   # the panel we get inserted next to
+FRC_PANEL_BEFORE = False                  # False = after FRC_PANEL_POSITION
+
+def _get_frc_submenu( panel_id: str ) -> adsk.core.ToolbarControl:
+    # Find the FRCTools submenu in the given panel of the workspace.
     workspace = ui.workspaces.itemById( WORKSPACE_ID )
-
-    # Get the sketch panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SKETCH_CREATE_ID )
-
-    # Find the the FRCTools submenu.
+    panel = workspace.toolbarPanels.itemById( panel_id )
     return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
+
+def get_sketch_create_submenu() -> adsk.core.ToolbarControl:
+    return _get_frc_submenu( SKETCH_CREATE_ID )
 
 def get_sketch_modify_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
-    workspace = ui.workspaces.itemById( WORKSPACE_ID )
+    return _get_frc_submenu( SKETCH_MODIFY_ID )
 
-    # Get the sketch panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SKETCH_MODIFY_ID )
+def get_solid_tab() -> adsk.core.ToolbarTab:
+    # The SOLID tab of the Design workspace, which owns the FRC panel.
+    return ui.workspaces.itemById( WORKSPACE_ID ).toolbarTabs.itemById( SOLID_TAB_ID )
 
-    # Find the the FRCTools submenu.
-    return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
-
-def get_solid_submenu() -> adsk.core.ToolbarControl:
-    # Get the target workspace the button will be created in.
-    workspace = ui.workspaces.itemById( WORKSPACE_ID )
-
-    # Get the solid panel the button will be created in.
-    panel = workspace.toolbarPanels.itemById( SOLID_CREATE_ID )
-
-    # Find the the FRCTools submenu.
-    return panel.controls.itemById( FRC_TOOLS_DROPDOWN_ID )
+def get_frc_panel() -> adsk.core.ToolbarPanel:
+    # The FRC panel itself; solid commands hang their buttons directly off this.
+    return get_solid_tab().toolbarPanels.itemById( FRC_PANEL_ID )

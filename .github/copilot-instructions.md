@@ -16,22 +16,25 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 
 ## Project structure
 
-- **`FRCTools.py`** — the add-in entry point. `run()` creates the `FRCTools` dropdown submenu in
-  the Solid-Create, Sketch-Create, and Sketch-Modify panels, then starts every command; `stop()`
-  tears it all down. You rarely need to edit this.
+- **`FRCTools.py`** — the add-in entry point. `run()` creates the custom **FRC** panel in the
+  SOLID tab (solid commands hang their buttons directly off it) plus the `FRCTools` dropdown
+  submenu in the Sketch-Create and Sketch-Modify panels, then starts every command; `stop()`
+  tears it all down, including deleting the FRC panel. You rarely need to edit this.
 - **`config.py`** — shared globals: `WORKSPACE_ID`, the panel IDs, `FRC_TOOLS_DROPDOWN_ID`,
   `ADDIN_NAME`, `COMPANY_NAME` (still the literal `'Team4698'` — it only builds unique internal UI
   IDs, so leave it unless the user asks to rebrand), a `DEBUG` flag, and the
-  `get_solid_submenu()` / `get_sketch_create_submenu()` / `get_sketch_modify_submenu()` helpers
-  that commands use to hang their buttons.
+  `FRC_PANEL_*` settings, and the `get_frc_panel()` / `get_sketch_create_submenu()` /
+  `get_sketch_modify_submenu()` helpers that commands use to hang their buttons.
 - **`commands/__init__.py`** — the command **registry**. Every tool is imported here and listed in
   the `commands[]` array; `start()`/`stop()` iterate over it. **Adding a tool = create a new folder
   under `commands/` and register it in this file.**
-- **`commands/<Name>/entry.py`** — one command each. Use **`AutoHole`** and **`Tubify`** as
+- **`commands/<Name>/entry.py`** — one command each. Use **`AutoHole`** and **`Lighten`** as
   reference implementations. Standard shape:
   - `CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_...'` (must be globally unique),
     `CMD_NAME`, `CMD_Description`, `ICON_FOLDER`, and a module-level `local_handlers = []`.
-  - `start()` — registers the command definition and adds the button to a submenu.
+  - `start()` — registers the command definition and adds the button to the FRC panel (solid
+    tools) or a sketch submenu. Panel controls need `isPromoted = True` or they hide in the
+    panel's overflow dropdown.
   - `stop()` — deletes the control/definition and resets `local_handlers`.
   - `command_created(args)` — builds the dialog `commandInputs`, then wires handlers with
     `futil.add_handler(...)`: `command_execute`, `command_preview` (optional), `command_input_changed`,
@@ -60,6 +63,15 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 - **Units:** Fusion's API works in **centimeters internally**. FRC is imperial, so expose **inch**
   inputs in dialogs but convert to cm before touching geometry — use `IN_TO_CM = 2.54` or
   `futil.inchValue(inches)`.
+- **Sketches must end up fully constrained.** Every sketch a tool generates has to be black/fully
+  constrained, so nothing can be dragged out of shape later. Note that Fusion does **not** merge
+  sketch points created at identical coordinates through the API — curves drawn end-to-end come out
+  with *zero* constraints and only look closed — so stitch the loop with explicit coincident
+  constraints, anchor it (`sketch.originPoint`, or a fixed point when the sketch is on a picked
+  face), and dimension the rest. Assert it with `sketch.isFullyConstrained` rather than assuming.
+  Constraining costs roughly 13 ms per constraint, so skip it in `executePreview` and set
+  `args.isValidResult = False` so `command_execute` rebuilds the committed result constrained. See
+  `commands/PartsGen/shaft_gen.py` (`_draw_rounded_hex`, `_draw_circle`) for a worked example.
 - **Errors & logging:** wrap risky work in `try/except` and route failures through
   `futil.handle_error(name, show_message_box=...)`. Use `futil.log(...)` for tracing. Set
   `config.DEBUG = True` to mirror logs to Fusion's **Text Command** window while developing.
@@ -75,9 +87,29 @@ There are **no automated tests** — tools are verified live in Fusion.
 1. Edit the Python files in place (this repo *is* the installed add-in directory).
 2. In Fusion, open **Scripts and Add-Ins** (`Shift+S`), and **Stop → Run** FRCTools to reload the
    code.
-3. Trigger the command from its `FRCTools` submenu and watch the **Text Command** window (with
+3. Trigger the command from the **FRC** panel (or the `FRCTools` sketch submenu) and watch the **Text Command** window (with
    `config.DEBUG = True`) for `futil.log` output and tracebacks.
 4. To ship, run the VS Code **"Create Installer and Zip Archive"** task (or `bash ./bundle.sh`).
+
+### Always test changes live via the Fusion MCP server
+
+Whenever the Fusion MCP tools (`fusion_mcp_execute`, `fusion_mcp_read`, `fusion_mcp_update`) are
+available, **develop and verify changes against a live Fusion session instead of only reading the
+code** — this is the closest thing this project has to automated testing:
+
+- After editing a command, reload the add-in (Stop → Run) and drive it end-to-end through the MCP
+  server: run the `script` feature type to invoke the command/API path being changed, or to poke at
+  the resulting geometry directly (e.g. `adsk.fusion` calls to inspect bodies/sketches/parameters).
+- Use the `read` tool's `screenshot` query to visually confirm the resulting geometry looks right,
+  and `apiDocumentation` to check exact signatures/enums before calling unfamiliar Fusion API
+  members instead of guessing.
+- Use `fusion_mcp_update` (`undo`/`redo`) to clean up test artifacts left in the open document after
+  a verification run, so exploratory testing doesn't pollute the user's design.
+- Prefer this live loop over "looks correct on inspection" — Fusion API behavior (units, parametric
+  feature ordering, sketch/timeline side effects) is full of gotchas that only show up at runtime;
+  see [LESSONS_LEARNED.md](../LESSONS_LEARNED.md).
+- If the MCP server isn't connected/available, fall back to the manual Scripts-and-Add-Ins workflow
+  above and say so rather than skipping testing.
 
 ## Lessons learned — keep this growing
 

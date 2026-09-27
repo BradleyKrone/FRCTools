@@ -5,24 +5,22 @@
 from .BoltPattern import entry as BoltPattern
 from .CCDistance import entry as CCDistance
 from .FaceFillet import entry as FaceFillet
-from .FilletXpert import entry as FilletXpert
 from .Lighten import entry as Lighten
 from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
-from .Tubify import entry as Tubify
 from .AutoHole import entry as AutoHole
+from .JointInspector import entry as JointInspector
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
     BoltPattern,
     CCDistance,
     FaceFillet,
-    FilletXpert,
     Lighten,
     QuickCircle,
     PartsGen,
-    Tubify,
-    AutoHole
+    AutoHole,
+    JointInspector
 ]
 
 

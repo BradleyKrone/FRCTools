@@ -14,7 +14,7 @@ CMD_NAME = 'Lighten'
 CMD_Description = 'Lighten a solid by pocketing'
 
 # Specify that the command will be promoted to the panel.
-IS_PROMOTED = False
+IS_PROMOTED = True
 
 # Resource location for command icons, here we assume a sub folder in this directory named "resources".
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
@@ -62,21 +62,22 @@ def start():
     futil.add_handler(cmd_def.commandCreated, command_created)
 
     # ******** Add a button into the UI so the user can run the command. ********
-    # Get the FRCTool submenu.
-    submenu = config.get_solid_submenu()
+    # Get the FRC panel.
+    panel = config.get_frc_panel()
 
     # # Create the button command control in the UI.
-    control = submenu.controls.addCommand(cmd_def)
+    control = panel.controls.addCommand(cmd_def)
 
     # Specify if the command is promoted to the main toolbar. 
+    control.isPromotedByDefault = IS_PROMOTED
     control.isPromoted = IS_PROMOTED
 
 # Executed when add-in is stopped.
 def stop():
 
     # Get the various UI elements for this command
-    submenu = config.get_solid_submenu()
-    command_control = submenu.controls.itemById(CMD_ID)
+    panel = config.get_frc_panel()
+    command_control = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
 
     # Delete the button command control
@@ -87,9 +88,6 @@ def stop():
     # Delete the command definition
     if command_definition:
         command_definition.deleteMe()
-
-    global ui_handlers
-    ui_handlers = []
 
 # Function that is called when a user clicks the corresponding button in the UI.
 # This defines the contents of the command dialog and connects to the command related events.
@@ -347,7 +345,6 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers
     local_handlers = []
 
-# def offsetProfile( solid: adsk.fusion.BRepBody, profile: LightenProfile ) :
 def offsetProfile( profile: LightenProfile ) :
 
     # Create a temporary sketch

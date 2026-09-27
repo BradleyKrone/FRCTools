@@ -9,7 +9,6 @@
 #  AUTODESK, INC. DOES NOT WARRANT THAT THE OPERATION OF THE PROGRAM WILL BE
 #  UNINTERRUPTED OR ERROR FREE.
 
-import os
 import traceback
 import adsk.core
 import adsk.fusion
@@ -76,30 +75,10 @@ def print_SketchObjectCollection( col: adsk.core.ObjectCollection ) :
         log(f'   isFixed({item.isFixed}), is2D({item.is2D}), isFullyConstr({item.isFullyConstrained}), isRef({item.isReference})')
         print_SketchCurve( item )
 
-def print_Selection( selections: adsk.core.SelectionCommandInput ) :
-    i = 0
-    log(f'Selection has {selections.selectionCount} items.')
-    while i < selections.selectionCount:
-        print_BaseObject( selections.selection(i).entity )
-        i += 1
-
-def print_BaseObject( object: adsk.core.Base ) :
-    log(f'item type = {object.objectType}, isValid={object.isValid}')
-
 def print_OrientedBB( orientedBB: adsk.core.OrientedBoundingBox3D ) :
     log(f'item type = {orientedBB.objectType}, isValid={orientedBB.isValid}')
     log(f'   height = {orientedBB.height}, length={orientedBB.length}, width={orientedBB.width}')
     print_Point3D( orientedBB.centerPoint, "   centerPt: ")
-
-def print_BBox( bbox: adsk.core.BoundingBox3D ) :
-    log(f'item type = {bbox.objectType}, isValid={bbox.isValid}')
-    log(f'   minPt = {format_Point3D(bbox.minPoint)}, maxPt={format_Point3D(bbox.maxPoint)}')
-
-def print_Point2D( pt: adsk.core.Point2D, prefix: str = "" ) :
-    log( f'{prefix} {format_Point2D( pt )}' )
-
-def format_Point2D( pt: adsk.core.Point2D ) :
-    return f'({pt.x:.4},{pt.y:.4})'
 
 def format_Vector2D( v: adsk.core.Vector2D ) :
     return f'({v.x:.4},{v.y:.4})'
@@ -134,26 +113,6 @@ def print_SketchCurve( curve: adsk.fusion.SketchCurve ) :
         log(f'print_SketchCurve() --> {curve.objectType} Not handled.')
     log(f'    is2D({curve.is2D}), isDeletable({curve.isDeletable}), isFixed({curve.isFixed}), isFullyConstrained({curve.isFullyConstrained})')
     log(f'    isLinked({curve.isLinked}), isReference({curve.isReference}), isValid({curve.isValid}), isVisible({curve.isVisible})')
-
-def print_Curve2D( curve: adsk.core.Curve2D ) :
-    if curve.objectType == adsk.core.Line2D.classType() :
-        line: adsk.core.Line2D = curve
-        log(f'Line2D: {format_Point2D(line.startPoint)} -- {format_Point2D(line.endPoint)}')
-    elif curve.objectType == adsk.core.Arc2D.classType() :
-        arc: adsk.core.Arc2D = curve
-        str = f'Arc2D: C{format_Point2D(arc.center)}, {format_Point2D(arc.startPoint)} -- {format_Point2D(arc.endPoint)}'
-        str += f', R={arc.radius:.4}'
-        log(str)
-    elif curve.objectType == adsk.core.Circle2D.classType() :
-        circle: adsk.core.Circle2D = curve
-        str = f'Circle2D: C{format_Point2D(circle.center)}, '
-        str += f'radius = {circle.radius:.4}'
-        log(str)
-    elif curve.objectType == adsk.core.Point2D.classType() :
-        pt: adsk.core.Point2D = curve
-        log(f'Point2D: {format_Point2D(pt)}')
-    else :
-        log(f'print_Curve2D() --> {curve.objectType} Not handled.')
 
 def print_Curve3D( curve: adsk.core.Curve3D ) :
     if curve.objectType == adsk.core.Line3D.classType() :
@@ -206,3 +165,72 @@ def inchValue( inches: float ) -> adsk.core.ValueInput :
 
 def Value( number: float ) -> adsk.core.ValueInput :
     return adsk.core.ValueInput.createByReal( number )
+
+def group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
+    """Group all timeline items from start_marker to the current marker into a named group."""
+    try:
+        timeline = design.timeline
+        end_marker = timeline.markerPosition - 1
+        if end_marker > start_marker:
+            group = timeline.timelineGroups.add(start_marker, end_marker)
+            group.name = group_name
+    except Exception:
+        log(f'FRCTools: failed to create timeline group "{group_name}"')
+
+
+def add_occurrence_in_active(design: adsk.fusion.Design,
+                             world_transform: adsk.core.Matrix3D = None,
+                             parent_occ: adsk.fusion.Occurrence = None) -> adsk.fusion.Occurrence:
+    """A new component occurrence in the active component (the root when none is active) --
+    or in `parent_occ`, a root-context occurrence -- returned as a root-context proxy so
+    createForAssemblyContext / sketch / joint calls on it work unchanged. `world_transform`
+    (default identity in its parent) is where it goes in world space. Raises RuntimeError in
+    a Part Design document, like addNewComponent."""
+    active = parent_occ if parent_occ is not None else design.activeOccurrence
+    parent = active.component if active is not None else design.rootComponent
+    local = adsk.core.Matrix3D.create()
+    if world_transform is not None:
+        local = world_transform.copy()
+        if active is not None:
+            to_local = active.transform2.copy()     # the proxy's full world transform
+            to_local.invert()
+            local.transformBy(to_local)
+    occ = parent.occurrences.addNewComponent(local)
+    return occ.createForAssemblyContext(active) if active is not None else occ
+
+
+def get_or_create_appearance(design: adsk.fusion.Design, name: str, rgb) -> adsk.core.Base:
+    """Return a design-local Appearance named `name`, colored `rgb` (an (r, g, b) 0-255
+    tuple) -- reusing it if a previous call already created it in this design, or copying
+    a base appearance out of the Fusion Appearance Library the first time it's needed.
+
+    An existing appearance found by name has its color re-synced to `rgb` on every call
+    (not just set once at creation), so a code change to the target color takes effect on
+    documents that already created it under the old color, and every part sharing the
+    named appearance stays in sync rather than only new ones.
+
+    Used to mark a specific face with a persistent color override (e.g. PartsGen's
+    reference-face indicator) -- unlike a CustomGraphics overlay, this is a real design
+    property that's saved with the file and survives after the command that created it
+    closes.
+    """
+    r, g, b = rgb
+    existing = design.appearances.itemByName(name)
+    if existing:
+        color_prop = existing.appearanceProperties.itemByName('Color')
+        if color_prop:
+            color_prop.value = adsk.core.Color.create(r, g, b, 255)
+        return existing
+
+    lib = app.materialLibraries.itemByName('Fusion Appearance Library')
+    src = lib.appearances.itemByName('Paint - Enamel Glossy (Yellow)') if lib else None
+    if src is None and lib and lib.appearances.count > 0:
+        src = lib.appearances.item(0)
+    if src is None:
+        raise RuntimeError('Fusion Appearance Library unavailable -- cannot create appearance')
+
+    appearance = design.appearances.addByCopy(src, name)
+    color_prop = appearance.appearanceProperties.itemByName('Color')
+    if color_prop:
+        color_prop.value = adsk.core.Color.create(r, g, b, 255)
+    return appearance

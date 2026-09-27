@@ -378,7 +378,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # futil.log(f'{args.firingEvent.name} Command Validate Event, Motion={motionType.selectedItem.index}, N1={cog1Teeth.value}, N2={cog2Teeth.value}, T={beltTeeth.value}')
     args.areInputsValid = True        
 
-    if not (cog1Teeth.value >= 6 and cog1Teeth.value < 100 and cog2Teeth.value >= 6 and cog1Teeth.value < 100 ):
+    if not (cog1Teeth.value >= 6 and cog1Teeth.value < 100 and cog2Teeth.value >= 6 and cog2Teeth.value < 100 ):
         status.formattedText = '<div align="center"><font color="red">Invalid Number of cog teeth! [6-100]</font></div>'
         args.areInputsValid = False
         return

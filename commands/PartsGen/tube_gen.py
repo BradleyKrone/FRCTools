@@ -46,6 +46,13 @@ ATTR_ADD_HOLES   = 'tube_add_holes'
 ATTR_HOLE_SIZE   = 'hole_size'
 ATTR_HOLE_DIAM   = 'hole_diam_expr'
 ATTR_LEN_EXPR    = 'custom_len_expr'
+ATTR_CUSTOM_NAME = 'custom_name'
+
+# Persistent color marking the reference face (the face the part was extruded from) --
+# matches entry.py's transient preview highlight so the color doesn't change when the
+# dialog closes and this permanent appearance takes over.
+REF_FACE_APPEARANCE_NAME = 'FRCTools_PartsGen_RefFace'
+REF_FACE_COLOR           = (120, 190, 255)  # light blue
 
 
 # ===========================================================================
@@ -61,17 +68,81 @@ def _bbox_center(face: adsk.fusion.BRepFace) -> adsk.core.Point3D:
     )
 
 
-def _largest_profile(sketch: adsk.fusion.Sketch) -> adsk.fusion.Profile:
-    """Return the sketch profile with the largest area."""
-    best = sketch.profiles.item(0)
-    best_area = best.areaProperties().area
-    for i in range(1, sketch.profiles.count):
-        p = sketch.profiles.item(i)
-        a = p.areaProperties().area
-        if a > best_area:
-            best_area = a
-            best = p
-    return best
+def _anchor_point(sketch: adsk.fusion.Sketch,
+                  center: adsk.core.Point3D) -> adsk.fusion.SketchPoint:
+    """Return a sketch point at `center` that a profile can be constrained against.
+
+    A sketch on the XY plane is centred on the sketch origin, which is already a fixed
+    reference. A sketch on a picked face is centred on that face's bounding box, which
+    has no natural reference in the sketch, so anchor it with a fixed point.
+    """
+    if abs(center.x) < 1e-9 and abs(center.y) < 1e-9:
+        return sketch.originPoint
+    anchor = sketch.sketchPoints.add(adsk.core.Point3D.create(center.x, center.y, 0.0))
+    anchor.isFixed = True
+    return anchor
+
+
+def _draw_rectangle(sketch: adsk.fusion.Sketch,
+                    center: adsk.core.Point3D,
+                    width_cm: float,
+                    height_cm: float,
+                    constrain: bool = True) -> list:
+    """Draw a fully-constrained rectangle `width_cm` x `height_cm` centred at `center`
+    in sketch space. Returns the four sketch lines (bottom, right, top, left).
+
+    Curves created at identical coordinates are *not* merged by Fusion — the loop
+    closes only by luck and can be dragged apart — so each corner is stitched with an
+    explicit coincident constraint, anchored, and dimensioned (see
+    `shaft_gen._draw_rounded_hex` for the original worked example of this pattern).
+
+    `constrain=False` draws the geometry only, for use inside `executePreview`; the
+    caller must rebuild with `constrain=True` for the committed result.
+    """
+    cx, cy = center.x, center.y
+    hw = width_cm / 2.0
+    hh = height_cm / 2.0
+
+    corners = [
+        adsk.core.Point3D.create(cx - hw, cy - hh, 0),
+        adsk.core.Point3D.create(cx + hw, cy - hh, 0),
+        adsk.core.Point3D.create(cx + hw, cy + hh, 0),
+        adsk.core.Point3D.create(cx - hw, cy + hh, 0),
+    ]
+    lines_col = sketch.sketchCurves.sketchLines
+    lines = [lines_col.addByTwoPoints(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+
+    if not constrain:
+        return lines
+
+    # --- Constrain ------------------------------------------------------------
+    # 16 dof for 4 unconnected lines, removed by exactly the constraints/dimensions
+    # below, so the sketch lands fully constrained.
+    gc = sketch.geometricConstraints
+    sd = sketch.sketchDimensions
+
+    for i in range(4):                                                  # -8 dof
+        gc.addCoincident(lines[i].endSketchPoint, lines[(i + 1) % 4].startSketchPoint)
+
+    anchor = _anchor_point(sketch, corners[0])
+    gc.addCoincident(lines[0].startSketchPoint, anchor)                 # -2 dof
+
+    bottom, right, top, left = lines
+    gc.addHorizontal(bottom)                                            # -4 dof
+    gc.addHorizontal(top)
+    gc.addVertical(right)
+    gc.addVertical(left)
+
+    sd.addDistanceDimension(                                            # -2 dof
+        bottom.startSketchPoint, bottom.endSketchPoint,
+        adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+        adsk.core.Point3D.create(cx, cy - hh - 0.3, 0.0))
+    sd.addDistanceDimension(
+        bottom.startSketchPoint, left.startSketchPoint,
+        adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+        adsk.core.Point3D.create(cx - hw - 0.3, cy, 0.0))
+
+    return lines
 
 
 def _extrude_direction(face1: adsk.fusion.BRepFace,
@@ -109,31 +180,21 @@ def _extrude_one_side(comp: adsk.fusion.Component,
     return extrudes.add(extInput)
 
 
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker into a named group."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
-
-
 # ===========================================================================
 # Tube face holes — seed hole + feature rectangular pattern
 # ===========================================================================
 
 def _add_face_holes(comp: adsk.fusion.Component,
                     body: adsk.fusion.BRepBody,
-                    wall_thickness_cm: float,
                     hole_diam_cm: float,
                     extrusion_axis: adsk.core.Vector3D,
-                    custom_len_expr=None):
-    """Drill holes on each outer long face.
+                    custom_len_expr=None,
+                    constrain: bool = True):
+    """Drill holes through each pair of opposite tube walls.
 
-    One seed hole is sketched and extruded, then a **feature** rectangular
+    Only two adjacent outer faces are sketched (one per wall direction); each
+    seed hole is cut the tube's full depth, so it passes through both the near wall and
+    the opposite wall.  One seed hole is sketched and extruded, then a **feature** rectangular
     pattern replicates that cut.  Because the replication lives at the
     feature level (not the sketch level), Fusion re-drives every cut
     instance on each recompute — so when ``custom_len_expr`` is a user
@@ -150,9 +211,12 @@ def _add_face_holes(comp: adsk.fusion.Component,
     body_cy = (bb.minPoint.y + bb.maxPoint.y) / 2.0
     body_cz = (bb.minPoint.z + bb.maxPoint.z) / 2.0
 
-    # --- Collect outer wall faces -------------------------------------------
-    outer_faces = []
-    seen_ids    = set()
+    # --- Collect one outer wall face per wall direction ---------------------
+    # A full-depth cut from one face also drills the opposite wall, so a face
+    # parallel to one already kept is skipped -- leaving two adjacent faces.
+    outer_faces  = []
+    kept_normals = []
+    seen_ids     = set()
 
     for face in body.faces:
         _, face_normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
@@ -170,33 +234,27 @@ def _add_face_holes(comp: adsk.fusion.Component,
         if fid in seen_ids:
             continue
         seen_ids.add(fid)
+        if any(abs(face_normal.dotProduct(n)) > 0.5 for n in kept_normals):
+            continue
+        kept_normals.append(face_normal)
         outer_faces.append(face)
 
-    futil.log(f'_add_face_holes: {len(outer_faces)} outer faces')
+    futil.log(f'_add_face_holes: {len(outer_faces)} outer faces (one per wall direction)')
 
     holeArea = hole_diam_cm ** 2 * math.pi / 4.0
 
     for face in outer_faces:
         try:
-            # --- Sketch: seed hole + direction construction lines -----------
+            # --- Sketch: seed hole ------------------------------------------
+            # Every API call costs ~0.1 s in a big assembly and this runs on each
+            # preview tick, so: reuse the edges sketches.add() already projects
+            # (a separate project() per edge doubled them), draw the circle at its
+            # final spot (no dimension values to set), and defer sketch compute
+            # while drawing.
             sketch: adsk.fusion.Sketch = comp.sketches.add(face)
             sketch.name = 'SeedHole'
 
-            sketchEdges = adsk.core.ObjectCollection.create()
-            for edge in face.edges:
-                projected = sketch.project(edge)
-                if projected.count > 0:
-                    sketchEdges.add(projected.item(0))
-
-            edge_list = []
-            for idx in range(sketchEdges.count):
-                e = sketchEdges.item(idx)
-                try:
-                    if e.length > 1e-4:
-                        edge_list.append(e)
-                except Exception:
-                    pass
-
+            edge_list = [l for l in sketch.sketchCurves.sketchLines if l.length > 1e-4]
             if len(edge_list) < 2:
                 futil.log('  _add_face_holes: insufficient edges, skipping face')
                 continue
@@ -212,73 +270,68 @@ def _add_face_holes(comp: adsk.fusion.Component,
                 futil.log(f'  _add_face_holes: face too narrow ({widthIn:.2f}"), skipping')
                 continue
 
-            leUnitVec = futil.sketchLineUnitVec(longEdge)
-            seUnitVec = futil.sketchLineUnitVec(shortEdge)
+            # A short edge that shares an end with longEdge; that end is the corner.
+            # The sign flips each edge's unit vector to point away from the corner.
             cornerPoint = None
-
-            if longEdge.startSketchPoint.geometry.isEqualTo(shortEdge.startSketchPoint.geometry):
-                cornerPoint = longEdge.startSketchPoint
-            elif longEdge.startSketchPoint.geometry.isEqualTo(shortEdge.endSketchPoint.geometry):
-                cornerPoint = longEdge.startSketchPoint
-                seUnitVec = futil.multVector2D(seUnitVec, -1.0)
-            elif longEdge.endSketchPoint.geometry.isEqualTo(shortEdge.startSketchPoint.geometry):
-                cornerPoint = longEdge.endSketchPoint
-                leUnitVec = futil.multVector2D(leUnitVec, -1.0)
-            elif longEdge.endSketchPoint.geometry.isEqualTo(shortEdge.endSketchPoint.geometry):
-                cornerPoint = longEdge.endSketchPoint
-                leUnitVec = futil.multVector2D(leUnitVec, -1.0)
-                seUnitVec = futil.multVector2D(seUnitVec, -1.0)
+            for cand in edge_list:
+                if abs(cand.length - shortEdge.length) > 1e-4:
+                    continue
+                for lp, leSign in ((longEdge.startSketchPoint, 1), (longEdge.endSketchPoint, -1)):
+                    for sp, seSign in ((cand.startSketchPoint, 1), (cand.endSketchPoint, -1)):
+                        if cornerPoint is None and lp.geometry.isEqualTo(sp.geometry):
+                            cornerPoint, shortEdge = lp, cand
+                            leSignF, seSignF = leSign, seSign
 
             if cornerPoint is None:
                 futil.log('  _add_face_holes: no shared corner, skipping face')
                 continue
 
-            # Seed hole circle
-            diag = leUnitVec.copy()
-            diag.add(seUnitVec)
+            leUnitVec = futil.multVector2D(futil.sketchLineUnitVec(longEdge),  leSignF)
+            seUnitVec = futil.multVector2D(futil.sketchLineUnitVec(shortEdge), seSignF)
+
+            # Seed hole circle, HOLE_OFFSET_CM in from both edges
+            cp = cornerPoint.geometry
             seedPt = adsk.core.Point3D.create(
-                cornerPoint.geometry.x + diag.x,
-                cornerPoint.geometry.y + diag.y,
+                cp.x + (leUnitVec.x + seUnitVec.x) * HOLE_OFFSET_CM,
+                cp.y + (leUnitVec.y + seUnitVec.y) * HOLE_OFFSET_CM,
                 0.0,
             )
-            cornerHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(
-                seedPt, hole_diam_cm / 2.0
-            )
+            sketch.isComputeDeferred = True
+            try:
+                cornerHole = sketch.sketchCurves.sketchCircles.addByCenterRadius(
+                    seedPt, hole_diam_cm / 2.0
+                )
+                # Dimensions only on the committed build -- the geometry is already
+                # exact, so the preview looks identical without them.
+                if constrain:
+                    sd = sketch.sketchDimensions
+                    sd.addDiameterDimension(
+                        cornerHole, futil.offsetPoint3D(seedPt, 0.1, 0.1, 0))
+                    sd.addOffsetDimension(longEdge,  cornerHole.centerSketchPoint, cp)
+                    sd.addOffsetDimension(shortEdge, cornerHole.centerSketchPoint, cp)
 
-            textPt = futil.offsetPoint3D(cornerHole.centerSketchPoint.geometry, 0.1, 0.1, 0)
-            diamDim = sketch.sketchDimensions.addDiameterDimension(cornerHole, textPt)
-            diamDim.value = hole_diam_cm
-
-            textPt = cornerPoint.geometry
-            widthDim = sketch.sketchDimensions.addOffsetDimension(
-                longEdge, cornerHole.centerSketchPoint, textPt)
-            widthDim.value = HOLE_OFFSET_CM
-
-            lengthDim = sketch.sketchDimensions.addOffsetDimension(
-                shortEdge, cornerHole.centerSketchPoint, textPt)
-            lengthDim.value = HOLE_OFFSET_CM
-
-            # Construction lines from the corner in the two pattern directions.
-            cp = cornerPoint.geometry
-            len_dir_line = sketch.sketchCurves.sketchLines.addByTwoPoints(
-                cp,
-                adsk.core.Point3D.create(
-                    cp.x + leUnitVec.x * 20.0,
-                    cp.y + leUnitVec.y * 20.0,
-                    0.0,
-                ),
-            )
-            len_dir_line.isConstruction = True
-
-            wid_dir_line = sketch.sketchCurves.sketchLines.addByTwoPoints(
-                cp,
-                adsk.core.Point3D.create(
-                    cp.x + seUnitVec.x * 20.0,
-                    cp.y + seUnitVec.y * 20.0,
-                    0.0,
-                ),
-            )
-            wid_dir_line.isConstruction = True
+                # Construction lines from the corner in the two pattern directions.
+                # The projected edges can't stand in for these: which way Fusion
+                # runs a pattern along a sketch line doesn't reliably follow the
+                # line's start->end, and a negative spacing only sometimes flips it.
+                lines = sketch.sketchCurves.sketchLines
+                len_dir_line = lines.addByTwoPoints(cp, adsk.core.Point3D.create(
+                    cp.x + leUnitVec.x * 20.0, cp.y + leUnitVec.y * 20.0, 0.0))
+                len_dir_line.isConstruction = True
+                wid_dir_line = lines.addByTwoPoints(cp, adsk.core.Point3D.create(
+                    cp.x + seUnitVec.x * 20.0, cp.y + seUnitVec.y * 20.0, 0.0))
+                wid_dir_line.isConstruction = True
+                if constrain:
+                    gc = sketch.geometricConstraints
+                    for dir_line, edge in ((len_dir_line, longEdge), (wid_dir_line, shortEdge)):
+                        gc.addCoincident(dir_line.startSketchPoint, cornerPoint)
+                        gc.addCollinear(dir_line, edge)
+                        sd.addDistanceDimension(
+                            dir_line.startSketchPoint, dir_line.endSketchPoint,
+                            adsk.fusion.DimensionOrientations.AlignedDimensionOrientation,
+                            dir_line.endSketchPoint.geometry)
+            finally:
+                sketch.isComputeDeferred = False
 
             # --- Extrude-cut the single seed hole --------------------------
             seed_profile = None
@@ -295,8 +348,17 @@ def _add_face_holes(comp: adsk.fusion.Component,
             cutInput = extrudes.createInput(
                 seed_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
             )
+            # Cut the tube's full depth across this face (plus a margin) so it
+            # drills this wall and the opposite one. Not ThroughAllExtentDefinition:
+            # in an assembly document through-all fails with "No target body!" and
+            # the cut silently does nothing -- which then breaks the pattern below.
+            # participantBodies keeps it from cutting anything else.
+            _, face_normal = face.evaluator.getNormalAtPoint(face.pointOnFace)
+            depth_cm = (abs(face_normal.x) * (bb.maxPoint.x - bb.minPoint.x) +
+                        abs(face_normal.y) * (bb.maxPoint.y - bb.minPoint.y) +
+                        abs(face_normal.z) * (bb.maxPoint.z - bb.minPoint.z))
             cutExtent = adsk.fusion.DistanceExtentDefinition.create(
-                adsk.core.ValueInput.createByReal(wall_thickness_cm)
+                adsk.core.ValueInput.createByReal(depth_cm + 0.25)
             )
             cutInput.setOneSideExtent(
                 cutExtent, adsk.fusion.ExtentDirections.NegativeExtentDirection
@@ -347,7 +409,7 @@ def _add_face_holes(comp: adsk.fusion.Component,
 # Tube creation
 # ===========================================================================
 
-def _create_tube(inputs: adsk.core.CommandInputs):
+def _create_tube(inputs: adsk.core.CommandInputs, constrain: bool = True):
     tubeWidthInp:   adsk.core.ValueCommandInput     = inputs.itemById('tube_width')
     tubeHeightInp:  adsk.core.ValueCommandInput     = inputs.itemById('tube_height')
     tubeThickInp:   adsk.core.DropDownCommandInput  = inputs.itemById('tube_thickness')
@@ -363,6 +425,13 @@ def _create_tube(inputs: adsk.core.CommandInputs):
         t_cm = customThickInp.value
     else:
         t_cm = THICKNESS_MAP[tubeThickInp.selectedItem.name]
+
+    # Defensive guard — command_validate_input already blocks these values from the
+    # dialog's OK button, but executePreview can call this function with a transient
+    # or momentarily-invalid value while the user is still typing.
+    if w_cm <= 0 or h_cm <= 0 or t_cm <= 0 or t_cm >= min(w_cm, h_cm) / 2.0:
+        futil.log('PartsGen _create_tube: invalid dimensions, skipping')
+        return
 
     len_type = lenTypeInp.selectedItem.name
 
@@ -381,144 +450,145 @@ def _create_tube(inputs: adsk.core.CommandInputs):
         return
     workingComp  = workingOcc.component
 
-    w_in = w_cm / IN_TO_CM
-    h_in = h_cm / IN_TO_CM
-    t_in = t_cm / IN_TO_CM
-    workingComp.name = f'Tube_{w_in:.4g}x{h_in:.4g}_T{t_in:.4g}in'
-
-    if len_type == LEN_FACES:
-        face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
-        face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
-        centroid1       = _bbox_center(face1)
-        centroid2       = _bbox_center(face2)
-        ext_dir         = _extrude_direction(face1, centroid1, centroid2)
-        sketch_plane    = face1
-        face2_target    = face2
-        custom_len_expr = None
-        _, face1_normal = face1.evaluator.getNormalAtPoint(face1.pointOnFace)
-        extrusion_axis  = face1_normal
-    else:
-        face1           = None
-        face2_target    = None
-        centroid1       = adsk.core.Point3D.create(0, 0, 0)
-        ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
-        custom_len_expr = customLenInp.expression
-        sketch_plane    = rootComp.xYConstructionPlane
-        extrusion_axis  = adsk.core.Vector3D.create(0, 0, 1)
-
-    # --- Outer rectangle sketch ---------------------------------------------
-    outer_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    outer_sketch.name = 'TubeOuterProfile'
-
-    c_sk   = outer_sketch.modelToSketchSpace(centroid1)
-    cx, cy = c_sk.x, c_sk.y
-
-    hw = w_cm / 2.0
-    hh = h_cm / 2.0
-
-    lines = outer_sketch.sketchCurves.sketchLines
-    corners_outer = [
-        adsk.core.Point3D.create(cx - hw, cy - hh, 0),
-        adsk.core.Point3D.create(cx + hw, cy - hh, 0),
-        adsk.core.Point3D.create(cx + hw, cy + hh, 0),
-        adsk.core.Point3D.create(cx - hw, cy + hh, 0),
-    ]
-    for i in range(4):
-        lines.addByTwoPoints(corners_outer[i], corners_outer[(i + 1) % 4])
-
-    if outer_sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create outer tube profile.')
-        return
-
-    outer_profile = _largest_profile(outer_sketch)
-
-    # --- Extrude outer solid ------------------------------------------------
-    outer_feat = _extrude_one_side(
-        workingComp, outer_profile,
-        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-        face2_target, custom_len_expr, ext_dir
-    )
-    body = outer_feat.bodies.item(0)
-
-    # --- Inner rectangle (cut) sketch ---------------------------------------
-    inner_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
-    inner_sketch.name = 'TubeInnerProfile'
-
-    ihw = (w_cm - 2 * t_cm) / 2.0
-    ihh = (h_cm - 2 * t_cm) / 2.0
-    corners_inner = [
-        adsk.core.Point3D.create(cx - ihw, cy - ihh, 0),
-        adsk.core.Point3D.create(cx + ihw, cy - ihh, 0),
-        adsk.core.Point3D.create(cx + ihw, cy + ihh, 0),
-        adsk.core.Point3D.create(cx - ihw, cy + ihh, 0),
-    ]
-    inner_lines = inner_sketch.sketchCurves.sketchLines
-    for i in range(4):
-        inner_lines.addByTwoPoints(corners_inner[i], corners_inner[(i + 1) % 4])
-
-    if inner_sketch.profiles.count < 1:
-        futil.popup_error('Parts Gen: could not create inner tube profile.')
-        return
-
-    inner_profile = _largest_profile(inner_sketch)
-
-    cut_extrudes = workingComp.features.extrudeFeatures
-    cut_input    = cut_extrudes.createInput(
-        inner_profile, adsk.fusion.FeatureOperations.CutFeatureOperation
-    )
-    if face2_target is not None:
-        cut_extent = adsk.fusion.ToEntityExtentDefinition.create(face2_target, False)
-    else:
-        cut_extent = adsk.fusion.DistanceExtentDefinition.create(
-            adsk.core.ValueInput.createByString(custom_len_expr)
-        )
-    cut_input.setOneSideExtent(cut_extent, ext_dir)
-    cut_input.participantBodies = [body]
-    cut_extrudes.add(cut_input)
-
-    # --- Holes on each outer face --------------------------------------------
     try:
-        tubeHolesInp: adsk.core.BoolValueCommandInput = inputs.itemById('tube_add_holes')
-        if tubeHolesInp is not None and tubeHolesInp.value:
-            holeSizeInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
-            if holeSizeInp.selectedItem.name == HOLE_CUSTOM:
-                hole_diam_cm = inputs.itemById('hole_diameter').value
-            else:
-                hole_diam_cm = HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
-            _add_face_holes(workingComp, body, t_cm, hole_diam_cm, extrusion_axis, custom_len_expr)
-    except Exception:
-        futil.handle_error('PartsGen _add_face_holes', show_message_box=True)
+        w_in = w_cm / IN_TO_CM
+        h_in = h_cm / IN_TO_CM
+        t_in = t_cm / IN_TO_CM
+        workingComp.name = f'Tube_{w_in:.4g}x{h_in:.4g}_T{t_in:.4g}in'
 
-    # --- Save PartsGen attributes for right-click edit ----------------------
-    try:
-        comp_attrs = workingComp.attributes
-        comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,   PART_TUBE)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_WIDTH,  tubeWidthInp.expression)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_HEIGHT, tubeHeightInp.expression)
-        comp_attrs.add(ATTR_GROUP, ATTR_TUBE_THICK,  tubeThickInp.selectedItem.name)
-        if tubeThickInp.selectedItem.name == THICK_CUSTOM:
-            comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_THICK, customThickInp.expression)
-        _ahi = inputs.itemById('tube_add_holes')
-        _add = _ahi.value if _ahi else False
-        comp_attrs.add(ATTR_GROUP, ATTR_ADD_HOLES, str(_add))
-        if _add:
-            _hsi = inputs.itemById('hole_size')
-            if _hsi:
-                comp_attrs.add(ATTR_GROUP, ATTR_HOLE_SIZE, _hsi.selectedItem.name)
-                if _hsi.selectedItem.name == HOLE_CUSTOM:
-                    _hdi = inputs.itemById('hole_diameter')
-                    if _hdi:
-                        comp_attrs.add(ATTR_GROUP, ATTR_HOLE_DIAM, _hdi.expression)
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = custom_name
+
         if len_type == LEN_FACES:
-            d = math.sqrt(
-                (centroid2.x - centroid1.x) ** 2 +
-                (centroid2.y - centroid1.y) ** 2 +
-                (centroid2.z - centroid1.z) ** 2
-            )
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            face1: adsk.fusion.BRepFace = face1Sel.selection(0).entity
+            face2: adsk.fusion.BRepFace = face2Sel.selection(0).entity
+            centroid1       = _bbox_center(face1)
+            centroid2       = _bbox_center(face2)
+            ext_dir         = _extrude_direction(face1, centroid1, centroid2)
+            sketch_plane    = face1
+            face2_target    = face2
+            custom_len_expr = None
+            _, face1_normal = face1.evaluator.getNormalAtPoint(face1.pointOnFace)
+            extrusion_axis  = face1_normal
         else:
-            comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
-    except Exception:
-        futil.log('PartsGen: failed to save tube attributes')
+            face1           = None
+            face2_target    = None
+            centroid1       = adsk.core.Point3D.create(0, 0, 0)
+            ext_dir         = adsk.fusion.ExtentDirections.PositiveExtentDirection
+            custom_len_expr = customLenInp.expression
+            sketch_plane    = rootComp.xYConstructionPlane
+            extrusion_axis  = adsk.core.Vector3D.create(0, 0, 1)
 
-    _group_timeline_features(design, start_marker, workingComp.name)
+        # --- Wall profile sketch: outer + inner rectangle -----------------------
+        # One sketch and one extrude of the ring between the rectangles, rather
+        # than an outer solid plus an inner cut -- a whole sketch and feature
+        # fewer on every preview tick.
+        wall_sketch: adsk.fusion.Sketch = workingComp.sketches.addWithoutEdges(sketch_plane)
+        wall_sketch.name = 'TubeProfile'
+
+        c_sk   = wall_sketch.modelToSketchSpace(centroid1)
+        cx, cy = c_sk.x, c_sk.y
+
+        wall_sketch.isComputeDeferred = True
+        try:
+            _draw_rectangle(wall_sketch, adsk.core.Point3D.create(cx, cy, 0), w_cm, h_cm,
+                            constrain=constrain)
+            _draw_rectangle(wall_sketch, adsk.core.Point3D.create(cx, cy, 0),
+                            w_cm - 2 * t_cm, h_cm - 2 * t_cm, constrain=constrain)
+        finally:
+            wall_sketch.isComputeDeferred = False
+
+        # The ring is the profile with two loops (outer boundary + inner hole).
+        wall_profile = next((p for p in wall_sketch.profiles if p.profileLoops.count == 2), None)
+        if wall_profile is None:
+            futil.popup_error('Parts Gen: could not create tube wall profile.')
+            workingOcc.deleteMe()
+            return
+
+        # --- Extrude the tube wall ----------------------------------------------
+        outer_feat = _extrude_one_side(
+            workingComp, wall_profile,
+            adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
+            face2_target, custom_len_expr, ext_dir
+        )
+        body = outer_feat.bodies.item(0)
+
+        # --- Holes on each outer face --------------------------------------------
+        try:
+            tubeHolesInp: adsk.core.BoolValueCommandInput = inputs.itemById('tube_add_holes')
+            if tubeHolesInp is not None and tubeHolesInp.value:
+                holeSizeInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
+                if holeSizeInp.selectedItem.name == HOLE_CUSTOM:
+                    hole_diam_cm = inputs.itemById('hole_diameter').value
+                else:
+                    hole_diam_cm = HOLE_SIZE_MAP[holeSizeInp.selectedItem.name]
+                _add_face_holes(workingComp, body, hole_diam_cm, extrusion_axis, custom_len_expr,
+                                constrain=constrain)
+        except Exception:
+            futil.handle_error('PartsGen _add_face_holes', show_message_box=True)
+
+        # --- Save PartsGen attributes for right-click edit ----------------------
+        try:
+            comp_attrs = workingComp.attributes
+            comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,   PART_TUBE)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_WIDTH,  tubeWidthInp.expression)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_HEIGHT, tubeHeightInp.expression)
+            comp_attrs.add(ATTR_GROUP, ATTR_TUBE_THICK,  tubeThickInp.selectedItem.name)
+            if tubeThickInp.selectedItem.name == THICK_CUSTOM:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_THICK, customThickInp.expression)
+            _ahi = inputs.itemById('tube_add_holes')
+            _add = _ahi.value if _ahi else False
+            comp_attrs.add(ATTR_GROUP, ATTR_ADD_HOLES, str(_add))
+            if _add:
+                _hsi = inputs.itemById('hole_size')
+                if _hsi:
+                    comp_attrs.add(ATTR_GROUP, ATTR_HOLE_SIZE, _hsi.selectedItem.name)
+                    if _hsi.selectedItem.name == HOLE_CUSTOM:
+                        _hdi = inputs.itemById('hole_diameter')
+                        if _hdi:
+                            comp_attrs.add(ATTR_GROUP, ATTR_HOLE_DIAM, _hdi.expression)
+            if len_type == LEN_FACES:
+                d = math.sqrt(
+                    (centroid2.x - centroid1.x) ** 2 +
+                    (centroid2.y - centroid1.y) ** 2 +
+                    (centroid2.z - centroid1.z) ** 2
+                )
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, f'{d / IN_TO_CM:.6g} in')
+            else:
+                comp_attrs.add(ATTR_GROUP, ATTR_LEN_EXPR, custom_len_expr)
+            if custom_name:
+                comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
+        except Exception:
+            futil.log('PartsGen: failed to save tube attributes')
+
+        futil.group_timeline_features(design, start_marker, workingComp.name)
+
+        # The face the tube was extruded from -- stays live through the hole
+        # cuts above, since Fusion keeps an extrude feature's startFaces in
+        # sync as later participant-body operations modify the same body.
+        ref_face = outer_feat.startFaces.item(0) if outer_feat.startFaces.count > 0 else None
+
+        # Persistently color it so the reference face is still obvious after OK,
+        # not just during the dialog's live preview (entry.py handles that part
+        # with a transient CustomGraphics overlay). Only on the real, fully
+        # constrained build -- not every preview tick -- and only if the user
+        # hasn't unchecked "Highlight Reference Face".
+        highlightInp = inputs.itemById('highlight_ref_face')
+        highlight_enabled = highlightInp is None or highlightInp.value
+        if constrain and highlight_enabled and ref_face is not None:
+            try:
+                appearance = futil.get_or_create_appearance(
+                    design, REF_FACE_APPEARANCE_NAME, REF_FACE_COLOR)
+                ref_face.appearance = appearance
+            except Exception:
+                futil.log('PartsGen: failed to color tube reference face')
+
+        return ref_face
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_tube', show_message_box=True)

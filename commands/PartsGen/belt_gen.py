@@ -9,11 +9,17 @@ import adsk.core
 import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
+from ... import config
 from ..CCDistance.CCLine import getCCLineFromEntity
-from .pulley_gen import (create_pulley_for_belt,
+from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, update_pulley_teeth,
+                          _belt_width_mm, _tooth_length_cm,
                           ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_BELT_COMP_TOKEN,
                           ATTR_PULLEY_PITCH_CIRCLE_IDX, ATTR_PULLEY_TOOTH_COUNT,
-                          ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH)
+                          ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH,
+                          ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
+                          BORE_HALF_HEX, BORE_OFFSET_DEFAULT_IN, FLANGE_THICKNESS_CM,
+                          LABEL_TEXT_HEIGHT_CM)
+from .shaft_gen import _world_plane, _hide_joint
 
 app = adsk.core.Application.get()
 
@@ -27,30 +33,30 @@ ATTR_BELT_WIDTH      = 'belt_width_expr'
 ATTR_BELT_SUPPRESS   = 'belt_suppress_teeth'
 ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
-ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+ATTR_BELT_BORE_TYPE    = 'belt_pulley_bore_type'    # stored per pulley, suffixed _1 / _2
+ATTR_BELT_BORE_OFFSET  = 'belt_pulley_bore_offset'
+ATTR_BELT_ADAPTER      = 'belt_pulley_adapter'      # stored per pulley, suffixed _1 / _2
 ATTR_BELT_LOOP_LENGTH  = 'belt_loop_length'
+ATTR_CUSTOM_NAME       = 'custom_name'
+ATTR_BELT_OFFSET_EXPR  = 'belt_offset_expr'         # Pulley 1's Z Offset, as typed
+ATTR_BELT_OFFSET_FACE  = 'belt_offset_face_token'   # entityToken of its "Offset From" face
+ATTR_BELT_CC_CIRCLE    = 'belt_cc_circle_token'     # the user's C-C circles, suffixed _1 / _2
+ATTR_BELT_JOINT_OFFSET = 'belt_joint_offset_cm'     # the offset Pulley 1's C-C joint got
+ATTR_BELT_OFFSET_FLANGE = 'belt_offset_flange'      # which flange the Z Offset is measured to
+
+# "Measured To" choices for Pulley 1's Z Offset
+OFFSET_FLANGE_BOTTOM = 'Bottom Flange'
+OFFSET_FLANGE_TOP    = 'Top Flange'
+
+# Tooth-count label engraved on the belt's back
+BELT_LABEL_SKETCH     = 'BeltLabel'
+BELT_LABEL_ENGRAVE_CM = 0.01 * 2.54   # shallower than the pulley's: GT2 backing is ~0.6 mm
 
 # ---------------------------------------------------------------------------
 # Belt-name-sync (commandTerminated hook)
 # ---------------------------------------------------------------------------
 _belt_sync_registered  = False
 _belt_sync_handlers: list = []  # keeps event handler alive (prevent GC)
-
-
-# ---------------------------------------------------------------------------
-# Timeline grouping helper (duplicated from entry.py to avoid circular import)
-# ---------------------------------------------------------------------------
-
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    """Group all timeline items from start_marker to the current marker."""
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
 
 
 # ---------------------------------------------------------------------------
@@ -78,15 +84,41 @@ def unregister_belt_name_sync():
     _belt_sync_registered = False
 
 
+_belt_sync_running = False
+
+
+def should_run_part_sync(args: adsk.core.ApplicationCommandEventArgs, design) -> bool:
+    """Whether a commandTerminated part-sync hook should run now.
+
+    Every dimension edit inside a sketch is its own command, so without this the pulley
+    update (which rolls the timeline back) ran mid-sketch, once per edit, and hung Fusion.
+    Skipping while a sketch is open means the sync runs once, on Finish Sketch."""
+    if design is None:
+        return False
+    if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+        return False
+    if args.terminationReason == adsk.core.CommandTerminationReason.CancelledTerminationReason:
+        return False
+    if adsk.fusion.Sketch.cast(design.activeEditObject) is not None:
+        return False
+    return True
+
+
 def _on_command_terminated(args: adsk.core.ApplicationCommandEventArgs):
     """After any command, scan belt components and update names if needed."""
+    global _belt_sync_running
+    if _belt_sync_running:
+        return  # a command fired by the sync's own edits
     try:
         design = adsk.fusion.Design.cast(app.activeProduct)
-        if design is None:
+        if not should_run_part_sync(args, design):
             return
+        _belt_sync_running = True
         _scan_and_update_belt_names(design)
     except Exception:
         pass  # must never interrupt normal Fusion operation
+    finally:
+        _belt_sync_running = False
 
 
 def _find_comp_by_token(design: adsk.fusion.Design, token: str):
@@ -111,7 +143,12 @@ def _find_comp_by_token(design: adsk.fusion.Design, token: str):
 
 
 def _scan_and_update_belt_names(design: adsk.fusion.Design):
-    """Walk every component in the design and fix belt and pulley names."""
+    """Walk every component in the design and fix belt and pulley names.
+
+    Collects the components first and updates them after: a pulley that has to be
+    rebuilt deletes its occurrence, and walking on through it used to throw and end the
+    scan early, leaving the belt's other pulley at its old tooth count."""
+    belts, pulleys = [], []
     try:
         root    = design.rootComponent
         visited: set = set()
@@ -125,16 +162,21 @@ def _scan_and_update_belt_names(design: adsk.fusion.Design):
 
             belt_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_TYPE)
             if belt_attr is not None:
-                _update_belt_name(comp, belt_attr.value)
+                belts.append((comp, belt_attr.value))
 
             pulley_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_PULLEY_BELT_TYPE)
             if pulley_attr is not None:
-                _update_pulley_name(comp, pulley_attr.value, design)
+                pulleys.append((comp, pulley_attr.value))
 
             for i in range(comp.occurrences.count):
                 queue.append(comp.occurrences.item(i).component)
     except Exception:
         pass
+    for comp, belt_type in belts:
+        _update_belt_name(comp, belt_type)
+    for comp, pulley_type in pulleys:
+        if comp.isValid:
+            _update_pulley_name(comp, pulley_type, design)
 
 
 def scan_and_rebuild_belts(design: adsk.fusion.Design):
@@ -188,6 +230,114 @@ def _find_occurrence_of(design: adsk.fusion.Design, comp_token: str):
     return None
 
 
+def _belt_normal(belt_occ: adsk.fusion.Occurrence,
+                 sketch_name: str = 'TimingBelt') -> adsk.core.Vector3D:
+    """World unit normal of the belt's (or chain's) loop sketch -- the way its pulleys point."""
+    sk = belt_occ.component.sketches.itemByName(sketch_name)
+    n = sk.xDirection.crossProduct(sk.yDirection)   # the component's own frame
+    n.transformBy(belt_occ.transform2)
+    n.normalize()
+    return n
+
+
+def _pulley_flange_z_cm(flange: str, belt_width_cm: float) -> float:
+    """Outer face of a belt pulley's `flange`, relative to its joint circle (see _add_flanges):
+    the bottom one FLANGE_THICKNESS_CM below it, the top one a tooth length + that above it."""
+    tooth_len_cm = _tooth_length_cm(int(round(belt_width_cm * 10)))
+    return (tooth_len_cm + FLANGE_THICKNESS_CM if flange == OFFSET_FLANGE_TOP
+            else -FLANGE_THICKNESS_CM)
+
+
+def _cc_joint_offset_cm(belt_occ: adsk.fusion.Occurrence,
+                        circle_proj: adsk.fusion.SketchCircle,
+                        face: adsk.fusion.BRepFace, dist_cm: float,
+                        part_face_z_cm: float = 0.0, sketch_name: str = 'TimingBelt'):
+    """Z offset for part 1's C-C joint (pulley or sprocket) that puts its face at
+    `part_face_z_cm` (along its axis, relative to its joint circle) `dist_cm` from `face`
+    (positive = the way the parts extend). With no face the distance is the joint offset
+    itself (0 = on the C-C sketch plane, as before). Returns None when the face isn't
+    parallel to the loop sketch `sketch_name`."""
+    if face is None:
+        return dist_cm
+    n = _belt_normal(belt_occ, sketch_name)
+    origin, face_n = _world_plane(face)
+    if abs(face_n.dotProduct(n)) < 0.999:
+        return None
+    # The belt hasn't been jointed yet, so the sketch point is on the C-C sketch plane.
+    # worldGeometry of a native entity is component space: move it by the belt's (root
+    # proxy) transform, which isn't identity when the belt was built in a sub-assembly.
+    center = circle_proj.centerSketchPoint.worldGeometry
+    center.transformBy(belt_occ.transform2)
+    s_face   = n.dotProduct(origin.asVector())
+    s_sketch = n.dotProduct(center.asVector())
+    return s_face + dist_cm - s_sketch - part_face_z_cm
+
+
+def _add_cc_joint(belt_occ: adsk.fusion.Occurrence, pulley: tuple,
+                  cc_circle: adsk.fusion.SketchCircle, circle_idx: int,
+                  offset_cm: float = 0.0, is_preview: bool = False,
+                  sketch_name: str = 'TimingBelt'):
+    """Joint a belt pulley (or chain sprocket) to the user's own C-C sketch circle, in the
+    root component. `sketch_name` is the belt/chain loop sketch in `belt_occ`.
+
+    `pulley` is create_pulley_for_belt's (pulley occurrence in the belt comp, joint circle).
+    Pulley 1 (circle_idx 0) gets a revolute joint carrying the Z offset -- it sets the
+    height of the whole belt, since both pulleys are also jointed to the belt. Pulley 2
+    gets a cylindrical joint, which stops the belt spinning about Pulley 1 but lets its
+    height follow."""
+    pulley_occ, joint_circle = pulley
+    name = pulley_occ.component.name
+    try:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        root   = design.rootComponent
+        pulley_root = pulley_occ.createForAssemblyContext(belt_occ)
+
+        def _add(flip: bool):
+            pulley_geom = adsk.fusion.JointGeometry.createByCurve(
+                joint_circle.createForAssemblyContext(pulley_root),
+                adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+            cc_geom = adsk.fusion.JointGeometry.createByCurve(
+                cc_circle, adsk.fusion.JointKeyPointTypes.CenterKeyPoint)
+            joint_input = root.joints.createInput(pulley_geom, cc_geom)
+            joint_input.isFlipped = flip
+            if circle_idx == 0:
+                joint_input.offset = adsk.core.ValueInput.createByReal(offset_cm)
+                joint_input.setAsRevoluteJointMotion(
+                    adsk.fusion.JointDirections.ZAxisJointDirection)
+            else:
+                joint_input.setAsCylindricalJointMotion(
+                    adsk.fusion.JointDirections.ZAxisJointDirection)
+            joint = root.joints.add(joint_input)
+            if joint is None:
+                raise RuntimeError('Joints.add returned null')
+            return joint
+
+        # Neither the flip nor the offset's sign can be read off the JointGeometry frames:
+        # their primaryAxisVector is component-native (seen live: +Z for a C-C sketch in a
+        # component turned upside down). So add the joint, then check what it did to the
+        # belt: it must keep its orientation, and move `offset_cm` along its normal (it
+        # was built on the C-C sketch plane).
+        before = belt_occ.transform2
+        z_before = before.getAsCoordinateSystem()[3]
+        joint = _add(False)
+        if belt_occ.transform2.getAsCoordinateSystem()[3].dotProduct(z_before) < 0.999:
+            joint.deleteMe()                 # doesn't put the belt back (LESSONS_LEARNED.md)
+            belt_occ.transform2 = before
+            joint = _add(True)
+        if circle_idx == 0 and abs(offset_cm) > 1e-9:
+            shift = belt_occ.transform2.translation
+            shift.subtract(before.translation)   # not 0 when built in a moved sub-assembly
+            moved = _belt_normal(belt_occ, sketch_name).dotProduct(shift)
+            if abs(moved + offset_cm) < abs(moved - offset_cm):
+                joint.offset.value = -joint.offset.value   # went the wrong way
+        joint.name = name + ('_cc_revolute' if circle_idx == 0 else '_cc_cylindrical')
+        _hide_joint(joint)
+        return joint
+    except Exception:
+        futil.handle_error(f'PartsGen: C-C joint for {name}', show_message_box=not is_preview)
+    return None
+
+
 def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
                     new_n_teeth: int, belt_pitch_mm: int,
                     belt_comp_token: str, circle_idx: int):
@@ -199,6 +349,13 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
         teeth_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_SHOW_TEETH)
         width_mm   = int(width_attr.value.split()[0]) if width_attr else 9
         show_teeth = teeth_attr is not None and teeth_attr.value.lower() == 'true'
+        bore_attr    = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_BORE_TYPE)
+        offset_attr  = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_BORE_OFFSET)
+        adapter_attr = attrs.itemByName(ATTR_GROUP, ATTR_PULLEY_ADAPTER)
+        bore_type    = bore_attr.value if bore_attr else BORE_HALF_HEX
+        bore_offset_cm = (design.unitsManager.evaluateExpression(offset_attr.value, 'in')
+                          if offset_attr else BORE_OFFSET_DEFAULT_IN * 2.54)
+        use_adapter  = adapter_attr is not None and adapter_attr.value.lower() == 'true'
         old_token  = old_comp.entityToken
 
         belt_comp = _find_comp_by_token(design, belt_comp_token)
@@ -216,16 +373,35 @@ def _rebuild_pulley(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
 
         rebuild_start = design.timeline.markerPosition
 
-        pulley_occ.deleteMe()  # removes the component and any associated joints
+        # Edit the pulley in place when possible: deleting it also deletes every joint
+        # the user made to it (e.g. to its flange faces).
+        if update_pulley_teeth(pulley_occ, new_n_teeth, design):
+            return
 
-        create_pulley_for_belt(belt_pitch_mm, new_n_teeth, width_mm / 10.0,
-                               belt_occ, proj_circle, show_teeth, circle_idx,
-                               parent_comp=belt_comp)
+        futil.log(f'PartsGen: rebuilding {old_comp.name} from scratch -- '
+                  'joints made to it will be lost')
+        # Its "<pulley>_Group" when it has an adapter; removes any associated joints too.
+        pulley_outer_occurrence(pulley_occ).deleteMe()
+
+        pulley = create_pulley_for_belt(belt_pitch_mm, new_n_teeth, width_mm / 10.0,
+                                        belt_occ, proj_circle, show_teeth, circle_idx,
+                                        parent_comp=belt_comp, bore_type=bore_type,
+                                        bore_offset_cm=bore_offset_cm, use_adapter=use_adapter,
+                                        group_timeline=False)   # grouped below with the delete
+
+        # Its joint to the user's C-C circle went with the old occurrence -- re-add it.
+        cc_attr  = belt_comp.attributes.itemByName(ATTR_GROUP, f'{ATTR_BELT_CC_CIRCLE}_{circle_idx + 1}')
+        off_attr = belt_comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_JOINT_OFFSET)
+        if pulley is not None and cc_attr is not None:
+            found = design.findEntityByToken(cc_attr.value)
+            if found:
+                _add_cc_joint(belt_occ, pulley, found[0], circle_idx,
+                              float(off_attr.value) if off_attr else 0.0)
 
         # Wrap the delete + recreation into one named timeline group
         prefix   = 'Pulley_HTD_5mm' if belt_pitch_mm == 5 else 'Pulley_GT2_3mm'
         new_name = f'{prefix}-{new_n_teeth}Tx{width_mm}mm'
-        _group_timeline_features(design, rebuild_start, new_name)
+        futil.group_timeline_features(design, rebuild_start, new_name)
     except Exception:
         futil.log('PartsGen: _rebuild_pulley failed')
 
@@ -299,6 +475,8 @@ def _rebuild_belt_3d(comp: adsk.fusion.Component, belt_pitch_mm: int,
             extrudeBeltPreview(sk, path_curves, belt_width_cm)
         else:
             extrudeBelt(sk, path_curves, belt_width_cm, tooth_count, belt_pitch_mm)
+        # Its old cut went with the extrudes above; redraw it with the new tooth count.
+        _add_belt_label(comp, sk, tooth_count, belt_width_cm)
 
         futil.log(f'PartsGen: _rebuild_belt_3d — done, bodies={comp.bRepBodies.count}')
 
@@ -383,6 +561,9 @@ def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
         if stored_len is None or abs(loop_cm - stored_len) > 1e-6:
             _rebuild_belt_3d(comp, belt_pitch_mm, tooth_count, loop_cm)
 
+        if comp.attributes.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME):
+            return  # user gave this belt a custom name — don't auto-rename it
+
         # Extract belt width from the existing name (format: "Belt_XXX-NNNTxMMmm")
         try:
             width_mm = int(comp.name.split('Tx')[1].replace('mm', ''))
@@ -451,11 +632,41 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
     pitchLineSelection: adsk.core.SelectionCommandInput = inputs.itemById('tb_pitch_circles')
     beltTypeInp:        adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_type')
-    beltWidthInp:       adsk.core.ValueCommandInput     = inputs.itemById('tb_belt_width')
+    beltWidthInp:       adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_width')
     suppressTeethInp:   adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
     genPulleysInp:      adsk.core.BoolValueCommandInput  = inputs.itemById('tb_gen_pulleys')
     pulleyTeethInp:     adsk.core.BoolValueCommandInput  = inputs.itemById('tb_pulley_teeth')
-    pulleyWidthInp:     adsk.core.ValueCommandInput      = inputs.itemById('tb_pulley_width')
+    boreOffsetInp:      adsk.core.ValueCommandInput      = inputs.itemById('tb_bore_offset')
+
+    # One width drives both the belt and its pulleys.
+    width_mm      = _belt_width_mm(beltWidthInp)
+    belt_width_cm = width_mm / 10.0
+    bore_offset_cm = (boreOffsetInp.value if boreOffsetInp is not None
+                      else BORE_OFFSET_DEFAULT_IN * 2.54)
+    # Bore and 3D print adapter are chosen per pulley: index 0 = the first End Circle.
+    bore_types, use_adapters = [], []
+    for i in (1, 2):
+        boreTypeInp: adsk.core.DropDownCommandInput  = inputs.itemById(f'tb_bore_type_{i}')
+        adapterInp:  adsk.core.BoolValueCommandInput = inputs.itemById(f'tb_adapter_{i}')
+        bore_types.append(boreTypeInp.selectedItem.name
+                          if boreTypeInp is not None and boreTypeInp.selectedItem is not None
+                          else BORE_HALF_HEX)
+        use_adapters.append(adapterInp is not None and adapterInp.value)
+
+    # Pulley 1's height: its bottom flange sits `offset_dist_cm` from the picked face.
+    offsetFaceInp: adsk.core.SelectionCommandInput = inputs.itemById('tb_offset_face')
+    offsetDistInp: adsk.core.ValueCommandInput     = inputs.itemById('tb_offset_dist')
+    offsetFlangeInp: adsk.core.DropDownCommandInput = inputs.itemById('tb_offset_flange')
+    offset_dist_cm = offsetDistInp.value if offsetDistInp is not None else 0.0
+    offset_flange  = (offsetFlangeInp.selectedItem.name
+                      if offsetFlangeInp is not None and offsetFlangeInp.selectedItem is not None
+                      else OFFSET_FLANGE_BOTTOM)
+    offset_face = None
+    if offsetFaceInp is not None and offsetFaceInp.selectionCount > 0:
+        try:
+            offset_face = offsetFaceInp.selection(0).entity
+        except RuntimeError:
+            pass    # the count can run ahead of the indexer mid-click (LESSONS_LEARNED.md)
 
     if pitchLineSelection.selectionCount < 2:
         futil.popup_error('Parts Gen: please select two pitch circles for the Timing Belt.')
@@ -468,11 +679,9 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     originalSketch: adsk.fusion.Sketch = userSelections[0].parentSketch
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
-    rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
-    trans     = adsk.core.Matrix3D.create()
     try:
-        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+        workingOcc  = futil.add_occurrence_in_active(design)   # root-context proxy
     except RuntimeError:
         futil.popup_error(
             'Cannot create belt: this document is in Part Design mode, '
@@ -482,160 +691,232 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         return
     workingComp = workingOcc.component
 
-    sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
-    sketch.name = 'TimingBelt'
-
-    if beltTypeInp.selectedItem.index == 0:
-        beltPitchLength = 5
-        beltThickness   = 0.174
-    else:
-        beltPitchLength = 3
-        beltThickness   = 0.126
-
-    # Belt only supports two directly-selected SketchCircles
-    if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
-        futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
-        workingOcc.deleteMe()
-        return
-
-    projList1 = sketch.include(userSelections[0])
-    projList2 = sketch.include(userSelections[1])
-    circle1_proj = projList1.item(0)
-    circle2_proj = projList2.item(0)
-
-    PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
-
-    pathCurves = adsk.core.ObjectCollection.create()
-    for curve in PitchLoop:
-        pathCurves.add(curve)          # native SketchCurve — keeps parametric link alive
-
-    curveLength = sum(curve.length for curve in PitchLoop)
-    toothCount  = int(curveLength * 10 / beltPitchLength + 0.5)
-    futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
-
-    if beltPitchLength == 5:
-        comp_name = f'Belt_HTD_5mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
-    else:
-        comp_name = f'Belt_GT2_3mm-{toothCount}Tx{int(beltWidthInp.value * 10)}mm'
-    workingComp.name = comp_name
-
-    # Build the belt thickness offset around the pitch loop
-    half_belt_thickness = adsk.core.ValueInput.createByReal(beltThickness / 2)
-    geoConstraints      = sketch.geometricConstraints
-    curves              = list(PitchLoop)
-
-    offsetInput = geoConstraints.createOffsetInput(curves, half_belt_thickness)
-    geoConstraints.addTwoSidesOffset(offsetInput, True)
-
-    futil.log(f'Belt offset created {sketch.profiles.count} profiles')
-    if sketch.profiles.count < 2:
-        futil.popup_error('Parts Gen: belt offset profiles not created correctly.')
-        workingOcc.deleteMe()
-        return
-
-    # Find the annular belt profile (neither the smallest nor the largest area)
-    maxArea = max(sketch.profiles.item(i).areaProperties().area for i in range(sketch.profiles.count))
-    insideLoop = None
-    for i in range(sketch.profiles.count):
-        profile = sketch.profiles.item(i)
-        if profile.areaProperties().area == maxArea:
-            insideLoop = profile.profileLoops.item(0)
-            break
-
-    if insideLoop is None:
-        futil.popup_error('Parts Gen: could not find belt inside loop.')
-        workingOcc.deleteMe()
-        return
-
-    (lineCurve, lineNormal, toothAnchorPoint) = findToothAnchor(insideLoop)
-
-    if beltPitchLength == 5:
-        baseLine = createHTD_5mmProfile(sketch)
-    else:
-        baseLine = createGT2_3mmProfile(sketch)
-
-    geoConstraints.addCoincident(baseLine.startSketchPoint, toothAnchorPoint)
-    angleDim = sketch.sketchDimensions.addAngularDimension(
-        baseLine, lineCurve, baseLine.startSketchPoint.geometry)
-    angleDim.value = 0.1
-    angleDim.deleteMe()
-    geoConstraints.addCollinear(baseLine, lineCurve)
-
-    # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
-    if is_preview and not (suppressTeethInp and suppressTeethInp.value):
-        extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
-        return
-
-    # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
-    if suppressTeethInp and suppressTeethInp.value:
-        extrudeBeltPreview(sketch, pathCurves, beltWidthInp.value)
-    else:
-        extrudeBelt(sketch, pathCurves, beltWidthInp.value, toothCount, beltPitchLength)
-
-    # Save attributes so the right-click Edit command can restore the dialog
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
-        attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
-        attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    beltWidthInp.expression)
-        attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
-        attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
-        attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
-        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
-        attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_WIDTH, pulleyWidthInp.expression if pulleyWidthInp is not None else '0.394 in')
+        sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
+        sketch.name = 'TimingBelt'
+
+        if beltTypeInp.selectedItem.index == 0:
+            beltPitchLength = 5
+            beltThickness   = 0.174
+        else:
+            beltPitchLength = 3
+            beltThickness   = 0.126
+
+        # Belt only supports two directly-selected SketchCircles
+        if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
+            futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
+            workingOcc.deleteMe()
+            return
+
+        projList1 = sketch.include(userSelections[0])
+        projList2 = sketch.include(userSelections[1])
+        circle1_proj = projList1.item(0)
+        circle2_proj = projList2.item(0)
+
+        # Guard against coincident/near-coincident pitch circles — _buildPitchLoop divides
+        # by the center-to-center distance, so this must be checked before it runs (mirrors
+        # the same check already used on rebuild in _update_belt_name).
+        p1_c, p2_c = circle1_proj.centerSketchPoint.geometry, circle2_proj.centerSketchPoint.geometry
+        cc_dist = math.sqrt((p2_c.x - p1_c.x) ** 2 + (p2_c.y - p1_c.y) ** 2)
+        if cc_dist < abs(circle1_proj.radius - circle2_proj.radius) + 1e-6:
+            futil.popup_error(
+                'Parts Gen: the two selected pitch circles are coincident or one is '
+                'inside the other — cannot build a belt loop.'
+            )
+            workingOcc.deleteMe()
+            return
+
+        joint_offset_cm = _cc_joint_offset_cm(workingOcc, circle1_proj, offset_face,
+                                              offset_dist_cm,
+                                              _pulley_flange_z_cm(offset_flange, belt_width_cm))
+        if joint_offset_cm is None:
+            if not is_preview:
+                futil.popup_error('Parts Gen: the "Offset From" face must be parallel to the '
+                                  'C-C sketch.')
+            workingOcc.deleteMe()
+            return
+
+        PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
+
+        pathCurves = adsk.core.ObjectCollection.create()
+        for curve in PitchLoop:
+            pathCurves.add(curve)          # native SketchCurve — keeps parametric link alive
+
+        curveLength = sum(curve.length for curve in PitchLoop)
+        toothCount  = int(curveLength * 10 / beltPitchLength + 0.5)
+        futil.log(f'Belt: loop length={curveLength:.4f}, teeth={toothCount}')
+
+        if beltPitchLength == 5:
+            comp_name = f'Belt_HTD_5mm-{toothCount}Tx{width_mm}mm'
+        else:
+            comp_name = f'Belt_GT2_3mm-{toothCount}Tx{width_mm}mm'
+        workingComp.name = comp_name
+
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
+        # Build the belt thickness offset around the pitch loop
+        half_belt_thickness = adsk.core.ValueInput.createByReal(beltThickness / 2)
+        geoConstraints      = sketch.geometricConstraints
+        curves              = list(PitchLoop)
+
+        offsetInput = geoConstraints.createOffsetInput(curves, half_belt_thickness)
+        geoConstraints.addTwoSidesOffset(offsetInput, True)
+
+        profile_areas = _profile_areas(sketch)
+        futil.log(f'Belt offset created {len(profile_areas)} profiles')
+        if len(profile_areas) < 2:
+            futil.popup_error('Parts Gen: belt offset profiles not created correctly.')
+            workingOcc.deleteMe()
+            return
+
+        # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
+        # Returns before the tooth-profile sketch, which only the tooth pattern uses.
+        if is_preview and not (suppressTeethInp and suppressTeethInp.value):
+            extrudeBeltPreview(sketch, pathCurves, belt_width_cm, profile_areas)
+            return
+
+        # The largest profile is the region inside the belt; its loop is the belt's inner face
+        insideLoop = max(profile_areas, key=lambda pa: pa[1])[0].profileLoops.item(0)
+
+        if insideLoop is None:
+            futil.popup_error('Parts Gen: could not find belt inside loop.')
+            workingOcc.deleteMe()
+            return
+
+        (lineCurve, lineNormal, toothAnchorPoint) = findToothAnchor(insideLoop)
+
+        if beltPitchLength == 5:
+            baseLine = createHTD_5mmProfile(sketch)
+        else:
+            baseLine = createGT2_3mmProfile(sketch)
+
+        geoConstraints.addCoincident(baseLine.startSketchPoint, toothAnchorPoint)
+        angleDim = sketch.sketchDimensions.addAngularDimension(
+            baseLine, lineCurve, baseLine.startSketchPoint.geometry)
+        angleDim.value = 0.1
+        angleDim.deleteMe()
+        geoConstraints.addCollinear(baseLine, lineCurve)
+
+        # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
+        if suppressTeethInp and suppressTeethInp.value:
+            extrudeBeltPreview(sketch, pathCurves, belt_width_cm)
+        else:
+            extrudeBelt(sketch, pathCurves, belt_width_cm, toothCount, beltPitchLength)
+        if not is_preview:
+            _add_belt_label(workingComp, sketch, toothCount, belt_width_cm)
+
+        # Save attributes so the right-click Edit command can restore the dialog
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,     'Timing Belt')
+            attrs.add(ATTR_GROUP, ATTR_BELT_TYPE,     beltTypeInp.selectedItem.name)
+            attrs.add(ATTR_GROUP, ATTR_BELT_WIDTH,    f'{width_mm} mm')
+            attrs.add(ATTR_GROUP, ATTR_BELT_SUPPRESS, str(suppressTeethInp.value))
+            attrs.add(ATTR_GROUP, ATTR_BELT_LOOP_LENGTH, str(round(curveLength, 8)))
+            attrs.add(ATTR_GROUP, ATTR_BELT_GEN_PULLEYS,  str(genPulleysInp.value  if genPulleysInp  is not None else True))
+            attrs.add(ATTR_GROUP, ATTR_BELT_PULLEY_TEETH, str(pulleyTeethInp.value if pulleyTeethInp is not None else False))
+            if boreOffsetInp is not None:
+                attrs.add(ATTR_GROUP, ATTR_BELT_BORE_OFFSET, boreOffsetInp.expression)
+            for i in (1, 2):
+                attrs.add(ATTR_GROUP, f'{ATTR_BELT_BORE_TYPE}_{i}', bore_types[i - 1])
+                attrs.add(ATTR_GROUP, f'{ATTR_BELT_ADAPTER}_{i}',   str(use_adapters[i - 1]))
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME, custom_name)
+            if offsetDistInp is not None:
+                attrs.add(ATTR_GROUP, ATTR_BELT_OFFSET_EXPR, offsetDistInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_BELT_JOINT_OFFSET, str(round(joint_offset_cm, 8)))
+            attrs.add(ATTR_GROUP, ATTR_BELT_OFFSET_FLANGE, offset_flange)
+            for key, entity in [(ATTR_BELT_OFFSET_FACE, offset_face),
+                                (f'{ATTR_BELT_CC_CIRCLE}_1', userSelections[0]),
+                                (f'{ATTR_BELT_CC_CIRCLE}_2', userSelections[1])]:
+                try:
+                    if entity is not None:
+                        attrs.add(ATTR_GROUP, key, entity.entityToken)
+                except Exception:
+                    futil.log(f'PartsGen: could not save belt attribute {key}')
+        except Exception:
+            futil.log('PartsGen: failed to save belt attributes')
+
+        # Auto-generate matching pulleys for both pitch circles (optional).
+        gen_pulleys    = genPulleysInp  is not None and genPulleysInp.value
+        pulley_teeth   = pulleyTeethInp is not None and pulleyTeethInp.value
+        if gen_pulleys:
+            # proj_circles are the projected SketchCircles inside the belt sketch — they
+            # are live parametric references so the pulleys follow when C-C distance changes.
+            proj_circles = [circle1_proj, circle2_proj]
+            for i, circle in enumerate(userSelections[:2]):
+                try:
+                    n_pulley_teeth = int(circle.radius * 20 * math.pi / beltPitchLength + 0.5)
+                    futil.log(f'Belt: auto-pulley {i+1} — radius={circle.radius:.4f} cm, teeth={n_pulley_teeth}')
+                    if n_pulley_teeth < 8:
+                        futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
+                        continue
+                    pulley = create_pulley_for_belt(beltPitchLength, n_pulley_teeth, belt_width_cm,
+                                                    workingOcc, proj_circles[i], pulley_teeth,
+                                                    circle_index=i, parent_comp=workingComp,
+                                                    bore_type=bore_types[i],
+                                                    bore_offset_cm=bore_offset_cm,
+                                                    use_adapter=use_adapters[i],
+                                                    is_preview=is_preview,
+                                                    # in the belt's own group (no nesting)
+                                                    group_timeline=False)
+                    # ...and to the user's own C-C circle, which places the whole belt.
+                    if pulley is not None:
+                        _add_cc_joint(workingOcc, pulley, circle, i, joint_offset_cm, is_preview)
+                except Exception:
+                    futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
+
+        # Group belt + all auto-generated pulleys into one timeline entry
+        futil.group_timeline_features(design, start_marker, comp_name)
     except Exception:
-        futil.log('PartsGen: failed to save belt attributes')
-
-    # Auto-generate matching pulleys for both pitch circles (optional).
-    gen_pulleys    = genPulleysInp  is not None and genPulleysInp.value
-    pulley_teeth   = pulleyTeethInp is not None and pulleyTeethInp.value
-    if gen_pulleys:
-        # proj_circles are the projected SketchCircles inside the belt sketch — they
-        # are live parametric references so the pulleys follow when C-C distance changes.
-        proj_circles = [circle1_proj, circle2_proj]
-        for i, circle in enumerate(userSelections[:2]):
-            try:
-                n_pulley_teeth = int(circle.radius * 20 * math.pi / beltPitchLength + 0.5)
-                futil.log(f'Belt: auto-pulley {i+1} — radius={circle.radius:.4f} cm, teeth={n_pulley_teeth}')
-                if n_pulley_teeth < 8:
-                    futil.log(f'Belt: skipping auto-pulley {i+1} — tooth count {n_pulley_teeth} too small')
-                    continue
-                pulley_width_cm = pulleyWidthInp.value if pulleyWidthInp is not None else beltWidthInp.value
-                create_pulley_for_belt(beltPitchLength, n_pulley_teeth, pulley_width_cm,
-                                       workingOcc, proj_circles[i], pulley_teeth,
-                                       circle_index=i, parent_comp=workingComp)
-            except Exception:
-                futil.handle_error(f'PartsGen: auto-pulley {i+1} failed', show_message_box=True)
-
-    # Group belt + all auto-generated pulleys into one timeline entry
-    _group_timeline_features(design, start_marker, comp_name)
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_belt', show_message_box=True)
 
 
 # ---------------------------------------------------------------------------
 # Belt extrude helpers
 # ---------------------------------------------------------------------------
 
+def _profile_areas(sketch: adsk.fusion.Sketch) -> list:
+    """(profile, area) for every profile in the sketch -- areaProperties() is slow, so the
+    belt helpers compute it once per profile and reuse it."""
+    profiles = sketch.profiles
+    result = []
+    for i in range(profiles.count):
+        profile = profiles.item(i)
+        result.append((profile, profile.areaProperties().area))
+    return result
+
+
 def extrudeBeltPreview(sketch: adsk.fusion.Sketch,
                        path: adsk.core.ObjectCollection,
-                       beltWidth: float):
-    """Extrude only the belt shell (no tooth patterning) for live preview."""
-    workingComp = sketch.parentComponent
+                       beltWidth: float,
+                       profile_areas: list = None):
+    """Extrude only the belt shell (no tooth patterning) for live preview.
 
-    maxArea = 0
-    minArea = 9999999
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if a > maxArea:
-            maxArea = a
-        if a < minArea:
-            minArea = a
+    `profile_areas` is _profile_areas(sketch) when the caller already has it (it must be
+    current -- drawing the tooth profile afterwards changes the profiles)."""
+    workingComp = sketch.parentComponent
+    if profile_areas is None:
+        profile_areas = _profile_areas(sketch)
 
     beltLoop = None
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if minArea < a < maxArea:
-            beltLoop = sketch.profiles.item(i)
-            break
+    if len(profile_areas) >= 3:
+        # Neither the smallest (the tooth) nor the largest (inside the belt) area
+        areas   = [a for _, a in profile_areas]
+        maxArea = max(areas)
+        minArea = min(areas)
+        beltLoop = next((p for p, a in profile_areas if minArea < a < maxArea), None)
+    else:
+        # No tooth profile yet (the teeth-on preview): the belt shell is the ring between
+        # the two offset loops -- the only profile with two loops.
+        beltLoop = next((p for p, _ in profile_areas if p.profileLoops.count == 2), None)
 
     if beltLoop is None:
         return
@@ -653,20 +934,14 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     """Extrude the belt shell and then path-pattern the tooth profile."""
     workingComp = sketch.parentComponent
 
-    maxArea = 0
-    minArea = 9999999
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if a > maxArea:
-            maxArea = a
-        if a < minArea:
-            minArea = a
+    profile_areas = _profile_areas(sketch)
+    areas   = [a for _, a in profile_areas]
+    maxArea = max(areas, default=0)
+    minArea = min(areas, default=9999999)
 
     beltLoop    = None
     profileLoop = None
-    for i in range(sketch.profiles.count):
-        profile = sketch.profiles.item(i)
-        a = profile.areaProperties().area
+    for profile, a in profile_areas:
         if minArea < a < maxArea:
             beltLoop = profile
         elif a < maxArea:
@@ -687,8 +962,12 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     patternCol    = adsk.core.ObjectCollection.create()
     patternCol.add(extrudeToothFeat)
 
-    futil.print_SketchObjectCollection(path)
-    patternPath   = adsk.fusion.Path.create(path, adsk.fusion.ChainedCurveOptions.noChainedCurves)
+    if config.DEBUG:    # the dumper makes its API calls even when log() drops the output
+        futil.print_SketchObjectCollection(path)
+    # Not Path.create: the belt sketch's curves are native to the belt sub-component, and
+    # Path.create resolves them from the root and throws InternalValidationError
+    # (Utils::getObjectPath). The component's own createPath takes them as they are.
+    patternPath   = workingComp.features.createPath(path, False)   # False = no chaining
     toothPatInput = pathPatterns.createInput(
         patternCol, patternPath, toothCountVI, beltPitch,
         adsk.fusion.PatternDistanceType.SpacingPatternDistanceType,
@@ -696,6 +975,97 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     toothPatInput.isOrientationAlongPath  = True
     toothPatInput.patternComputeOption    = adsk.fusion.PatternComputeOptions.IdenticalPatternCompute
     pathPatterns.add(toothPatInput)
+
+
+def _scaled(v: adsk.core.Vector3D, s: float) -> adsk.core.Vector3D:
+    out = v.copy()
+    out.scaleBy(s)
+    return out
+
+
+def _add_belt_label(comp: adsk.fusion.Component, belt_sketch: adsk.fusion.Sketch,
+                    tooth_count: int, belt_width_cm: float, is_preview: bool = False):
+    """Engrave the tooth count (e.g. "120T") on the belt's back, along both straight spans.
+
+    The outer face of a span is the belt's only large flat face -- the inside is broken
+    up by teeth and the edges are ~1.5 mm tall. Each label reads upright from outside the
+    belt, with the belt sketch's normal (the way the pulleys extend) as "up"."""
+    try:
+        for i in range(comp.sketches.count - 1, -1, -1):
+            if comp.sketches.item(i).name.startswith(BELT_LABEL_SKETCH):
+                comp.sketches.item(i).deleteMe()
+        if comp.bRepBodies.count == 0:
+            return
+        body = comp.bRepBodies.item(0)
+        up   = belt_sketch.xDirection.crossProduct(belt_sketch.yDirection)
+        up.normalize()
+
+        # The two largest planar faces parallel to the belt normal that face away from its
+        # middle -- the backs of the two spans.
+        mid   = futil.BBCentroid(body.boundingBox)
+        faces = []
+        for f in body.faces:
+            if adsk.core.Plane.cast(f.geometry) is None:
+                continue
+            _, n = f.evaluator.getNormalAtPoint(f.pointOnFace)
+            if abs(n.dotProduct(up)) > 1e-6 or mid.vectorTo(f.pointOnFace).dotProduct(n) <= 0:
+                continue
+            faces.append((f, n))
+        faces = sorted(faces, key=lambda fn: fn[0].area, reverse=True)[:2]
+        if not faces:
+            futil.log('PartsGen: no flat outer face on the belt for its label')
+            return
+
+        # Sketch every label before cutting any: a cut remakes the body's faces.
+        height = min(LABEL_TEXT_HEIGHT_CM, 0.6 * belt_width_cm)
+        labels = []
+        for idx, (face, face_n) in enumerate(faces):
+            # Path line down the face's length, dropped half a text height below its middle
+            # so the text (drawn above the path) ends up centred across the belt. Pointing
+            # it along up x normal keeps the text reading left-to-right from outside.
+            span = max(face.edges, key=lambda e: e.length)
+            along = span.startVertex.geometry.vectorTo(span.endVertex.geometry)
+            along.normalize()
+            if up.crossProduct(face_n).dotProduct(along) < 0:
+                along.scaleBy(-1)
+            center = futil.BBCentroid(face.boundingBox)
+            center.translateBy(_scaled(up, -height / 2))
+            half = span.length * 0.4
+            p1 = center.copy()
+            p1.translateBy(_scaled(along, -half))
+            p2 = center.copy()
+            p2.translateBy(_scaled(along, half))
+
+            sk = comp.sketches.add(face)
+            sk.name = f'{BELT_LABEL_SKETCH}_{idx + 1}'
+            path = sk.sketchCurves.sketchLines.addByTwoPoints(sk.modelToSketchSpace(p1),
+                                                              sk.modelToSketchSpace(p2))
+            path.isConstruction = True
+            # Pinning the path fully constrains the sketch -- the text stays whole (no explode).
+            path.startSketchPoint.isFixed = True
+            path.endSketchPoint.isFixed   = True
+            text_input = sk.sketchTexts.createInput2(f'{tooth_count}T', height)
+            text_input.setAsAlongPath(path, True,
+                                      adsk.core.HorizontalAlignments.CenterHorizontalAlignment, 0)
+            labels.append((sk, sk.sketchTexts.add(text_input)))
+
+        # The face sketch's normal points out of the belt, so Negative cuts into it.
+        extrudes = comp.features.extrudeFeatures
+        for sk, text in labels:
+            ext_in = extrudes.createInput(text, adsk.fusion.FeatureOperations.CutFeatureOperation)
+            ext_in.setOneSideExtent(
+                adsk.fusion.DistanceExtentDefinition.create(
+                    adsk.core.ValueInput.createByReal(BELT_LABEL_ENGRAVE_CM)),
+                adsk.fusion.ExtentDirections.NegativeExtentDirection)
+            ext_in.participantBodies = [comp.bRepBodies.item(0)]
+            feature = extrudes.add(ext_in)
+            if feature.healthState != adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState:
+                futil.log(f'PartsGen: belt label cut unhealthy ({feature.errorOrWarningMessage}), '
+                          'removing it')
+                feature.deleteMe()
+                sk.deleteMe()
+    except Exception:
+        futil.handle_error('PartsGen _add_belt_label', show_message_box=not is_preview)
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +1162,8 @@ def findToothAnchor(insideLoop: adsk.fusion.ProfileLoop):
 
     for i in range(insideLoop.profileCurves.count):
         curve = insideLoop.profileCurves.item(i).sketchEntity
-        futil.print_SketchCurve(curve)
+        if config.DEBUG:
+            futil.print_SketchCurve(curve)
         if curve.objectType == adsk.fusion.SketchLine.classType():
             curve: adsk.fusion.SketchLine = curve
             insideNormal = futil.sketchLineNormal(curve, centroid)

@@ -35,7 +35,7 @@ hole_sizes: list[HoleSize] = [
     HoleSize('10-32 Tap', 0.1590, '#7 drill (10-32 clearance)'),
     HoleSize('1/4-20 Clearance', 0.265625, 'F drill (1/4-20 clearance)'),
     HoleSize('Rivnut Hole', 0.296875, '10-32 rivnut installation hole'),
-    HoleSize('1/2 Hex Bearing"', 1.125, '1/2" hex bearing'),
+    HoleSize('1/2 Hex Bearing', 1.125, '1/2" hex bearing'),
     HoleSize('1/2 Hex Bushing', 0.75, '1/2" hex bushing'),
     HoleSize('Spline Bearing', 1.85039, 'Spine Bearing installation hole'),
     HoleSize('Custom', 0.0, 'Enter custom diameter'),
@@ -122,77 +122,82 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
 
+# Shared worker for execute and preview: reads the dialog inputs and
+# adds/updates a diameter dimension on every selected circle.
+def _apply_dimensions(inputs: adsk.core.CommandInputs) -> tuple[HoleSize, float, float, int]:
+    holeSizeDropdownInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
+    customDiameterInp: adsk.core.ValueCommandInput = inputs.itemById('custom_diameter')
+    offsetInp: adsk.core.ValueCommandInput = inputs.itemById('diameter_offset')
+    circleSelectionInp: adsk.core.SelectionCommandInput = inputs.itemById('circle_selection')
+
+    # Get the selected hole size
+    selectedIndex = holeSizeDropdownInp.selectedItem.index
+    selectedHoleSize = hole_sizes[selectedIndex]
+
+    # Get the offset value (in cm, Fusion converts automatically)
+    offset_cm = offsetInp.value
+    offset_inches = offset_cm / 2.54
+
+    # Determine the diameter to use
+    if selectedHoleSize.name == 'Custom':
+        # Custom input value is already in cm (Fusion converts it automatically)
+        diameter_cm = customDiameterInp.value
+        diameter_inches = diameter_cm / 2.54
+    else:
+        # Predefined values are in inches, need to convert to cm
+        diameter_inches = selectedHoleSize.diameter
+        diameter_cm = diameter_inches * 2.54
+
+    # Apply the offset to the diameter
+    diameter_inches += offset_inches
+    diameter_cm += offset_cm
+
+    # Get the active design
+    design = app.activeProduct
+    if not design:
+        raise RuntimeError('No active design found.')
+
+    # Process each selected circle
+    dimensionsAdded = 0
+    for i in range(circleSelectionInp.selectionCount):
+        selection = circleSelectionInp.selection(i)
+        circle: adsk.fusion.SketchCircle = selection.entity
+
+        if circle.objectType == adsk.fusion.SketchCircle.classType():
+            # Get the sketch
+            sketch = circle.parentSketch
+
+            # Check if the circle already has a diameter dimension
+            existingDim = None
+            for dim in sketch.sketchDimensions:
+                if dim.objectType == adsk.fusion.SketchDiameterDimension.classType():
+                    dimCircle = dim.entity
+                    if dimCircle == circle:
+                        existingDim = dim
+                        break
+
+            if existingDim:
+                # Update existing dimension
+                existingDim.value = diameter_cm
+            else:
+                # Add new diameter dimension
+                centerPt = circle.centerSketchPoint.geometry
+                textPoint = adsk.core.Point3D.create(
+                    centerPt.x + circle.radius * 0.7,
+                    centerPt.y + circle.radius * 0.7,
+                    centerPt.z
+                )
+                dimension = sketch.sketchDimensions.addDiameterDimension(circle, textPoint)
+                dimension.value = diameter_cm
+
+            dimensionsAdded += 1
+
+    return (selectedHoleSize, diameter_inches, offset_inches, dimensionsAdded)
+
 # This event handler is called when the user clicks the OK button
 def command_execute(args: adsk.core.CommandEventArgs):
     try:
-        inputs = args.command.commandInputs
-        holeSizeDropdownInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
-        customDiameterInp: adsk.core.ValueCommandInput = inputs.itemById('custom_diameter')
-        offsetInp: adsk.core.ValueCommandInput = inputs.itemById('diameter_offset')
-        circleSelectionInp: adsk.core.SelectionCommandInput = inputs.itemById('circle_selection')
-
-        # Get the selected hole size
-        selectedIndex = holeSizeDropdownInp.selectedItem.index
-        selectedHoleSize = hole_sizes[selectedIndex]
-
-        # Get the offset value (in cm, Fusion converts automatically)
-        offset_cm = offsetInp.value
-        offset_inches = offset_cm / 2.54
-
-        # Determine the diameter to use
-        if selectedHoleSize.name == 'Custom':
-            # Custom input value is already in cm (Fusion converts it automatically)
-            diameter_cm = customDiameterInp.value
-            diameter_inches = diameter_cm / 2.54
-        else:
-            # Predefined values are in inches, need to convert to cm
-            diameter_inches = selectedHoleSize.diameter
-            diameter_cm = diameter_inches * 2.54
-        
-        # Apply the offset to the diameter
-        diameter_inches += offset_inches
-        diameter_cm += offset_cm
-
-        # Get the active design
-        design = app.activeProduct
-        if not design:
-            ui.messageBox('No active design found.')
-            return
-
-        # Process each selected circle
-        dimensionsAdded = 0
-        for i in range(circleSelectionInp.selectionCount):
-            selection = circleSelectionInp.selection(i)
-            circle: adsk.fusion.SketchCircle = selection.entity
-
-            if circle.objectType == adsk.fusion.SketchCircle.classType():
-                # Get the sketch
-                sketch = circle.parentSketch
-
-                # Check if the circle already has a diameter dimension
-                existingDim = None
-                for dim in sketch.sketchDimensions:
-                    if dim.objectType == adsk.fusion.SketchDiameterDimension.classType():
-                        dimCircle = dim.entity
-                        if dimCircle == circle:
-                            existingDim = dim
-                            break
-
-                if existingDim:
-                    # Update existing dimension
-                    existingDim.value = diameter_cm
-                else:
-                    # Add new diameter dimension
-                    centerPt = circle.centerSketchPoint.geometry
-                    textPoint = adsk.core.Point3D.create(
-                        centerPt.x + circle.radius * 0.7,
-                        centerPt.y + circle.radius * 0.7,
-                        centerPt.z
-                    )
-                    dimension = sketch.sketchDimensions.addDiameterDimension(circle, textPoint)
-                    dimension.value = diameter_cm
-
-                dimensionsAdded += 1
+        (selectedHoleSize, diameter_inches, offset_inches, dimensionsAdded) = _apply_dimensions(args.command.commandInputs)
 
         # Show offset in message if it's not zero
         if abs(offset_inches) > 0.0001:
@@ -206,68 +211,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
 # This event handler is called when the command needs to compute a new preview
 def command_preview(args: adsk.core.CommandEventArgs):
     try:
-        inputs = args.command.commandInputs
-        holeSizeDropdownInp: adsk.core.DropDownCommandInput = inputs.itemById('hole_size')
-        customDiameterInp: adsk.core.ValueCommandInput = inputs.itemById('custom_diameter')
-        offsetInp: adsk.core.ValueCommandInput = inputs.itemById('diameter_offset')
-        circleSelectionInp: adsk.core.SelectionCommandInput = inputs.itemById('circle_selection')
-
-        # Get the selected hole size
-        selectedIndex = holeSizeDropdownInp.selectedItem.index
-        selectedHoleSize = hole_sizes[selectedIndex]
-
-        # Get the offset value (in cm, Fusion converts automatically)
-        offset_cm = offsetInp.value
-
-        # Determine the diameter to use
-        if selectedHoleSize.name == 'Custom':
-            # Custom input value is already in cm (Fusion converts it automatically)
-            diameter_cm = customDiameterInp.value
-        else:
-            # Predefined values are in inches, need to convert to cm
-            diameter_inches = selectedHoleSize.diameter
-            diameter_cm = diameter_inches * 2.54
-        
-        # Apply the offset to the diameter
-        diameter_cm += offset_cm
-
-        # Get the active design
-        design = app.activeProduct
-        if not design:
-            return
-
-        # Process each selected circle for preview
-        for i in range(circleSelectionInp.selectionCount):
-            selection = circleSelectionInp.selection(i)
-            circle: adsk.fusion.SketchCircle = selection.entity
-
-            if circle.objectType == adsk.fusion.SketchCircle.classType():
-                # Get the sketch
-                sketch = circle.parentSketch
-
-                # Check if the circle already has a diameter dimension
-                existingDim = None
-                for dim in sketch.sketchDimensions:
-                    if dim.objectType == adsk.fusion.SketchDiameterDimension.classType():
-                        dimCircle = dim.entity
-                        if dimCircle == circle:
-                            existingDim = dim
-                            break
-
-                if existingDim:
-                    # Update existing dimension
-                    existingDim.value = diameter_cm
-                else:
-                    # Add new diameter dimension
-                    centerPt = circle.centerSketchPoint.geometry
-                    textPoint = adsk.core.Point3D.create(
-                        centerPt.x + circle.radius * 0.7,
-                        centerPt.y + circle.radius * 0.7,
-                        centerPt.z
-                    )
-                    dimension = sketch.sketchDimensions.addDiameterDimension(circle, textPoint)
-                    dimension.value = diameter_cm
-
+        _apply_dimensions(args.command.commandInputs)
         args.isValidResult = True
 
     except:

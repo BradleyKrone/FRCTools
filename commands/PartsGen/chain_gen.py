@@ -6,9 +6,10 @@ The chain type is determined automatically from the CCDistance sketch that
 the user selects — motion==3 → #25, motion==4 → #35.
 
 Architecture mirrors belt_gen.py exactly: CCLine auto-detection, pitch-loop
-construction, simple offset-body extrusion, optional sprocket auto-generation,
-and a commandTerminated name-sync hook so the chain and sprockets rebuild
-when the CC distance is edited.
+construction, simple offset-body extrusion, optional sprocket auto-generation
+(each also jointed to the user's own C-C circle, sprocket 1 carrying a Z offset),
+and a commandTerminated name-sync hook so the chain rebuilds and the sprockets
+are resized in place when the CC distance is edited.
 """
 
 import adsk.core
@@ -16,13 +17,18 @@ import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
 from ..CCDistance.CCLine import getCCLineFromEntity
-from .belt_gen import createPitchLoopFromSketchCircles
+from .belt_gen import (createPitchLoopFromSketchCircles, should_run_part_sync,
+                       _cc_joint_offset_cm, _add_cc_joint)
+from .pulley_gen import BORE_OFFSET_DEFAULT_IN
 from .sprocket_gen import (
     create_sprocket_for_chain,
+    update_sprocket_teeth,
     ATTR_SPROCKET_CHAIN_COMP_TOKEN,
     ATTR_SPROCKET_PITCH_CIRCLE_IDX,
     ATTR_SPROCKET_CHAIN_PITCH,
     ATTR_SPROCKET_TOOTH_COUNT,
+    ATTR_SPROCKET_WIDTH,
+    ATTR_SPROCKET_BORE_OFFSET,
 )
 
 app = adsk.core.Application.get()
@@ -40,13 +46,13 @@ MOTION_CHAIN_35 = 4
 CHAIN_25_PITCH_MM            = 6.35
 CHAIN_25_LINK_HEIGHT_CM      = 0.232 * 2.54   # C: link plate height   = 0.232 in ≈ 5.89 mm
 CHAIN_25_WIDTH_CM            = 0.307 * 2.54   # E: outer chain width   = 0.307 in ≈ 7.80 mm
-CHAIN_25_SPROCKET_FACE_CM    = 0.375 * 2.54   # WCP Double Hub sprocket face width = 0.375 in ≈ 9.53 mm
+CHAIN_25_SPROCKET_FACE_CM    = 0.375 * 2.54   # WCP Double Hub sprocket hub-to-hub width = 0.375 in ≈ 9.53 mm
 
 # #35 chain (3/8 in pitch) — ANSI B29.1 / WCP-0770
 CHAIN_35_PITCH_MM            = 9.525
 CHAIN_35_LINK_HEIGHT_CM      = 0.352 * 2.54   # C: link plate height   = 0.352 in ≈ 8.94 mm
 CHAIN_35_WIDTH_CM            = 0.463 * 2.54   # E: outer chain width   = 0.463 in ≈ 11.76 mm
-CHAIN_35_SPROCKET_FACE_CM    = 0.500 * 2.54   # WCP Double Hub sprocket face width = 0.500 in ≈ 12.70 mm
+CHAIN_35_SPROCKET_FACE_CM    = 0.53125 * 2.54 # WCP Double Hub sprocket hub-to-hub width = 17/32 in ≈ 13.49 mm
 
 # ---------------------------------------------------------------------------
 # Attribute keys (written to the component so the edit command can restore)
@@ -56,29 +62,24 @@ ATTR_PART_TYPE           = 'part_type'
 ATTR_CHAIN_TYPE          = 'chain_type'           # '25' or '35'
 ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
 ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
-ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
 ATTR_CHAIN_LOOP_LENGTH    = 'chain_loop_length'
+ATTR_CUSTOM_NAME          = 'custom_name'
+ATTR_CHAIN_BORE_OFFSET    = 'chain_bore_offset'         # sprockets' hex bore offset, as typed
+ATTR_CHAIN_OFFSET_EXPR    = 'chain_offset_expr'         # Sprocket 1's Z Offset, as typed
+ATTR_CHAIN_OFFSET_FACE    = 'chain_offset_face_token'   # entityToken of its "Offset From" face
+ATTR_CHAIN_OFFSET_SIDE    = 'chain_offset_side'         # which sprocket face it's measured to
+ATTR_CHAIN_CC_CIRCLE      = 'chain_cc_circle_token'     # the user's C-C circles, suffixed _1 / _2
+ATTR_CHAIN_JOINT_OFFSET   = 'chain_joint_offset_cm'     # the offset Sprocket 1's C-C joint got
+
+# "Measured To" choices for Sprocket 1's Z Offset
+OFFSET_SIDE_BOTTOM = 'Bottom Face'
+OFFSET_SIDE_TOP    = 'Top Face'
 
 # ---------------------------------------------------------------------------
 # Chain-name-sync (commandTerminated hook)
 # ---------------------------------------------------------------------------
 _chain_sync_registered  = False
 _chain_sync_handlers: list = []
-
-
-# ---------------------------------------------------------------------------
-# Timeline grouping helper (avoids circular import from entry.py)
-# ---------------------------------------------------------------------------
-
-def _group_timeline_features(design: adsk.fusion.Design, start_marker: int, group_name: str):
-    try:
-        timeline = design.timeline
-        end_marker = timeline.markerPosition - 1
-        if end_marker > start_marker:
-            group = timeline.timelineGroups.add(start_marker, end_marker)
-            group.name = group_name
-    except Exception:
-        futil.log(f'PartsGen: failed to create timeline group "{group_name}"')
 
 
 # ---------------------------------------------------------------------------
@@ -133,14 +134,23 @@ def unregister_chain_name_sync():
     _chain_sync_registered = False
 
 
+_chain_sync_running = False
+
+
 def _on_command_terminated(args: adsk.core.ApplicationCommandEventArgs):
+    global _chain_sync_running
+    if _chain_sync_running:
+        return  # a command fired by the sync's own edits
     try:
         design = adsk.fusion.Design.cast(app.activeProduct)
-        if design is None:
+        if not should_run_part_sync(args, design):
             return
+        _chain_sync_running = True
         _scan_and_update_chain_names(design)
     except Exception:
         pass
+    finally:
+        _chain_sync_running = False
 
 
 def _find_comp_by_token(design: adsk.fusion.Design, token: str):
@@ -173,6 +183,10 @@ def _find_occurrence_of(design: adsk.fusion.Design, comp_token: str):
 
 
 def _scan_and_update_chain_names(design: adsk.fusion.Design):
+    """Walk every component, then fix chains and their sprockets. Collect first, update
+    after: a sprocket that has to be rebuilt deletes its occurrence, which would end a
+    walk in progress (LESSONS_LEARNED.md)."""
+    chains, sprockets = [], []
     try:
         root    = design.rootComponent
         visited: set = set()
@@ -184,18 +198,20 @@ def _scan_and_update_chain_names(design: adsk.fusion.Design):
                 continue
             visited.add(token)
 
-            chain_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH)
-            if chain_attr is not None:
-                _update_chain_name(comp)
-
-            sprocket_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_SPROCKET_CHAIN_COMP_TOKEN)
-            if sprocket_attr is not None:
-                _update_chain_sprocket_name(comp, design)
+            if comp.attributes.itemByName(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH) is not None:
+                chains.append(comp)
+            if comp.attributes.itemByName(ATTR_GROUP, ATTR_SPROCKET_CHAIN_COMP_TOKEN) is not None:
+                sprockets.append(comp)
 
             for i in range(comp.occurrences.count):
                 queue.append(comp.occurrences.item(i).component)
     except Exception:
         pass
+    for comp in chains:
+        _update_chain_name(comp)
+    for comp in sprockets:
+        if comp.isValid:
+            _update_chain_sprocket_name(comp, design)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +274,8 @@ def _rebuild_chain_3d(comp: adsk.fusion.Component, new_loop_cm: float, sprocket_
             return
 
         path_curves = sk.findConnectedCurves(tangent_line)
-        extrudeChain(sk, sprocket_width_cm)
+        extrudeChain(sk, sprocket_width_cm,
+                     CHAIN_35_WIDTH_CM if sname == 'Chain35' else CHAIN_25_WIDTH_CM)
 
         existing = comp.attributes.itemByName(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH)
         if existing:
@@ -271,19 +288,24 @@ def _rebuild_chain_3d(comp: adsk.fusion.Component, new_loop_cm: float, sprocket_
 def _rebuild_sprocket(old_comp: adsk.fusion.Component, design: adsk.fusion.Design,
                       new_n_teeth: int, chain_pitch_mm: float,
                       chain_comp_token: str, circle_idx: int):
-    """Delete the stale sprocket occurrence and recreate it with updated tooth count."""
+    """Bring the sprocket to its new tooth count: edited in place when possible (joints the
+    user made to it survive), else deleted and recreated, with its C-C joint re-added."""
     try:
-        attrs      = old_comp.attributes
-        width_attr = attrs.itemByName(ATTR_GROUP, ATTR_SPROCKET_CHAIN_PITCH)
-        show_attr  = attrs.itemByName(ATTR_GROUP, 'sprocket_show_teeth')
-        width_mm_attr = attrs.itemByName(ATTR_GROUP, 'sprocket_width_expr')
-
-        show_teeth = show_attr is not None and show_attr.value.lower() == 'true'
-        # Recover width: stored as 'NNN mm' in the attr
+        # Read attributes BEFORE any deletion (comp becomes invalid after deleteMe)
+        attrs  = old_comp.attributes
+        units  = design.unitsManager
+        width_attr  = attrs.itemByName(ATTR_GROUP, ATTR_SPROCKET_WIDTH)
+        offset_attr = attrs.itemByName(ATTR_GROUP, ATTR_SPROCKET_BORE_OFFSET)
         try:
-            width_cm = float(width_mm_attr.value.split()[0]) / 10.0 if width_mm_attr else 0.9525
+            # Older sprockets stored the rounded width as 'NN mm'; newer ones exact inches.
+            width_cm = units.evaluateExpression(width_attr.value, 'in') if width_attr else 0.9525
         except Exception:
             width_cm = 0.9525
+        try:
+            bore_offset_cm = (units.evaluateExpression(offset_attr.value, 'in') if offset_attr
+                              else BORE_OFFSET_DEFAULT_IN * 2.54)
+        except Exception:
+            bore_offset_cm = BORE_OFFSET_DEFAULT_IN * 2.54
 
         old_token  = old_comp.entityToken
         chain_comp = _find_comp_by_token(design, chain_comp_token)
@@ -299,11 +321,31 @@ def _rebuild_sprocket(old_comp: adsk.fusion.Component, design: adsk.fusion.Desig
         if chain_occ is None or sprocket_occ is None:
             return
 
-        sprocket_occ.deleteMe()
+        if update_sprocket_teeth(sprocket_occ, new_n_teeth, design):
+            return
 
-        create_sprocket_for_chain(new_n_teeth, width_cm, chain_pitch_mm,
-                                  chain_occ, proj_circle, show_teeth, circle_idx,
-                                  parent_comp=chain_comp)
+        futil.log(f'PartsGen: rebuilding {old_comp.name} from scratch -- '
+                  'joints made to it will be lost')
+        rebuild_start = design.timeline.markerPosition
+        sprocket_occ.deleteMe()     # removes its joints too
+
+        sprocket = create_sprocket_for_chain(new_n_teeth, width_cm, chain_pitch_mm,
+                                             chain_occ, proj_circle, circle_idx,
+                                             parent_comp=chain_comp,
+                                             bore_offset_cm=bore_offset_cm,
+                                             group_timeline=False)
+
+        # Its joint to the user's C-C circle went with the old occurrence -- re-add it.
+        cc_attr  = chain_comp.attributes.itemByName(ATTR_GROUP, f'{ATTR_CHAIN_CC_CIRCLE}_{circle_idx + 1}')
+        off_attr = chain_comp.attributes.itemByName(ATTR_GROUP, ATTR_CHAIN_JOINT_OFFSET)
+        if sprocket is not None and cc_attr is not None:
+            found = design.findEntityByToken(cc_attr.value)
+            if found:
+                _add_cc_joint(chain_occ, sprocket, found[0], circle_idx,
+                              float(off_attr.value) if off_attr else 0.0,
+                              sketch_name=proj_circle.parentSketch.name)
+        if sprocket is not None:
+            futil.group_timeline_features(design, rebuild_start, sprocket[0].component.name)
     except Exception:
         futil.log('PartsGen: _rebuild_sprocket failed')
 
@@ -354,6 +396,9 @@ def _update_chain_name(comp: adsk.fusion.Component):
         if stored_len is None or abs(loop_cm - stored_len) > 1e-6:
             _rebuild_chain_3d(comp, loop_cm, width_cm, link_height_cm)
 
+        if comp.attributes.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME):
+            return  # user gave this chain a custom name — don't auto-rename it
+
         width_mm = round(width_cm * 10)
         new_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
         if comp.name != new_name:
@@ -396,8 +441,11 @@ def _update_chain_sprocket_name(comp: adsk.fusion.Component, design: adsk.fusion
 # Extrude helper
 # ---------------------------------------------------------------------------
 
-def extrudeChain(sketch: adsk.fusion.Sketch, sprocket_width_cm: float):
-    """Extrude the annular chain loop profile (the 'belt shell' equivalent)."""
+def extrudeChain(sketch: adsk.fusion.Sketch, sprocket_width_cm: float,
+                 chain_width_cm: float = None):
+    """Extrude the annular chain loop profile (the 'belt shell' equivalent): `chain_width_cm`
+    wide (the chain's outer width), centred on the sprockets' plates, i.e. mid-way across
+    their `sprocket_width_cm` hub-to-hub width. None = the full sprocket width."""
     workingComp = sketch.parentComponent
 
     if sketch.profiles.count == 0:
@@ -433,12 +481,17 @@ def extrudeChain(sketch: adsk.fusion.Sketch, sprocket_width_cm: float):
                   f'(profiles={sketch.profiles.count})')
         return
 
+    width_cm = sprocket_width_cm if chain_width_cm is None else chain_width_cm
     extrudes = workingComp.features.extrudeFeatures
-    extrudes.addSimple(
-        chain_loop,
-        adsk.core.ValueInput.createByReal(sprocket_width_cm),
-        adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
-    )
+    ext_in = extrudes.createInput(chain_loop, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+    ext_in.setOneSideExtent(adsk.fusion.DistanceExtentDefinition.create(
+        adsk.core.ValueInput.createByReal(width_cm)),
+        adsk.fusion.ExtentDirections.PositiveExtentDirection)
+    start_cm = (sprocket_width_cm - width_cm) / 2
+    if abs(start_cm) > 1e-6:
+        ext_in.startExtent = adsk.fusion.OffsetStartDefinition.create(
+            adsk.core.ValueInput.createByReal(start_cm))
+    extrudes.add(ext_in)
 
 
 # ---------------------------------------------------------------------------
@@ -520,15 +573,38 @@ def handle_chain_selection_changed(inputs: adsk.core.CommandInputs):
 # ---------------------------------------------------------------------------
 
 def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
-    """Create (or preview) a roller chain component from the PartsGen dialog inputs."""
+    """Create (or preview) a roller chain component from the PartsGen dialog inputs.
+
+    With "Generate Sprockets" on, both sprockets are built toothless with a 1/2in hex bore
+    and jointed to the chain's pitch circles *and* to the user's own C-C circles: Sprocket 1
+    with a revolute joint carrying the Z offset (it sets the height of the whole chain),
+    Sprocket 2 with a cylindrical one -- the same scheme as the belt's pulleys."""
 
     selInp:         adsk.core.SelectionCommandInput = inputs.itemById('chain_pitch_circles')
     widthInp:       adsk.core.ValueCommandInput     = inputs.itemById('chain_sprocket_width')
     genSprocketsInp: adsk.core.BoolValueCommandInput = inputs.itemById('chain_gen_sprockets')
-    sprTeethInp:    adsk.core.BoolValueCommandInput  = inputs.itemById('chain_sprocket_teeth')
+    boreOffsetInp:  adsk.core.ValueCommandInput     = inputs.itemById('chain_bore_offset')
+    offsetFaceInp:  adsk.core.SelectionCommandInput = inputs.itemById('chain_offset_face')
+    offsetDistInp:  adsk.core.ValueCommandInput     = inputs.itemById('chain_offset_dist')
+    offsetSideInp:  adsk.core.DropDownCommandInput  = inputs.itemById('chain_offset_side')
+
+    bore_offset_cm = (boreOffsetInp.value if boreOffsetInp is not None
+                      else BORE_OFFSET_DEFAULT_IN * 2.54)
+    # Sprocket 1's height: its `offset_side` face sits `offset_dist_cm` from the picked face.
+    offset_dist_cm = offsetDistInp.value if offsetDistInp is not None else 0.0
+    offset_side    = (offsetSideInp.selectedItem.name
+                      if offsetSideInp is not None and offsetSideInp.selectedItem is not None
+                      else OFFSET_SIDE_BOTTOM)
+    offset_face = None
+    if offsetFaceInp is not None and offsetFaceInp.selectionCount > 0:
+        try:
+            offset_face = offsetFaceInp.selection(0).entity
+        except RuntimeError:
+            pass    # the count can run ahead of the indexer mid-click (LESSONS_LEARNED.md)
 
     if selInp.selectionCount < 2:
-        futil.popup_error('Parts Gen: please select two pitch circles for the Chain.')
+        if not is_preview:
+            futil.popup_error('Parts Gen: please select two pitch circles for the Chain.')
         return
 
     # Cache selections before new component creation clears them
@@ -546,94 +622,150 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     chain_type_str = '35' if motion == MOTION_CHAIN_35 else '25'
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
-    rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
-    trans     = adsk.core.Matrix3D.create()
     try:
-        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+        workingOcc  = futil.add_occurrence_in_active(design)   # root-context proxy
     except RuntimeError:
-        futil.popup_error(
-            'Cannot create chain: this document is in Part Design mode, '
-            'which only supports a single component.\n\n'
-            'Please open or create an Assembly document and try again.'
-        )
+        if not is_preview:
+            futil.popup_error(
+                'Cannot create chain: this document is in Part Design mode, '
+                'which only supports a single component.\n\n'
+                'Please open or create an Assembly document and try again.'
+            )
         return
     workingComp = workingOcc.component
 
-    sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
-    sketch.name = sketch_name
-
-    if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
-        futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
-        workingOcc.deleteMe()
-        return
-
-    projList1 = sketch.include(userSelections[0])
-    projList2 = sketch.include(userSelections[1])
-    circle1_proj = projList1.item(0)
-    circle2_proj = projList2.item(0)
-
-    PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
-
-    curveLength = sum(curve.length for curve in PitchLoop)
-    link_count  = int(curveLength * 10 / pitch_mm + 0.5)
-    futil.log(f'Chain {chain_label}: loop length={curveLength:.4f} cm, links={link_count}')
-
-    width_mm = round(widthInp.value * 10)
-    comp_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
-    workingComp.name = comp_name
-
-    # Build offset profiles around the pitch loop for the chain body cross-section
-    half_thickness = adsk.core.ValueInput.createByReal(link_height_cm / 2)
-    geoConstraints = sketch.geometricConstraints
-    curves         = list(PitchLoop)
-
-    offsetInput = geoConstraints.createOffsetInput(curves, half_thickness)
-    geoConstraints.addTwoSidesOffset(offsetInput, True)
-
-    futil.log(f'Chain offset created {sketch.profiles.count} profiles')
-    if sketch.profiles.count < 2:
-        futil.popup_error('Parts Gen: chain offset profiles not created correctly.')
-        workingOcc.deleteMe()
-        return
-
-    if is_preview:
-        extrudeChain(sketch, widthInp.value)
-        return
-
-    extrudeChain(sketch, widthInp.value)
-
-    # Save attributes
     try:
-        attrs = workingComp.attributes
-        attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Chain')
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_TYPE,           chain_type_str)
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_WIDTH, widthInp.expression)
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_GEN_SPROCKETS,  str(genSprocketsInp.value if genSprocketsInp else True))
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_TEETH, str(sprTeethInp.value if sprTeethInp else False))
-        attrs.add(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH,    str(round(curveLength, 8)))
-    except Exception:
-        futil.log('PartsGen: failed to save chain attributes')
+        sketch = workingComp.sketches.add(originalSketch.referencePlane, workingOcc)
+        sketch.name = sketch_name
 
-    # Auto-generate sprockets
-    gen_sprockets = genSprocketsInp is not None and genSprocketsInp.value
-    show_teeth    = sprTeethInp    is not None and sprTeethInp.value
+        if userSelections[0].objectType != adsk.fusion.SketchCircle.classType():
+            if not is_preview:
+                futil.popup_error('Parts Gen: please select two pitch circles (not a line).')
+            workingOcc.deleteMe()
+            return
 
-    if gen_sprockets:
-        proj_circles = [circle1_proj, circle2_proj]
-        for i, circle in enumerate(userSelections[:2]):
-            try:
-                n_teeth = _n_teeth_from_radius(circle.radius, pitch_mm)
-                futil.log(f'Chain {chain_label}: auto-sprocket {i+1} — radius={circle.radius:.4f} cm, teeth={n_teeth}')
-                if n_teeth < 9:
-                    futil.log(f'Chain: skipping auto-sprocket {i+1} — tooth count {n_teeth} too small')
-                    continue
-                create_sprocket_for_chain(
-                    n_teeth, widthInp.value, pitch_mm,
-                    workingOcc, proj_circles[i], show_teeth,
-                    circle_index=i, parent_comp=workingComp,
+        projList1 = sketch.include(userSelections[0])
+        projList2 = sketch.include(userSelections[1])
+        circle1_proj = projList1.item(0)
+        circle2_proj = projList2.item(0)
+
+        # Guard against coincident/near-coincident pitch circles — _buildPitchLoop divides
+        # by the center-to-center distance, so this must be checked before it runs (mirrors
+        # the same check already used on rebuild in _update_chain_name).
+        p1_c, p2_c = circle1_proj.centerSketchPoint.geometry, circle2_proj.centerSketchPoint.geometry
+        cc_dist = math.sqrt((p2_c.x - p1_c.x) ** 2 + (p2_c.y - p1_c.y) ** 2)
+        if cc_dist < abs(circle1_proj.radius - circle2_proj.radius) + 1e-6:
+            if not is_preview:
+                futil.popup_error(
+                    'Parts Gen: the two selected pitch circles are coincident or one is '
+                    'inside the other — cannot build a chain loop.'
                 )
-            except Exception:
-                futil.handle_error(f'PartsGen: auto-sprocket {i+1} failed', show_message_box=True)
+            workingOcc.deleteMe()
+            return
 
-    _group_timeline_features(design, start_marker, comp_name)
+        # The sprockets span Z=0..width from their joint circle, so the "Measured To" face
+        # is at 0 (bottom) or the width (top).
+        part_face_z = widthInp.value if offset_side == OFFSET_SIDE_TOP else 0.0
+        joint_offset_cm = _cc_joint_offset_cm(workingOcc, circle1_proj, offset_face,
+                                              offset_dist_cm, part_face_z, sketch_name)
+        if joint_offset_cm is None:
+            if not is_preview:
+                futil.popup_error('Parts Gen: the "Offset From" face must be parallel to the '
+                                  'C-C sketch.')
+            workingOcc.deleteMe()
+            return
+
+        PitchLoop = createPitchLoopFromSketchCircles(sketch, circle1_proj, circle2_proj)
+
+        curveLength = sum(curve.length for curve in PitchLoop)
+        link_count  = int(curveLength * 10 / pitch_mm + 0.5)
+        futil.log(f'Chain {chain_label}: loop length={curveLength:.4f} cm, links={link_count}')
+
+        width_mm = round(widthInp.value * 10)
+        comp_name = f'{comp_prefix}-{link_count}Lx{width_mm}mm'
+        workingComp.name = comp_name
+
+        customNameInp = inputs.itemById('custom_name')
+        custom_name = customNameInp.value.strip() if customNameInp is not None else ''
+        if custom_name:
+            workingComp.name = comp_name = custom_name
+
+        # Build offset profiles around the pitch loop for the chain body cross-section
+        half_thickness = adsk.core.ValueInput.createByReal(link_height_cm / 2)
+        geoConstraints = sketch.geometricConstraints
+        curves         = list(PitchLoop)
+
+        offsetInput = geoConstraints.createOffsetInput(curves, half_thickness)
+        geoConstraints.addTwoSidesOffset(offsetInput, True)
+
+        futil.log(f'Chain offset created {sketch.profiles.count} profiles')
+        if sketch.profiles.count < 2:
+            if not is_preview:
+                futil.popup_error('Parts Gen: chain offset profiles not created correctly.')
+            workingOcc.deleteMe()
+            return
+
+        extrudeChain(sketch, widthInp.value,
+                     CHAIN_35_WIDTH_CM if motion == MOTION_CHAIN_35 else CHAIN_25_WIDTH_CM)
+
+        # Save attributes
+        gen_sprockets = genSprocketsInp is not None and genSprocketsInp.value
+        try:
+            attrs = workingComp.attributes
+            attrs.add(ATTR_GROUP, ATTR_PART_TYPE,            'Chain')
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_TYPE,           chain_type_str)
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_SPROCKET_WIDTH, widthInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_GEN_SPROCKETS,  str(gen_sprockets))
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_LOOP_LENGTH,    str(round(curveLength, 8)))
+            if custom_name:
+                attrs.add(ATTR_GROUP, ATTR_CUSTOM_NAME,      custom_name)
+            if boreOffsetInp is not None:
+                attrs.add(ATTR_GROUP, ATTR_CHAIN_BORE_OFFSET, boreOffsetInp.expression)
+            if offsetDistInp is not None:
+                attrs.add(ATTR_GROUP, ATTR_CHAIN_OFFSET_EXPR, offsetDistInp.expression)
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_JOINT_OFFSET, str(round(joint_offset_cm, 8)))
+            attrs.add(ATTR_GROUP, ATTR_CHAIN_OFFSET_SIDE,  offset_side)
+            for key, entity in [(ATTR_CHAIN_OFFSET_FACE, offset_face),
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_1', userSelections[0]),
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_2', userSelections[1])]:
+                try:
+                    if entity is not None:
+                        attrs.add(ATTR_GROUP, key, entity.entityToken)
+                except Exception:
+                    futil.log(f'PartsGen: could not save chain attribute {key}')
+        except Exception:
+            futil.log('PartsGen: failed to save chain attributes')
+
+        # Auto-generate sprockets (toothless; cheap enough to build in preview too)
+        if gen_sprockets:
+            proj_circles = [circle1_proj, circle2_proj]
+            for i, circle in enumerate(userSelections[:2]):
+                try:
+                    n_teeth = _n_teeth_from_radius(circle.radius, pitch_mm)
+                    futil.log(f'Chain {chain_label}: auto-sprocket {i+1} — radius={circle.radius:.4f} cm, teeth={n_teeth}')
+                    if n_teeth < 9:
+                        futil.log(f'Chain: skipping auto-sprocket {i+1} — tooth count {n_teeth} too small')
+                        continue
+                    sprocket = create_sprocket_for_chain(
+                        n_teeth, widthInp.value, pitch_mm,
+                        workingOcc, proj_circles[i],
+                        circle_index=i, parent_comp=workingComp,
+                        bore_offset_cm=bore_offset_cm, is_preview=is_preview,
+                        group_timeline=False,
+                    )
+                    # ...and to the user's own C-C circle, which places the whole chain.
+                    if sprocket is not None:
+                        _add_cc_joint(workingOcc, sprocket, circle, i, joint_offset_cm,
+                                      is_preview, sketch_name)
+                except Exception:
+                    futil.handle_error(f'PartsGen: auto-sprocket {i+1} failed',
+                                       show_message_box=not is_preview)
+
+        futil.group_timeline_features(design, start_marker, comp_name)
+    except Exception:
+        try:
+            workingOcc.deleteMe()
+        except Exception:
+            pass
+        futil.handle_error('PartsGen _create_chain', show_message_box=not is_preview)

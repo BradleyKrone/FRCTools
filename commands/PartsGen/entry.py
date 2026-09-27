@@ -3,12 +3,31 @@ import adsk.fusion
 import os
 from ...lib import fusionAddInUtils as futil
 from ... import config
-from .shaft_gen import _create_shaft
+from .shaft_gen import (_create_shaft, _hex_spacer_bore_dims_cm, delete_shaft_bearings,
+                        shaft_outer_occurrence, BEARING_NONE, bearing_choices, bearing_part_name)
 from .tube_gen import _create_tube
-from .pulley_gen import _create_pulley
-from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
+from .pulley_gen import (_create_pulley, BORE_HALF_HEX, BORE_TYPES, BORE_OFFSET_DEFAULT_IN,
+                         ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
+                         PULLEY_BELT_WIDTH_ITEMS, pulley_outer_occurrence)
+from .belt_gen import (_create_belt, handle_belt_selection_changed, register_belt_name_sync,
+                       unregister_belt_name_sync, OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP)
 from .sprocket_gen import _create_sprocket
-from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
+from .chain_gen import (_create_chain, handle_chain_selection_changed, register_chain_name_sync,
+                        unregister_chain_name_sync,
+                        OFFSET_SIDE_BOTTOM as CHAIN_OFFSET_BOTTOM,
+                        OFFSET_SIDE_TOP as CHAIN_OFFSET_TOP,
+                        ATTR_CHAIN_BORE_OFFSET, ATTR_CHAIN_OFFSET_EXPR, ATTR_CHAIN_OFFSET_FACE,
+                        ATTR_CHAIN_OFFSET_SIDE, ATTR_CHAIN_CC_CIRCLE)
+from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_selection_changed,
+                       update_gear_dialog, update_gear_from_dialog, selected_pitch_circles,
+                       is_cc_gear, register_gear_sync, unregister_gear_sync,
+                       OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP,
+                       ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
+                       ATTR_GEAR_CC_CIRCLE)
+from .hardware_gen import (PART_HARDWARE, add_hardware_group, create_hardware,
+                           handle_hardware_input_changed, handle_hardware_html,
+                           selected_spacer_type, create_spacers, SPACER_BY_SHAFT_TYPE,
+                           _hardware_folder, _hardware_parent)
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -17,7 +36,7 @@ CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenDialog'
 CMD_NAME = 'Parts Gen'
 CMD_Description = 'Create FRC robot parts (shafts and tubes)'
 
-IS_PROMOTED = False
+IS_PROMOTED = True
 
 ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', '')
 
@@ -25,7 +44,35 @@ local_handlers         = []
 edit_local_handlers   = []
 ui_handlers            = []
 _edit_target_occ       = None   # occurrence being edited; set in ui_command_starting
+_edit_ref_entities     = None   # (ref_point, face2) recovered from the edited shaft's stored
+                                # entity tokens, re-selected in edit_command_activate --
+                                # SelectionCommandInput.addSelection() doesn't stick when it is
+                                # called from commandCreated.
+_edit_belt_entities    = None   # (C-C circle 1, C-C circle 2, offset face) for a belt, same idea
+_edit_chain_entities   = None   # the same three picks for a chain
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
+_belt_live_preview     = True   # the Timing Belt's "Live Preview" checkbox, kept between dialogs
+
+# ---------------------------------------------------------------------------
+# Apply button -- commit the part and reopen the dialog with the same settings.
+# The click fires a CustomEvent that, once Fusion is idle, starts Parts Gen again. That
+# pre-empts the open dialog, which Fusion executes just like OK (isExecutedWhenPreEmpted
+# defaults to True), and command_created restores the saved input values. Don't call
+# doExecute() for this -- it destroys the command inside our own callback, which leaves
+# Fusion's command state broken so later commits silently don't happen.
+# ---------------------------------------------------------------------------
+_APPLY_EVENT_ID  = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenApplyEvent'
+_apply_state     = None   # [(input id, value)] saved by an Apply click, restored on reopen
+
+# ---------------------------------------------------------------------------
+# Reference-face highlight (Shaft/Tube preview) -- see command_preview /
+# command_destroy and _draw_ref_face_highlight below.
+# ---------------------------------------------------------------------------
+_ref_face_highlight_group = None
+
+_REF_FACE_COLOR   = (120, 190, 255)  # light blue
+_REF_FACE_OPACITY = 0.9
+_DEPTH_REF_FACE   = 10
 
 # ---------------------------------------------------------------------------
 # Units
@@ -41,15 +88,22 @@ PART_PULLEY  = 'Timing Pulley'
 PART_BELT    = 'Timing Belt'
 PART_SPROCKET = 'Sprocket'
 PART_CHAIN   = 'Chain'
+# PART_GEAR ('Gear') comes from gear_gen.py, which stores it on the component.
 
 # ---------------------------------------------------------------------------
 # Shaft types
 # ---------------------------------------------------------------------------
-SHAFT_HALF_HEX       = '1/2" Hex Shaft'
-SHAFT_THREE_EIGHTH_HEX = '3/8" Hex Shaft'
-SHAFT_CUSTOM         = 'Custom (Round Tube)'
+SHAFT_HALF_HEX            = '1/2" Hex Shaft'
+SHAFT_THREE_EIGHTH_HEX    = '3/8" Hex Shaft'
+SHAFT_MAXSPLINE           = 'MAXSpline Shaft'
+SHAFT_HALF_HEX_SPACER     = '1/2" Hex Spacer'
+SHAFT_THREE_EIGHTH_SPACER = '3/8" Hex Spacer'
+SHAFT_CUSTOM              = 'Custom (Round Tube)'
 
-# Half-inch hex and 3/8" hex circumradius constants live in shaft_gen.py
+# Both hex sizes are generated as WCP rounded hex (hex flats + round bearing pilot);
+# MAXSpline is REV Robotics' 6-lobe wavy spline shaft. A "Hex Spacer" is the inverse of its
+# same-size hex shaft: round OD (user-set) with a clearance-fit hex bore, for a spacer that
+# spins freely on that hex shaft. The profile constants for all of these live in shaft_gen.py
 
 # ---------------------------------------------------------------------------
 # Tube thickness options  (inches, label)
@@ -82,6 +136,16 @@ LEN_FACES  = 'Between Two Faces'
 LEN_CUSTOM = 'Custom Length'
 
 # ---------------------------------------------------------------------------
+# Shaft reference-face joint options -- only meaningful in LEN_FACES mode,
+# since that's the only mode where the reference face touches another part.
+# ---------------------------------------------------------------------------
+JOINT_REVOLUTE = 'Revolute (Spins Freely)'
+JOINT_RIGID    = 'Rigid (Fixed)'
+
+# The shaft's optional "Add Bearing" parts (BEARING_NONE, bearing_choices,
+# bearing_part_name) are defined once in shaft_gen.py's BEARING_PARTS table.
+
+# ---------------------------------------------------------------------------
 # Edit command  (shown only via the right-click marking menu)
 # ---------------------------------------------------------------------------
 EDIT_CMD_ID          = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenEdit'
@@ -111,7 +175,13 @@ ATTR_BELT_WIDTH        = 'belt_width_expr'
 ATTR_BELT_SUPPRESS     = 'belt_suppress_teeth'
 ATTR_BELT_GEN_PULLEYS  = 'belt_gen_pulleys'
 ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
-ATTR_BELT_PULLEY_WIDTH = 'belt_pulley_width'
+ATTR_BELT_BORE_TYPE    = 'belt_pulley_bore_type'
+ATTR_BELT_BORE_OFFSET  = 'belt_pulley_bore_offset'
+ATTR_BELT_ADAPTER      = 'belt_pulley_adapter'
+ATTR_BELT_OFFSET_EXPR  = 'belt_offset_expr'
+ATTR_BELT_OFFSET_FACE  = 'belt_offset_face_token'
+ATTR_BELT_CC_CIRCLE    = 'belt_cc_circle_token'
+ATTR_BELT_OFFSET_FLANGE = 'belt_offset_flange'
 
 ATTR_SPROCKET_TOOTH_COUNT = 'sprocket_tooth_count'
 ATTR_SPROCKET_WIDTH       = 'sprocket_width_expr'
@@ -121,7 +191,20 @@ ATTR_SPROCKET_CHAIN_TYPE  = 'sprocket_chain_type'
 ATTR_CHAIN_TYPE           = 'chain_type'
 ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
 ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
-ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
+
+ATTR_CUSTOM_NAME          = 'custom_name'
+
+ATTR_CREATE_JOINT = 'shaft_create_joint'
+ATTR_JOINT_TYPE   = 'shaft_joint_type'
+ATTR_JOINT_FLIP   = 'shaft_joint_flip'
+ATTR_REVERSE_DIR  = 'shaft_reverse_direction'
+ATTR_BEARING_ENDS = 'shaft_bearing_ends'
+
+# Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
+# where it was instead of dropping back to a Custom Length at the world origin. A Custom
+# Length shaft built from a Reference Point (no Face 2) stores only the ref-point token.
+ATTR_REF_POINT_TOKEN = 'shaft_ref_point_token'
+ATTR_FACE2_TOKEN     = 'shaft_face2_token'
 
 
 # ===========================================================================
@@ -134,8 +217,9 @@ def start():
     )
     futil.add_handler(cmd_def.commandCreated, command_created)
 
-    submenu = config.get_solid_submenu()
-    control = submenu.controls.addCommand(cmd_def)
+    panel = config.get_frc_panel()
+    control = panel.controls.addCommand(cmd_def)
+    control.isPromotedByDefault = IS_PROMOTED
     control.isPromoted = IS_PROMOTED
 
     # Edit command — shown only via the right-click marking menu; no toolbar button
@@ -150,11 +234,20 @@ def start():
 
     register_belt_name_sync()
     register_chain_name_sync()
+    register_gear_sync()
+
+    # A leftover registration from a crashed run makes registerCustomEvent return None.
+    try:
+        app.unregisterCustomEvent(_APPLY_EVENT_ID)
+    except Exception:
+        pass
+    apply_event = app.registerCustomEvent(_APPLY_EVENT_ID)
+    futil.add_handler(apply_event, _on_apply_event, local_handlers=ui_handlers)
 
 
 def stop():
-    submenu = config.get_solid_submenu()
-    command_control  = submenu.controls.itemById(CMD_ID)
+    panel = config.get_frc_panel()
+    command_control  = panel.controls.itemById(CMD_ID)
     command_definition = ui.commandDefinitions.itemById(CMD_ID)
     edit_cmd_def       = ui.commandDefinitions.itemById(EDIT_CMD_ID)
 
@@ -168,6 +261,11 @@ def stop():
 
     unregister_belt_name_sync()
     unregister_chain_name_sync()
+    unregister_gear_sync()
+    try:
+        app.unregisterCustomEvent(_APPLY_EVENT_ID)
+    except Exception:
+        pass
 
     global ui_handlers
     ui_handlers = []
@@ -177,11 +275,368 @@ def stop():
 # command_created  –  build the dialog
 # ===========================================================================
 
+def _add_bearing_ends_input(placeInputs: adsk.core.CommandInputs, selected: str,
+                            shaft_type: str):
+    """Add the shaft's 'Add Bearing' dropdown (shared by the create and edit dialogs)."""
+    bearingEndsInp = placeInputs.addDropDownCommandInput(
+        'bearing_ends', 'Add Bearing', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    bearingEndsInp.tooltip = ('Add a flanged bearing or bushing to both ends of the shaft, '
+                              'rigidly jointed with the flange flush to the shaft end')
+    _refresh_bearing_items(bearingEndsInp, shaft_type, bearing_part_name(selected))
+    return bearingEndsInp
+
+
+def _refresh_bearing_items(bearingEndsInp: adsk.core.DropDownCommandInput, shaft_type: str,
+                           selected: str = None):
+    """Refill the 'Add Bearing' list with the parts that fit `shaft_type`, keeping the
+    current pick (or `selected`) when it still fits, else falling back to None."""
+    if selected is None:
+        item = bearingEndsInp.selectedItem
+        selected = item.name if item is not None else BEARING_NONE
+    choices = bearing_choices(shaft_type)
+    if selected not in choices:
+        selected = BEARING_NONE
+    bearingEndsInp.listItems.clear()
+    for name in choices:
+        bearingEndsInp.listItems.add(name, name == selected, '')
+
+
+def _add_dialog_groups(inputs: adsk.core.CommandInputs):
+    """Add the dialog's three groups and return their child collections.
+
+    "Part" holds what to build (type, name, size, length); "Placement" holds where it goes
+    (joint, reference picks, direction, bearings); "Display" holds preview-only options.
+    Inputs live inside the groups, but itemById on the command's top-level inputs still
+    finds them -- in inputChanged, though, `args.inputs` is only the changed input's own
+    group, so look inputs up from the command instead.
+    """
+    partGroup = inputs.addGroupCommandInput('part_group', 'Part')
+    partGroup.isExpanded = True
+    placeGroup = inputs.addGroupCommandInput('placement_group', 'Placement')
+    placeGroup.isExpanded = True
+    displayGroup = inputs.addGroupCommandInput('display_group', 'Display')
+    displayGroup.isExpanded = True
+    return partGroup.children, placeGroup.children, displayGroup.children
+
+
+def _add_pulley_belt_width_input(partInputs: adsk.core.CommandInputs,
+                                 width_name: str, visible: bool):
+    """Add the Timing Pulley's Belt Width dropdown (shared by the create and edit dialogs).
+    A saved width that isn't one of the options (older pulleys) falls back to the first."""
+    beltWidthInp = partInputs.addDropDownCommandInput(
+        'belt_width', 'Belt Width', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in PULLEY_BELT_WIDTH_ITEMS:
+        beltWidthInp.listItems.add(name, name == width_name, '')
+    if beltWidthInp.selectedItem is None:
+        beltWidthInp.listItems.item(0).isSelected = True
+    beltWidthInp.isVisible = visible
+
+
+def _add_pulley_bore_inputs(partInputs: adsk.core.CommandInputs,
+                            bore_type: str, offset_expr: str, visible: bool,
+                            adapter: bool = False):
+    """Add the Timing Pulley's Bore Type dropdown, Bore Offset input and 3D Print Adapter
+    checkbox (shared by the create and edit dialogs)."""
+    boreTypeInp = partInputs.addDropDownCommandInput(
+        'pulley_bore_type', 'Bore', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in BORE_TYPES:
+        boreTypeInp.listItems.add(name, name == bore_type, '')
+    if boreTypeInp.selectedItem is None:
+        boreTypeInp.listItems.item(0).isSelected = True
+    boreTypeInp.isVisible = visible
+
+    boreOffsetInp = partInputs.addValueInput(
+        'pulley_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(offset_expr)
+    )
+    boreOffsetInp.tooltip = ('Added to every side of the bore: positive = looser, '
+                             'negative = tighter.')
+    boreOffsetInp.isVisible = visible
+
+    adapterInp = partInputs.addBoolValueInput('pulley_adapter', '3D Print Adapter', True, '',
+                                              adapter)
+    adapterInp.tooltip = ('Press a 3D-printed hub adapter into the bottom of the pulley: '
+                          'WCP-1121 for 1/2" Hex, WCP-1021 for SplineXS. The pulley is '
+                          'pocketed to fit it, and both are placed in their own group.')
+    adapterInp.isVisible = visible
+
+
+def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
+                     belt_type: str = 'HTD 5mm Pitch',
+                     width_name: str = PULLEY_BELT_WIDTH_ITEMS[0],
+                     suppress_teeth: bool = True, belt_type_enabled: bool = False,
+                     gen_pulleys: bool = True, pulley_teeth: bool = False,
+                     bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
+                     bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
+                     adapters=(False, False),
+                     offset_expr: str = '0.251 in',
+                     offset_flange: str = OFFSET_FLANGE_BOTTOM,
+                     live_preview: bool = None):
+    """Add the Timing Belt's "Belt", "Pulleys", "Pulley 1" and "Pulley 2" groups (shared
+    by the create and edit dialogs). The one Width dropdown sizes both the belt and its
+    generated pulleys, and the pulley options mirror the Timing Pulley part's, with Bore
+    and 3D Print Adapter chosen per pulley. command_input_changed shows the groups only
+    for Timing Belt, and the pulley options only with Generate Pulleys on.
+    `live_preview` adds the Live Preview checkbox (None = no checkbox: the edit dialog
+    has no preview)."""
+    beltGroup = inputs.addGroupCommandInput('belt_group', 'Belt')
+    beltGroup.isExpanded = True
+    beltGroup.isVisible  = visible
+    beltInputs = beltGroup.children
+
+    if live_preview is not None:
+        livePreviewInp = beltInputs.addBoolValueInput('tb_live_preview', 'Live Preview', True,
+                                                      '', live_preview)
+        livePreviewInp.tooltip = ('Off: nothing is built while you edit -- the belt and its '
+                                  'pulleys are built once on OK. Faster in big assemblies.')
+
+    tbCirclesInp = beltInputs.addSelectionInput(
+        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
+    )
+    tbCirclesInp.addSelectionFilter('SketchCurves')
+    tbCirclesInp.setSelectionLimits(2 if visible else 0, 2)
+
+    tbBeltTypeInp = beltInputs.addDropDownCommandInput(
+        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', belt_type == 'HTD 5mm Pitch', '')
+    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', belt_type == 'GT2 3mm Pitch', '')
+    if tbBeltTypeInp.selectedItem is None:
+        tbBeltTypeInp.listItems.item(0).isSelected = True
+    tbBeltTypeInp.isEnabled = belt_type_enabled
+
+    tbBeltWidthInp = beltInputs.addDropDownCommandInput(
+        'tb_belt_width', 'Width', adsk.core.DropDownStyles.TextListDropDownStyle
+    )
+    for name in PULLEY_BELT_WIDTH_ITEMS:
+        tbBeltWidthInp.listItems.add(name, name == width_name, '')
+    if tbBeltWidthInp.selectedItem is None:
+        tbBeltWidthInp.listItems.item(0).isSelected = True
+    tbBeltWidthInp.tooltip = 'Belt width -- the generated pulleys are made to match.'
+
+    beltInputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '',
+                                 suppress_teeth)
+
+    pulleyGroup = inputs.addGroupCommandInput('belt_pulley_group', 'Pulleys')
+    pulleyGroup.isExpanded = True
+    pulleyGroup.isVisible  = visible
+    pulleyInputs = pulleyGroup.children
+
+    pulleyInputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', gen_pulleys)
+    tbPulleyTeethInp = pulleyInputs.addBoolValueInput('tb_pulley_teeth', 'Show Teeth', True, '',
+                                                      pulley_teeth)
+    tbPulleyTeethInp.isVisible = gen_pulleys
+
+    boreOffsetInp = pulleyInputs.addValueInput(
+        'tb_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(bore_offset_expr)
+    )
+    boreOffsetInp.tooltip = ('Added to every side of both pulleys\' bores: positive = looser, '
+                             'negative = tighter.')
+    boreOffsetInp.isVisible = gen_pulleys
+
+    # One group per pulley so each can have its own bore (and adapter, which depends on
+    # the bore). Input names can't change at runtime, so the group says which End Circle.
+    for i in (1, 2):
+        group = inputs.addGroupCommandInput(
+            f'belt_pulley{i}_group',
+            f'Pulley {i} ({"first" if i == 1 else "second"} End Circle)')
+        group.isExpanded = True
+        group.isVisible  = visible and gen_pulleys
+        children = group.children
+
+        boreTypeInp = children.addDropDownCommandInput(
+            f'tb_bore_type_{i}', 'Bore', adsk.core.DropDownStyles.TextListDropDownStyle
+        )
+        for name in BORE_TYPES:
+            boreTypeInp.listItems.add(name, name == bore_types[i - 1], '')
+        if boreTypeInp.selectedItem is None:
+            boreTypeInp.listItems.item(0).isSelected = True
+
+        adapterInp = children.addBoolValueInput(f'tb_adapter_{i}', '3D Print Adapter', True,
+                                                '', adapters[i - 1])
+        adapterInp.tooltip = ('Press a 3D-printed hub adapter into the bottom of this pulley: '
+                              'WCP-1121 for 1/2" Hex, WCP-1021 for SplineXS. The pulley is '
+                              'pocketed to fit it, and both are placed in their own group.')
+
+        if i == 1:
+            # Pulley 1's joint to its C-C circle carries the belt's height; Pulley 2's
+            # follows it.
+            offsetFaceInp = children.addSelectionInput(
+                'tb_offset_face', 'Offset From',
+                'Optional: a face to measure the Z Offset from')
+            offsetFaceInp.addSelectionFilter('PlanarFaces')
+            offsetFaceInp.setSelectionLimits(0, 1)
+            offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is '
+                                     'measured from. Leave empty to offset from the C-C sketch '
+                                     'plane.')
+            offsetDistInp = children.addValueInput(
+                'tb_offset_dist', 'Z Offset', 'in',
+                adsk.core.ValueInput.createByString(offset_expr))
+            offsetDistInp.tooltip = ('Gap from the Offset From face to the Measured To flange '
+                                     'of this pulley, along the pulley axis. The belt and the '
+                                     'other pulley move with it. With no face picked, how far '
+                                     'the belt is moved off the C-C sketch plane.')
+            offsetFlangeInp = children.addDropDownCommandInput(
+                'tb_offset_flange', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+            for name in (OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP):
+                offsetFlangeInp.listItems.add(name, name == offset_flange, '')
+            if offsetFlangeInp.selectedItem is None:
+                offsetFlangeInp.listItems.item(0).isSelected = True
+            offsetFlangeInp.tooltip = ('Which of this pulley\'s flanges (its outer face) the Z '
+                                       'Offset is measured to. Only used with an Offset From face.')
+
+
+CHAIN_SPROCKET_INPUT_IDS = ('chain_bore_offset', 'chain_offset_face', 'chain_offset_dist',
+                            'chain_offset_side')
+
+
+def _add_chain_inputs(partInputs: adsk.core.CommandInputs, visible: bool,
+                      width_expr: str = '0.375 in', gen_sprockets: bool = True,
+                      bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
+                      offset_expr: str = '0 in', offset_side: str = CHAIN_OFFSET_BOTTOM):
+    """Add the Chain's inputs (shared by the create and edit dialogs). Kept flat in the
+    Part group, not a group of their own: a group changes InputChangedEventArgs.inputs.
+
+    The sprockets are toothless with a 1/2in hex bore. Sprocket 1's joint to its C-C
+    circle carries the chain's height (Z Offset, from an optional face); Sprocket 2's
+    follows it -- the same scheme as the belt's pulleys."""
+    chainCirclesInp = partInputs.addSelectionInput(
+        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
+    )
+    chainCirclesInp.addSelectionFilter('SketchCurves')
+    chainCirclesInp.setSelectionLimits(0, 2)
+    chainCirclesInp.isVisible = visible
+
+    chainSprocketWidthInp = partInputs.addValueInput(
+        'chain_sprocket_width', 'Sprocket Width', 'in',
+        adsk.core.ValueInput.createByString(width_expr)
+    )
+    chainSprocketWidthInp.tooltip = ('Hub-to-hub width of the WCP double-hub sprockets (0.375 in '
+                                     'for #25, 17/32 in for #35 -- set automatically when a C-C '
+                                     'line is picked). The chain is centred on their plates.')
+    chainSprocketWidthInp.isVisible = visible
+
+    chainGenSprocketsInp = partInputs.addBoolValueInput(
+        'chain_gen_sprockets', 'Generate Sprockets', True, '', gen_sprockets)
+    chainGenSprocketsInp.isVisible = visible
+    show = visible and gen_sprockets
+
+    boreOffsetInp = partInputs.addValueInput(
+        'chain_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(bore_offset_expr))
+    boreOffsetInp.tooltip = ('Added to every side of both sprockets\' 1/2" hex bores: '
+                             'positive = looser, negative = tighter.')
+    boreOffsetInp.isVisible = show
+
+    offsetFaceInp = partInputs.addSelectionInput(
+        'chain_offset_face', 'Offset From', 'Optional: a face to measure the Z Offset from')
+    offsetFaceInp.addSelectionFilter('PlanarFaces')
+    offsetFaceInp.setSelectionLimits(0, 1)
+    offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is measured '
+                             'from. Leave empty to offset from the C-C sketch plane.')
+    offsetFaceInp.isVisible = show
+
+    offsetDistInp = partInputs.addValueInput(
+        'chain_offset_dist', 'Z Offset', 'in', adsk.core.ValueInput.createByString(offset_expr))
+    offsetDistInp.tooltip = ('Gap from the Offset From face to the Measured To face of Sprocket 1 '
+                             '(first End Circle), along the sprocket axis. The chain and the other '
+                             'sprocket move with it. With no face picked, how far the chain is '
+                             'moved off the C-C sketch plane.')
+    offsetDistInp.isVisible = show
+
+    offsetSideInp = partInputs.addDropDownCommandInput(
+        'chain_offset_side', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for name in (CHAIN_OFFSET_BOTTOM, CHAIN_OFFSET_TOP):
+        offsetSideInp.listItems.add(name, name == offset_side, '')
+    if offsetSideInp.selectedItem is None:
+        offsetSideInp.listItems.item(0).isSelected = True
+    offsetSideInp.tooltip = ('Which face of Sprocket 1 the Z Offset is measured to. Only used '
+                             'with an Offset From face.')
+    offsetSideInp.isVisible = show
+
+
+def _add_gear_group(inputs: adsk.core.CommandInputs, visible: bool,
+                    tooth_expr: str = '60', bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
+                    joint_offset_expr: str = '0 in', edit_cc_gear: bool = None):
+    """Add the Gear's "Gears" group (shared by the create and edit dialogs).
+
+    Picking a gear C-C line builds both of its gears in one group component, jointed to the
+    pitch circles, with a bore each, and placed by a Z Offset from an optional face to the
+    gears' top or bottom hub; with no pick one standalone gear is built from Tooth Count.
+    The edit dialog (`edit_cc_gear` not None) edits one existing gear, so it has no C-C
+    pick; a C-C gear's tooth count follows its pitch circle, so it's read-only there."""
+    group = inputs.addGroupCommandInput('gear_group', 'Gears')
+    group.isExpanded = True
+    group.isVisible  = visible
+    children = group.children
+    is_edit = edit_cc_gear is not None
+
+    circlesInp = children.addSelectionInput(
+        'gear_pitch_circles', 'C-C Line', 'Optional: select a "Gears 20DP" C-C Line')
+    circlesInp.addSelectionFilter('SketchCurves')
+    circlesInp.setSelectionLimits(0, 2)
+    circlesInp.tooltip = ('Pick a Gears 20DP C-C Line to build both of its gears, jointed to '
+                          'its pitch circles and kept in step when the C-C changes. Leave '
+                          'empty to build one gear from Tooth Count.')
+    circlesInp.isVisible = not is_edit
+
+    infoInp = children.addTextBoxCommandInput('gear_cc_info', '', '', 1, True)
+    infoInp.isVisible = not is_edit
+
+    toothInp = children.addValueInput('gear_tooth_count', 'Tooth Count', '',
+                                      adsk.core.ValueInput.createByString(tooth_expr))
+    toothInp.tooltip = '20DP, 14.5 deg pressure angle. OD = (N + 2) / 20 in.'
+    toothInp.isEnabled = not edit_cc_gear
+
+    # CommandInput.name is read-only, so the label can't follow pair vs standalone.
+    for i in (1, 2):
+        boreTypeInp = children.addDropDownCommandInput(
+            f'gear_bore_type_{i}', 'Bore' if is_edit else f'Gear {i} Bore',
+            adsk.core.DropDownStyles.TextListDropDownStyle)
+        for name in BORE_TYPES:
+            boreTypeInp.listItems.add(name, name == bore_types[i - 1], '')
+        if boreTypeInp.selectedItem is None:
+            boreTypeInp.listItems.item(0).isSelected = True
+        boreTypeInp.isVisible = not (is_edit and i == 2)
+
+    offsetFaceInp = children.addSelectionInput(
+        'gear_offset_face', 'Offset From', 'Optional: a face to measure the Z Offset from')
+    offsetFaceInp.addSelectionFilter('PlanarFaces')
+    offsetFaceInp.setSelectionLimits(0, 1)
+    offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is measured '
+                             'from. Leave empty to offset from the C-C sketch plane.')
+    offsetFaceInp.isVisible = not is_edit
+
+    jointOffInp = children.addValueInput(
+        'gear_joint_offset', 'Z Offset', 'in',
+        adsk.core.ValueInput.createByString(joint_offset_expr))
+    jointOffInp.tooltip = ('Gap from the Offset From face to the Measured To hub face of both '
+                           'gears, out from the face. With no face picked, measured from the '
+                           'C-C sketch plane along its normal.')
+    jointOffInp.isVisible = not is_edit
+
+    offsetSideInp = children.addDropDownCommandInput(
+        'gear_offset_side', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for name in (OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP):
+        offsetSideInp.listItems.add(name, name == OFFSET_SIDE_BOTTOM, '')
+    offsetSideInp.tooltip = ('Which side of the gears the Z Offset is measured to: the outer '
+                             'face of the bottom or the top hub.')
+    offsetSideInp.isVisible = not is_edit
+
+    if not is_edit:
+        update_gear_dialog(inputs)
+
+
 def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
+    partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
 
     # --- Part type -----------------------------------------------------------
-    partTypeInp = inputs.addDropDownCommandInput(
+    partTypeInp = partInputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     partTypeInp.listItems.add(PART_SHAFT,    True,  '')
@@ -190,41 +645,49 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    False, '')
     partTypeInp.listItems.add(PART_SPROCKET, False, '')
     partTypeInp.listItems.add(PART_CHAIN,   False, '')
+    partTypeInp.listItems.add(PART_GEAR,    False, '')
+    partTypeInp.listItems.add(PART_HARDWARE, False, '')
+
+    # --- Component name (optional override; blank = auto-generated name) -----
+    customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', '')
+    customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---------------------------------------------------------
-    shaftTypeInp = inputs.addDropDownCommandInput(
+    shaftTypeInp = partInputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     shaftTypeInp.listItems.add(SHAFT_HALF_HEX, True, '')
     shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX, False, '')
-    shaftTypeInp.listItems.add(SHAFT_CUSTOM, False, '')
+    shaftTypeInp.listItems.add(SHAFT_MAXSPLINE, False, '')
+    # The spacers (Hex Spacers, Custom Round Tube) are under Hardware > Spacers now; they
+    # still build through _create_shaft, so custom_od/custom_id and Placement are shared.
 
-    customOD = inputs.addValueInput(
+    customOD = partInputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
         adsk.core.ValueInput.createByString('0.75 in')
     )
     customOD.isVisible = False
 
-    customID = inputs.addValueInput(
+    customID = partInputs.addValueInput(
         'custom_id', 'Bore Diameter', 'in',
         adsk.core.ValueInput.createByString('0.159 in')
     )
     customID.isVisible = False
 
     # --- Tube group ----------------------------------------------------------
-    tubeWidthInp = inputs.addValueInput(
+    tubeWidthInp = partInputs.addValueInput(
         'tube_width', 'Width', 'in',
         adsk.core.ValueInput.createByString('2 in')
     )
     tubeWidthInp.isVisible = False
 
-    tubeHeightInp = inputs.addValueInput(
+    tubeHeightInp = partInputs.addValueInput(
         'tube_height', 'Height', 'in',
         adsk.core.ValueInput.createByString('1 in')
     )
     tubeHeightInp.isVisible = False
 
-    tubeThickInp = inputs.addDropDownCommandInput(
+    tubeThickInp = partInputs.addDropDownCommandInput(
         'tube_thickness', 'Wall Thickness', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tubeThickInp.listItems.add(THICK_1_16, True, '')
@@ -232,17 +695,17 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     tubeThickInp.listItems.add(THICK_CUSTOM, False, '')
     tubeThickInp.isVisible = False
 
-    customThickInp = inputs.addValueInput(
+    customThickInp = partInputs.addValueInput(
         'custom_thickness', 'Custom Thickness', 'in',
         adsk.core.ValueInput.createByString('0.1 in')
     )
     customThickInp.isVisible = False
 
     # --- Tube face holes -----------------------------------------------------
-    tubeHolesInp = inputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', True)
+    tubeHolesInp = partInputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', True)
     tubeHolesInp.isVisible = False
 
-    holeSizeInp = inputs.addDropDownCommandInput(
+    holeSizeInp = partInputs.addDropDownCommandInput(
         'hole_size', 'Hole Size', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     holeSizeInp.listItems.add(HOLE_RIVENUT, True, '')
@@ -250,41 +713,96 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     holeSizeInp.listItems.add(HOLE_CUSTOM, False, '')
     holeSizeInp.isVisible = False
 
-    holeDiamInp = inputs.addValueInput(
+    holeDiamInp = partInputs.addValueInput(
         'hole_diameter', 'Custom Hole Diameter', 'in',
         adsk.core.ValueInput.createByString('0.25 in')
     )
     holeDiamInp.isVisible = False
 
     # --- Length group (shared) -----------------------------------------------
-    lenTypeInp = inputs.addDropDownCommandInput(
+    lenTypeInp = partInputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    lenTypeInp.listItems.add(LEN_FACES, False, '')
-    lenTypeInp.listItems.add(LEN_CUSTOM, True, '')
+    lenTypeInp.listItems.add(LEN_FACES, True, '')
+    lenTypeInp.listItems.add(LEN_CUSTOM, False, '')
 
-    face1Sel = inputs.addSelectionInput(
-        'face1_selection', 'Face 1', 'Select the starting planar face'
+    customLenInp = partInputs.addValueInput(
+        'custom_length', 'Length', 'in',
+        adsk.core.ValueInput.createByString('6 in')
+    )
+    customLenInp.isVisible = False
+
+    # --- Placement group -----------------------------------------------------
+    # Order: Create Joint, Reference Face/Point, Face 2, Reverse Direction, Joint Type,
+    # Flip, Add Bearing.
+    createJointInp = placeInputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', True)
+    createJointInp.isVisible = True
+
+    # Face 1 -- used only by Tube now. Shaft uses Reference Point instead (below): a
+    # face's own "center" is its area centroid, which is wrong for any face that isn't
+    # fully symmetric (e.g. a plate face with other holes in it), so Shaft needs an
+    # explicit point or circular edge to build from, not a face-center guess.
+    face1Sel = placeInputs.addSelectionInput(
+        'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
     face1Sel.setSelectionLimits(0, 1)
     face1Sel.isVisible = False
 
-    face2Sel = inputs.addSelectionInput(
+    # Reference Point -- Shaft only. Defines both where the shaft is built from AND
+    # (when "Create Joint" is checked) the joint's target on the other part -- one
+    # selection serves both roles, picked exactly like Fusion's own Joint command: a
+    # point, edge, or face, snapping to its center/midpoint/centroid keypoint.
+    refPointSel = placeInputs.addSelectionInput(
+        'ref_point_selection', 'Reference Point',
+        'Select a point, edge, or face that the shaft is built from -- just like picking a '
+        'joint origin in the Joint command'
+    )
+    refPointSel.addSelectionFilter('Vertices')
+    refPointSel.addSelectionFilter('SketchPoints')
+    refPointSel.addSelectionFilter('ConstructionPoints')
+    refPointSel.addSelectionFilter('Edges')
+    refPointSel.addSelectionFilter('Faces')
+    refPointSel.setSelectionLimits(1, 1)
+    refPointSel.isVisible = True
+
+    face2Sel = placeInputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
-    face2Sel.setSelectionLimits(0, 1)
-    face2Sel.isVisible = False
+    face2Sel.setSelectionLimits(1, 1)
+    face2Sel.isVisible = True
 
-    customLenInp = inputs.addValueInput(
-        'custom_length', 'Length', 'in',
-        adsk.core.ValueInput.createByString('6 in')
+    # Custom Length has no Face 2 to derive an extrude direction from, so once a Reference
+    # Point is picked (to place the shaft and/or joint it), which way the sketch plane's own
+    # normal happens to point is arbitrary -- this is a plain manual override for that, same
+    # spirit as the joint's own Flip checkbox below.
+    reverseDirInp = placeInputs.addBoolValueInput(
+        'reverse_direction', 'Reverse Direction', True, '', False)
+    reverseDirInp.isVisible = False
+
+    jointTypeInp = placeInputs.addDropDownCommandInput(
+        'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    customLenInp.isVisible = True
+    jointTypeInp.listItems.add(JOINT_REVOLUTE, True, '')
+    jointTypeInp.listItems.add(JOINT_RIGID, False, '')
+    jointTypeInp.isVisible = True
+
+    # Flip -- exactly the native Joint command's own Flip checkbox: no attempt is made to
+    # guess which of the two valid orientations is "correct" from the Reference Point pick,
+    # the user just toggles this if the shaft comes out backwards.
+    flipJointInp = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', False)
+    flipJointInp.isVisible = True
+
+    _add_bearing_ends_input(placeInputs, BEARING_NONE, shaftTypeInp.selectedItem.name)
+
+    # --- Display group -------------------------------------------------------
+    displayInputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
 
     # --- Pulley group --------------------------------------------------------
-    beltTypeInp = inputs.addDropDownCommandInput(
+    beltTypeInp = partInputs.addDropDownCommandInput(
         'belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     beltTypeInp.listItems.add('HTD 5mm Pitch', True,  '')
@@ -292,76 +810,40 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     beltTypeInp.isVisible = False
 
     defaultLengthUnits = ''
-    toothCountInp = inputs.addValueInput(
+    toothCountInp = partInputs.addValueInput(
         'tooth_count', 'Tooth Count', defaultLengthUnits,
         adsk.core.ValueInput.createByString('18')
     )
     toothCountInp.isVisible = False
 
-    beltWidthInp = inputs.addValueInput(
-        'belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString('0.394 in')
-    )
-    beltWidthInp.isVisible = False
+    _add_pulley_belt_width_input(partInputs, PULLEY_BELT_WIDTH_ITEMS[0], False)
 
-    pulleyShowTeethInp = inputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
+    pulleyShowTeethInp = partInputs.addBoolValueInput('pulley_show_teeth', 'Show Teeth', True, '', False)
     pulleyShowTeethInp.isVisible = False
 
-    # --- Timing Belt group ---------------------------------------------------
-    tbCirclesInp = inputs.addSelectionInput(
-        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
-    )
-    tbCirclesInp.addSelectionFilter('SketchCurves')
-    tbCirclesInp.setSelectionLimits(0, 2)
-    tbCirclesInp.isVisible = False
+    _add_pulley_bore_inputs(partInputs, BORE_HALF_HEX, f'{BORE_OFFSET_DEFAULT_IN} in', False)
 
-    tbBeltTypeInp = inputs.addDropDownCommandInput(
-        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
-    )
-    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', True,  '')
-    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', False, '')
-    tbBeltTypeInp.isEnabled = False
-    tbBeltTypeInp.isVisible = False
-
-    tbBeltWidthInp = inputs.addValueInput(
-        'tb_belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString('9')
-    )
-    tbBeltWidthInp.isVisible = False
-
-    tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', True)
-    tbSuppressInp.isVisible = False
-
-    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', True)
-    tbGenPulleysInp.isVisible = False
-
-    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', False)
-    tbPulleyTeethInp.isVisible = False
-
-    tbPulleyWidthInp = inputs.addValueInput(
-        'tb_pulley_width', 'Pulley Width', 'mm',
-        adsk.core.ValueInput.createByString('0.394 in')
-    )
-    tbPulleyWidthInp.isVisible = False
+    # --- Timing Belt ("Belt" and "Pulleys" groups) ----------------------------
+    _add_belt_groups(inputs, False, live_preview=_belt_live_preview)
 
     # --- Chain Sprocket group ------------------------------------------------
-    sprocketToothCountInp = inputs.addValueInput(
+    sprocketToothCountInp = partInputs.addValueInput(
         'sprocket_tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString('12')
     )
     sprocketToothCountInp.isVisible = False
 
-    sprocketWidthInp = inputs.addValueInput(
+    sprocketWidthInp = partInputs.addValueInput(
         'sprocket_width', 'Sprocket Width', 'in',
         adsk.core.ValueInput.createByString('0.375 in')
     )
     sprocketWidthInp.isVisible = False
 
-    sprocketShowTeethInp = inputs.addBoolValueInput(
+    sprocketShowTeethInp = partInputs.addBoolValueInput(
         'sprocket_show_teeth', 'Show Teeth', True, '', False)
     sprocketShowTeethInp.isVisible = False
 
-    sprocketChainTypeInp = inputs.addDropDownCommandInput(
+    sprocketChainTypeInp = partInputs.addDropDownCommandInput(
         'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     sprocketChainTypeInp.listItems.add('#25 Chain', True,  '')
@@ -369,31 +851,52 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInp.isVisible = False
 
     # --- Chain group ---------------------------------------------------------
-    chainCirclesInp = inputs.addSelectionInput(
-        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
-    )
-    chainCirclesInp.addSelectionFilter('SketchCurves')
-    chainCirclesInp.setSelectionLimits(0, 2)
-    chainCirclesInp.isVisible = False
+    _add_chain_inputs(partInputs, False)
 
-    chainSprocketWidthInp = inputs.addValueInput(
-        'chain_sprocket_width', 'Chain Width', 'in',
-        adsk.core.ValueInput.createByString('0.375 in')
-    )
-    chainSprocketWidthInp.isVisible = False
+    # --- Gear ("Gears" group) -------------------------------------------------
+    _add_gear_group(inputs, False)
 
-    chainGenSprocketsInp = inputs.addBoolValueInput(
-        'chain_gen_sprockets', 'Generate Sprockets', True, '', True)
-    chainGenSprocketsInp.isVisible = False
+    # --- Hardware ("Hardware" group) ------------------------------------------
+    add_hardware_group(inputs, False)
 
-    chainSprocketTeethInp = inputs.addBoolValueInput(
-        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', False)
-    chainSprocketTeethInp.isVisible = False
-    futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
-    futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=local_handlers)
-    futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
-    futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
-    futil.add_handler(args.command.destroy,        command_destroy,        local_handlers=local_handlers)
+    # --- Apply (commit this part, keep the dialog open for the next one) ------
+    # Last, so it sits right above OK -- the API can't put a button in the OK/Cancel row.
+    applyBtn = inputs.addBoolValueInput('apply_btn', 'Create and Continue', False, '', False)
+    applyBtn.text = 'Apply'
+    applyBtn.tooltip = ('Create this part and reopen Parts Gen with the same settings, '
+                        'ready to place the next one.')
+
+    global _apply_state
+    if _apply_state is not None:
+        state, _apply_state = _apply_state, None
+        try:
+            _restore_apply_state(inputs, state)
+        except Exception:
+            futil.handle_error('PartsGen restore Apply settings', show_message_box=False)
+
+    # A fresh list per dialog: Apply opens the next dialog *before* the pre-empted one is
+    # destroyed, so a shared list would be emptied by the old dialog's destroy and take the
+    # new dialog's handlers with it (blank thumbnail picker, dead inputs).
+    global local_handlers
+    handlers = local_handlers = []
+    futil.add_handler(args.command.execute,        command_execute,        local_handlers=handlers)
+    futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=handlers)
+    futil.add_handler(args.command.executePreview, command_preview,        local_handlers=handlers)
+    futil.add_handler(args.command.validateInputs, command_validate_input_create, local_handlers=handlers)
+    futil.add_handler(args.command.destroy,        lambda a: command_destroy(a, handlers),
+                      name='command_destroy', local_handlers=handlers)
+    futil.add_handler(args.command.incomingFromHTML, _hardware_html, local_handlers=handlers)
+
+
+def _hardware_html(args: adsk.core.HTMLEventArgs):
+    """The Hardware thumbnail picker. A tile click changes the hidden part dropdown without
+    an inputChanged event, so re-run the dialog's visibility for it here (a spacer shows the
+    Placement inputs, the other parts hide them)."""
+    handle_hardware_html(args)
+    if args.action == 'select' and args.browserCommandInput is not None:
+        hwPartInp = args.browserCommandInput.parentCommand.commandInputs.itemById('hw_part')
+        if hwPartInp is not None:
+            _refresh_inputs(hwPartInp)
 
 
 # ===========================================================================
@@ -401,7 +904,112 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 # ===========================================================================
 
 def command_input_changed(args: adsk.core.InputChangedEventArgs):
-    inputs = args.inputs
+    if args.input.id == 'apply_btn':
+        global _apply_state
+        _apply_state = _save_apply_state(args.input.parentCommand.commandInputs)
+        app.fireCustomEvent(_APPLY_EVENT_ID)
+        return
+    _refresh_inputs(args.input)
+
+
+# Not carried over by Apply: the button itself and the name override (it named the part
+# just made). Picks aren't saved either -- they belong to the part just made.
+_APPLY_SKIP_IDS = ('apply_btn', 'custom_name')
+
+
+def _walk_inputs(inputs: adsk.core.CommandInputs):
+    """Every input in dialog order, descending into groups."""
+    for i in range(inputs.count):
+        inp = inputs.item(i)
+        yield inp
+        if isinstance(inp, adsk.core.GroupCommandInput):
+            yield from _walk_inputs(inp.children)
+
+
+def _save_apply_state(inputs: adsk.core.CommandInputs):
+    state = []
+    for inp in _walk_inputs(inputs):
+        if inp.id in _APPLY_SKIP_IDS:
+            continue
+        if isinstance(inp, adsk.core.DropDownCommandInput):
+            if inp.selectedItem is not None:
+                state.append((inp.id, inp.selectedItem.name))
+        elif isinstance(inp, adsk.core.BoolValueCommandInput):
+            if inp.isCheckBox:
+                state.append((inp.id, inp.value))
+        elif isinstance(inp, adsk.core.ValueCommandInput):
+            state.append((inp.id, inp.expression))
+        elif isinstance(inp, (adsk.core.StringValueCommandInput,
+                              adsk.core.IntegerSpinnerCommandInput)):
+            state.append((inp.id, inp.value))
+    return state
+
+
+def _restore_apply_state(inputs: adsk.core.CommandInputs, state):
+    """Put an Apply click's saved values back into a freshly built dialog.
+
+    Dropdowns go first, in dialog order, each followed by _refresh_inputs as if the user
+    had picked it -- that refills dependent lists (a Hardware category's parts, a shaft
+    type's bearings) before the dropdowns after it are restored. The refresh also resets
+    some values to per-type defaults, so every other value goes second, overwriting them.
+    """
+    for inp_id, name in state:
+        inp = inputs.itemById(inp_id)
+        if not isinstance(inp, adsk.core.DropDownCommandInput) or \
+                (inp.selectedItem is not None and inp.selectedItem.name == name):
+            continue
+        for j in range(inp.listItems.count):
+            item = inp.listItems.item(j)
+            if item.name == name:
+                item.isSelected = True
+                _refresh_inputs(inp)
+                break
+    for inp_id, value in state:
+        inp = inputs.itemById(inp_id)
+        if inp is None or isinstance(inp, adsk.core.DropDownCommandInput):
+            continue
+        try:
+            if isinstance(inp, adsk.core.ValueCommandInput):
+                inp.expression = value
+            else:
+                inp.value = value
+        except Exception:
+            futil.log(f'PartsGen: Apply could not restore {inp_id}')
+    # Visibility follows the restored checkboxes (tube holes, joint options, ...). The
+    # id is one _refresh_inputs has no special case for, so nothing else is reset.
+    _refresh_inputs(inputs.itemById('custom_length'))
+    for sel_id in ('ref_point_selection', 'face1_selection', 'hw_holes', 'tb_pitch_circles',
+                   'chain_pitch_circles', 'gear_pitch_circles'):
+        sel = inputs.itemById(sel_id)
+        if sel is not None and sel.isVisible:
+            sel.hasFocus = True
+            break
+
+
+def _on_apply_event(args: adsk.core.CustomEventArgs):
+    """Runs once Fusion is idle after an Apply click: starting Parts Gen again commits the
+    open dialog (pre-empted = OK) and opens a fresh one with the saved settings."""
+    global _apply_state
+    try:
+        ui.commandDefinitions.itemById(CMD_ID).execute()
+    except Exception:
+        _apply_state = None
+        futil.handle_error('PartsGen Apply', show_message_box=True)
+
+
+def command_validate_input_create(args: adsk.core.ValidateInputsEventArgs):
+    """The create dialog's validateInputs: Apply is only clickable when OK is, since a
+    pre-empted command with invalid inputs is dropped instead of executed."""
+    command_validate_input(args)
+    applyBtn = args.inputs.itemById('apply_btn')
+    if applyBtn is not None:
+        applyBtn.isEnabled = args.areInputsValid
+
+
+def _refresh_inputs(changed_input: adsk.core.CommandInput):
+    """Show / hide the dialog's inputs after `changed_input` changed."""
+    # Not args.inputs -- that's only the changed input's own group (see _add_dialog_groups).
+    inputs = changed_input.parentCommand.commandInputs
 
     partTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('part_type')
     shaftTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('shaft_type')
@@ -418,16 +1026,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     face1Sel:       adsk.core.SelectionCommandInput  = inputs.itemById('face1_selection')
     face2Sel:       adsk.core.SelectionCommandInput  = inputs.itemById('face2_selection')
     customLenInp:   adsk.core.ValueCommandInput      = inputs.itemById('custom_length')
+    reverseDirInp:  adsk.core.BoolValueCommandInput  = inputs.itemById('reverse_direction')
+    highlightRefFaceInp: adsk.core.BoolValueCommandInput = inputs.itemById('highlight_ref_face')
+    createJointInp: adsk.core.BoolValueCommandInput  = inputs.itemById('create_joint')
+    jointTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('joint_type')
+    flipJointInp:   adsk.core.BoolValueCommandInput  = inputs.itemById('flip_joint')
+    refPointSel:    adsk.core.SelectionCommandInput  = inputs.itemById('ref_point_selection')
     beltTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('belt_type')
     toothCountInp:  adsk.core.ValueCommandInput      = inputs.itemById('tooth_count')
-    beltWidthInp:   adsk.core.ValueCommandInput      = inputs.itemById('belt_width')
+    beltWidthInp:   adsk.core.DropDownCommandInput   = inputs.itemById('belt_width')
     tbCirclesInp:   adsk.core.SelectionCommandInput  = inputs.itemById('tb_pitch_circles')
-    tbBeltTypeInp:  adsk.core.DropDownCommandInput   = inputs.itemById('tb_belt_type')
-    tbBeltWidthInp: adsk.core.ValueCommandInput      = inputs.itemById('tb_belt_width')
-    tbSuppressInp:       adsk.core.BoolValueCommandInput = inputs.itemById('tb_suppress_teeth')
     tbGenPulleysInp:     adsk.core.BoolValueCommandInput = inputs.itemById('tb_gen_pulleys')
-    tbPulleyTeethInp:    adsk.core.BoolValueCommandInput = inputs.itemById('tb_pulley_teeth')
-    tbPulleyWidthInp:    adsk.core.ValueCommandInput     = inputs.itemById('tb_pulley_width')
     pulleyShowTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
 
     part_type        = partTypeInp.selectedItem.name
@@ -437,16 +1046,49 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_belt     = (part_type == PART_BELT)
     part_is_sprocket = (part_type == PART_SPROCKET)
     part_is_chain    = (part_type == PART_CHAIN)
-    is_custom_shaft  = (shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
+    part_is_gear     = (part_type == PART_GEAR)
+    part_is_hardware = (part_type == PART_HARDWARE)
+    # First, so a category change has refilled the part list before the spacer check reads it.
+    if part_is_hardware and changed_input.id in ('part_type', 'hw_category', 'hw_part'):
+        handle_hardware_input_changed(inputs, changed_input.id)
+    # Hardware > Spacers are built by _create_shaft, so they take the Shaft's OD/ID and
+    # Placement inputs ("shaft-like"). The edit dialog edits a spacer as a Shaft.
+    spacer_type      = selected_spacer_type(inputs)
+    part_is_spacer   = spacer_type is not None
+    shaft_like       = part_is_shaft or part_is_spacer
+    shaft_type_name  = spacer_type or shaftTypeInp.selectedItem.name
+    is_custom_shaft  = (shaft_type_name == SHAFT_CUSTOM)
+    is_spacer_shaft  = (shaft_type_name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
+
+    # Length dropdown is shared across part types. Tube is most often cut to a specific
+    # custom length (e.g. a spacer), while Shaft is most often built Between Two Faces so
+    # its joint has both faces to reference -- default each part type to whichever is more
+    # common as soon as it's selected, same spirit as the customOD reset below.
+    if changed_input.id == 'part_type':
+        if part_is_tube:
+            lenTypeInp.listItems.item(1).isSelected = True  # Custom Length
+        elif part_is_shaft:
+            lenTypeInp.listItems.item(0).isSelected = True  # Between Two Faces
+
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
-    hide_length      = part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
+    hide_length      = (part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
+                        or part_is_gear or (part_is_hardware and not part_is_spacer))
+
+    # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
+    # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
+    # inputs stay invalid, executePreview never fires and the shaft never shows up. Turn it
+    # off on entering Custom Length unless a Reference Point is already there to joint to.
+    if (changed_input.id in ('part_type', 'length_type', 'hw_part') and shaft_like
+            and not is_between_faces and createJointInp is not None
+            and (refPointSel is None or refPointSel.selectionCount < 1)):
+        createJointInp.value = False
 
     # Shaft inputs
     shaftTypeInp.isVisible   = part_is_shaft
-    customOD.isVisible       = part_is_shaft and is_custom_shaft
-    customID.isVisible       = part_is_shaft and is_custom_shaft
+    customOD.isVisible       = shaft_like and (is_custom_shaft or is_spacer_shaft)
+    customID.isVisible       = shaft_like and is_custom_shaft
 
     # Tube inputs
     tubeWidthInp.isVisible   = part_is_tube
@@ -463,22 +1105,23 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     beltWidthInp.isVisible   = part_is_pulley
     if pulleyShowTeethInp is not None:
         pulleyShowTeethInp.isVisible = part_is_pulley
+    for bore_inp_id in ('pulley_bore_type', 'pulley_bore_offset', 'pulley_adapter'):
+        bore_inp = inputs.itemById(bore_inp_id)
+        if bore_inp is not None:
+            bore_inp.isVisible = part_is_pulley
 
-    # Timing Belt inputs
-    if tbCirclesInp is not None:
-        tbCirclesInp.isVisible  = part_is_belt
-    if tbBeltTypeInp is not None:
-        tbBeltTypeInp.isVisible = part_is_belt
-    if tbBeltWidthInp is not None:
-        tbBeltWidthInp.isVisible = part_is_belt
-    if tbSuppressInp is not None:
-        tbSuppressInp.isVisible = part_is_belt
-    if tbGenPulleysInp is not None:
-        tbGenPulleysInp.isVisible = part_is_belt
-    if tbPulleyTeethInp is not None:
-        tbPulleyTeethInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
-    if tbPulleyWidthInp is not None:
-        tbPulleyWidthInp.isVisible = part_is_belt and (tbGenPulleysInp is not None and tbGenPulleysInp.value)
+    # Timing Belt groups -- the pulley options only matter when pulleys are generated
+    gen_pulleys = tbGenPulleysInp is not None and tbGenPulleysInp.value
+    for group_id, show in (('belt_group', part_is_belt), ('belt_pulley_group', part_is_belt),
+                           ('belt_pulley1_group', part_is_belt and gen_pulleys),
+                           ('belt_pulley2_group', part_is_belt and gen_pulleys)):
+        group = inputs.itemById(group_id)
+        if group is not None:
+            group.isVisible = show
+    for pulley_inp_id in ('tb_pulley_teeth', 'tb_bore_offset'):
+        pulley_inp = inputs.itemById(pulley_inp_id)
+        if pulley_inp is not None:
+            pulley_inp.isVisible = gen_pulleys
 
     # Chain Sprocket inputs
     sprocketToothCountInp = inputs.itemById('sprocket_tooth_count')
@@ -498,29 +1141,111 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     chainCirclesInp       = inputs.itemById('chain_pitch_circles')
     chainSprocketWidthInp = inputs.itemById('chain_sprocket_width')
     chainGenSprocketsInp  = inputs.itemById('chain_gen_sprockets')
-    chainSprocketTeethInp = inputs.itemById('chain_sprocket_teeth')
     if chainCirclesInp is not None:
         chainCirclesInp.isVisible = part_is_chain
     if chainSprocketWidthInp is not None:
         chainSprocketWidthInp.isVisible = part_is_chain
     if chainGenSprocketsInp is not None:
         chainGenSprocketsInp.isVisible = part_is_chain
-    if chainSprocketTeethInp is not None:
-        chainSprocketTeethInp.isVisible = (
-            part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
+    for chain_inp_id in CHAIN_SPROCKET_INPUT_IDS:
+        chain_inp = inputs.itemById(chain_inp_id)
+        if chain_inp is not None:
+            chain_inp.isVisible = (part_is_chain and chainGenSprocketsInp is not None
+                                   and chainGenSprocketsInp.value)
 
-    # Length inputs — hidden when Pulley or Belt is selected
+    # Gear group
+    gearGroup = inputs.itemById('gear_group')
+    if gearGroup is not None:
+        gearGroup.isVisible = part_is_gear
+    gearCirclesInp = inputs.itemById('gear_pitch_circles')
+    if part_is_gear and gearCirclesInp is not None and gearCirclesInp.isVisible \
+            and changed_input.id == 'part_type':
+        gearCirclesInp.hasFocus = True
+    if changed_input.id == 'gear_pitch_circles':
+        handle_gear_selection_changed(inputs)
+
+    # Hardware group
+    hardwareGroup = inputs.itemById('hardware_group')
+    if hardwareGroup is not None:
+        hardwareGroup.isVisible = part_is_hardware
+    hwHolesInp = inputs.itemById('hw_holes')
+    if hwHolesInp is not None:
+        hwHolesInp.setSelectionLimits(1 if part_is_hardware and not part_is_spacer else 0, 0)
+        if part_is_hardware and not part_is_spacer and changed_input.id == 'part_type':
+            hwHolesInp.hasFocus = True
+
+    # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
+    # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
+    # see the note where it's declared in command_created for why).
     lenTypeInp.isVisible   = not hide_length
-    face1Sel.isVisible     = not hide_length and is_between_faces
+    for group_id in ('placement_group', 'display_group'):
+        group = inputs.itemById(group_id)
+        if group is not None:
+            group.isVisible = not hide_length
+    face1Sel.isVisible    = not hide_length and is_between_faces and part_is_tube
+    # Reference Point is required in Between-Two-Faces (positions the shaft). In Custom
+    # Length it only exists to give the joint below a target, so it's shown only while
+    # "Create Joint" is checked -- and cleared when hidden, so a stale pick can't silently
+    # keep placing the shaft somewhere the user can no longer see. A spacer always shows it:
+    # in Custom Length it takes any number of picks, one spacer at each.
+    show_ref_point = (not hide_length and shaft_like
+                      and (is_between_faces or part_is_spacer
+                           or (createJointInp is not None and createJointInp.value)))
+    if refPointSel is not None:
+        refPointSel.isVisible = show_ref_point
+        if not show_ref_point and refPointSel.selectionCount > 0:
+            refPointSel.clearSelection()
     face2Sel.isVisible     = not hide_length and is_between_faces
     customLenInp.isVisible = not hide_length and not is_between_faces
+    if reverseDirInp is not None:
+        reverseDirInp.isVisible = not hide_length and not is_between_faces and shaft_like
+    if highlightRefFaceInp is not None:
+        highlightRefFaceInp.isVisible = not hide_length
+
+    # Reference-face joint -- offered for a Shaft in either length mode, since Reference
+    # Point (its target) is now available in both. It reuses Reference Point directly as the
+    # joint's target -- no separate pick. Custom Length still requires an actual pick before
+    # "Create Joint" can be turned on (enforced in command_validate_input), since the point is
+    # optional there.
+    show_joint = shaft_like
+    show_joint_options = (show_joint and createJointInp is not None and createJointInp.value)
+    if createJointInp is not None:
+        createJointInp.isVisible = show_joint
+    if jointTypeInp is not None:
+        jointTypeInp.isVisible = show_joint_options
+    if flipJointInp is not None:
+        flipJointInp.isVisible = show_joint_options
+
+    # "Add Bearing" lists only the parts that fit the chosen shaft type, and hides when no
+    # part fits it at all.
+    bearingEndsInp = inputs.itemById('bearing_ends')
+    if bearingEndsInp is not None:
+        if changed_input.id == 'shaft_type':
+            _refresh_bearing_items(bearingEndsInp, shaft_type_name)
+        bearingEndsInp.isVisible = (not hide_length and part_is_shaft
+                                    and len(bearing_choices(shaft_type_name)) > 1)
 
     # Sync selection limits with visibility
-    if not hide_length and is_between_faces:
+    if not hide_length and is_between_faces and part_is_tube:
         face1Sel.setSelectionLimits(1, 1)
-        face2Sel.setSelectionLimits(1, 1)
     else:
         face1Sel.setSelectionLimits(0, 1)
+    if refPointSel is not None:
+        if not hide_length and is_between_faces and shaft_like:
+            if refPointSel.selectionCount > 1:
+                refPointSel.clearSelection()   # a spacer's Custom Length picks; one here
+            refPointSel.setSelectionLimits(1, 1)
+        elif part_is_spacer:
+            refPointSel.setSelectionLimits(0, 0)   # any number, one spacer each
+        else:
+            refPointSel.setSelectionLimits(0, 1)
+        refPointSel.tooltip = (
+            'Pick where each spacer goes -- as many as you like, one spacer at each.'
+            if part_is_spacer and not is_between_faces else
+            'Select a point, edge, or face that the part is built from.')
+    if not hide_length and is_between_faces:
+        face2Sel.setSelectionLimits(1, 1)
+    else:
         face2Sel.setSelectionLimits(0, 1)
 
     if part_is_belt and tbCirclesInp is not None:
@@ -534,68 +1259,269 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         else:
             chainCirclesInp.setSelectionLimits(0, 2)
 
-    if part_is_belt and tbCirclesInp is not None and args.input.id == 'part_type':
+    if part_is_belt and tbCirclesInp is not None and changed_input.id == 'part_type':
         tbCirclesInp.hasFocus = True
 
-    if part_is_chain and chainCirclesInp is not None and args.input.id == 'part_type':
+    if part_is_chain and chainCirclesInp is not None and changed_input.id == 'part_type':
         chainCirclesInp.hasFocus = True
 
-    # Auto-focus Face 1 when switching to Between Two Faces mode
-    if args.input.id == 'length_type' and is_between_faces:
-        face1Sel.hasFocus = True
+    # Outer Diameter is shared between Custom (Round Tube) and the two Hex Spacer shaft
+    # types; reset it to a sensible starting point for whichever one was just picked
+    # instead of leaving whatever the field last held.
+    if changed_input.id == 'shaft_type' or (part_is_spacer and changed_input.id == 'hw_part'):
+        if is_spacer_shaft:
+            customOD.value = 0.65 * IN_TO_CM
+        elif is_custom_shaft:
+            customOD.value = 0.75 * IN_TO_CM
 
-    # Auto-advance to Face 2 once Face 1 is filled
-    if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
+    # Auto-focus Face 1 (Tube) / Reference Point (Shaft) when switching length mode --
+    # Reference Point is now offered (optionally) in Custom Length too, so focus it there
+    # as well rather than only when switching to Between Two Faces.
+    if changed_input.id in ('length_type', 'create_joint', 'hw_part'):
+        if shaft_like and refPointSel is not None and show_ref_point:
+            refPointSel.hasFocus = True
+        elif part_is_tube and is_between_faces:
+            face1Sel.hasFocus = True
+
+    # Auto-advance to Face 2 once Face 1 / Reference Point is filled
+    if changed_input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
+        face2Sel.hasFocus = True
+    if (changed_input.id == 'ref_point_selection' and refPointSel is not None
+            and refPointSel.selectionCount >= 1 and is_between_faces):
         face2Sel.hasFocus = True
 
+    # Remember the belt's Live Preview choice for the next time the dialog opens
+    if changed_input.id == 'tb_live_preview':
+        global _belt_live_preview
+        _belt_live_preview = changed_input.value
+
     # CCLine detection for Timing Belt circles
-    if args.input.id == 'tb_pitch_circles':
+    if changed_input.id == 'tb_pitch_circles':
         handle_belt_selection_changed(inputs)
 
     # CCLine detection for Chain circles
-    if args.input.id == 'chain_pitch_circles':
+    if changed_input.id == 'chain_pitch_circles':
         handle_chain_selection_changed(inputs)
+
+    # Auto-advance to Offset From once both End Circles are picked; the preview then ghosts
+    # the part (see _offset_face_picking) so the face behind it is easy to see and click.
+    if changed_input.id in ('tb_pitch_circles', 'chain_pitch_circles'):
+        offsetFaceInp = _offset_face_input(inputs)
+        if (offsetFaceInp is not None and changed_input.selectionCount == 2
+                and offsetFaceInp.selectionCount == 0):
+            offsetFaceInp.hasFocus = True
 
 
 # ===========================================================================
 # execute / preview
 # ===========================================================================
 
-def command_execute(args: adsk.core.CommandEventArgs):
-    inputs = args.command.commandInputs
+def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
+                       is_preview: bool = False):
+    """Dispatch to the selected part type's creation function.
+
+    Returns (success, ref_face): success is False if an exception was caught — used
+    by command_preview to report an honest isValidResult instead of always True, and
+    to keep preview-time failures out of a blocking message box. ref_face is the
+    BRepFace the part was extruded from (Shaft/Tube only, else None), used to draw
+    the reference-face highlight.
+
+    `is_preview` lets a generator skip work that only matters on the committed
+    result; the shaft and tube use it to skip their (slow) sketch constraining.
+    """
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     try:
+        ref_face = None
         if part_type == PART_SHAFT:
-            _create_shaft(inputs)
+            ref_face = _create_shaft(inputs, constrain=not is_preview)
         elif part_type == PART_TUBE:
-            _create_tube(inputs)
+            ref_face = _create_tube(inputs, constrain=not is_preview)
         elif part_type == PART_PULLEY:
-            _create_pulley(inputs)
+            # The pulley reports its own errors (quietly in preview) and returns False.
+            if not _create_pulley(inputs, is_preview=is_preview):
+                return False, None
         elif part_type == PART_SPROCKET:
             _create_sprocket(inputs)
         elif part_type == PART_CHAIN:
             _create_chain(inputs)
+        elif part_type == PART_GEAR:
+            # Reports its own errors (quietly in preview) and returns False.
+            if not create_gears(inputs, is_preview=is_preview):
+                return False, None
+        elif part_type == PART_HARDWARE and selected_spacer_type(inputs) is not None:
+            ref_face = create_spacers(inputs, constrain=not is_preview)
+        elif part_type == PART_HARDWARE:
+            create_hardware(inputs, is_preview=is_preview)
         else:
             _create_belt(inputs)
+        return True, ref_face
     except Exception:
-        futil.handle_error('PartsGen command_execute', show_message_box=True)
+        futil.handle_error('PartsGen command_execute', show_message_box=show_message_box)
+        return False, None
+
+
+def command_execute(args: adsk.core.CommandEventArgs):
+    _run_part_creation(args.command.commandInputs, show_message_box=True)
+
+
+def _preview_parent_comp():
+    """The component a preview part gets added to (see futil.add_occurrence_in_active)."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return None
+    active = design.activeOccurrence
+    return active.component if active is not None else design.rootComponent
+
+
+# Opacity of a belt/chain/gear preview while its Offset From face is being picked
+_OFFSET_PICK_OPACITY = 0.3
+
+
+def _offset_face_input(inputs: adsk.core.CommandInputs):
+    """The shown Offset From input of the Timing Belt / Chain / Gear pair, or None."""
+    partTypeInp = inputs.itemById('part_type')
+    part_type = partTypeInp.selectedItem.name if partTypeInp.selectedItem is not None else ''
+    if part_type == PART_BELT:
+        # It lives in Pulley 1's group, which is hidden when pulleys aren't generated.
+        group = inputs.itemById('belt_pulley1_group')
+        if group is None or not group.isVisible:
+            return None
+        return inputs.itemById('tb_offset_face')
+    if part_type == PART_CHAIN:
+        offsetFaceInp = inputs.itemById('chain_offset_face')
+        return offsetFaceInp if offsetFaceInp is not None and offsetFaceInp.isVisible else None
+    if part_type == PART_GEAR:
+        # Only used (and enabled) for a C-C gear pair.
+        offsetFaceInp = inputs.itemById('gear_offset_face')
+        return (offsetFaceInp if offsetFaceInp is not None and offsetFaceInp.isVisible
+                and offsetFaceInp.isEnabled else None)
+    return None
+
+
+def _offset_face_picking(inputs: adsk.core.CommandInputs) -> bool:
+    """True while the user is picking the Offset From face: it has focus and is still empty."""
+    offsetFaceInp = _offset_face_input(inputs)
+    return (offsetFaceInp is not None and offsetFaceInp.hasFocus
+            and offsetFaceInp.selectionCount == 0)
+
+
+def _make_preview_unselectable(parent_comp, occ_count_before: int, opacity: float = None):
+    """Make every body of the occurrences the preview just added to `parent_comp` click-through,
+    so the dialog's face picks (e.g. the belt's Offset From) reach the model *behind* the preview.
+    The browser eye can't hide preview geometry while the command runs, and a pick that lands on
+    the preview would be a face that's deleted on the next preview tick anyway. `opacity`
+    also ghosts them (they are brand-new components, so nothing else shares the setting)."""
+    if parent_comp is None:
+        return
+    occs = parent_comp.occurrences
+    for i in range(occ_count_before, occs.count):
+        comp = occs.item(i).component
+        comps = [comp] + [sub.component for sub in comp.allOccurrences]
+        for c in comps:
+            old_opacity = c.opacity
+            if opacity is not None:
+                try:
+                    c.opacity = opacity
+                except Exception:
+                    pass    # e.g. a read-only linked library part (bearing)
+            for body in c.bRepBodies:
+                try:
+                    body.isSelectable = False
+                    # A gear/chain/toothless-belt preview is kept as the result on OK, so
+                    # tag it for _restore_preview_selectable to undo when the dialog closes.
+                    body.attributes.add(_PREVIEW_ATTR_GROUP, _PREVIEW_ATTR_NAME,
+                                        str(old_opacity))
+                except Exception:
+                    pass    # e.g. a read-only linked library part (bearing)
+
+
+_PREVIEW_ATTR_GROUP = 'FRCTools'
+_PREVIEW_ATTR_NAME  = 'previewUnselectable'
+
+
+def _restore_preview_selectable():
+    """Make bodies tagged by _make_preview_unselectable selectable (and opaque) again. The
+    tags only survive on a preview Fusion kept as the committed result."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return
+    for attr in design.findAttributes(_PREVIEW_ATTR_GROUP, _PREVIEW_ATTR_NAME):
+        body = adsk.fusion.BRepBody.cast(attr.parent)
+        try:
+            if body is not None and body.isValid:
+                body.isSelectable = True
+                try:
+                    body.parentComponent.opacity = float(attr.value)
+                except Exception:
+                    pass
+            attr.deleteMe()
+        except Exception:
+            futil.handle_error('PartsGen restore selectable', show_message_box=False)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
+    parent_comp = _preview_parent_comp()
+    occ_count_before = parent_comp.occurrences.count if parent_comp is not None else 0
+    try:
+        _command_preview(args)
+    finally:
+        try:
+            ghost = _offset_face_picking(args.command.commandInputs)
+            _make_preview_unselectable(parent_comp, occ_count_before,
+                                       _OFFSET_PICK_OPACITY if ghost else None)
+        except Exception:
+            futil.handle_error('PartsGen preview selectability', show_message_box=False)
+
+
+def _command_preview(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     if part_type == PART_BELT:
+        # Live Preview off: build nothing. isValidResult stays False, so OK runs the full build.
+        livePreviewInp = inputs.itemById('tb_live_preview')
+        if livePreviewInp is not None and not livePreviewInp.value:
+            _clear_ref_face_highlight()
+            return
         _create_belt(inputs, is_preview=True)
+        # A toothless-belt preview is the full result -- unless its pulleys need 3D print
+        # adapters, which the preview skips (a cloud insert per tick).
         suppressTeethInp = inputs.itemById('tb_suppress_teeth')
-        if suppressTeethInp and suppressTeethInp.value:
+        genPulleysInp    = inputs.itemById('tb_gen_pulleys')
+        belt_adapter = (genPulleysInp is not None and genPulleysInp.value
+                        and any(inputs.itemById(f'tb_adapter_{i}') is not None
+                                and inputs.itemById(f'tb_adapter_{i}').value for i in (1, 2)))
+        if suppressTeethInp and suppressTeethInp.value and not belt_adapter:
             args.isValidResult = True
+        _clear_ref_face_highlight()
+    elif part_type == PART_HARDWARE and selected_spacer_type(inputs) is None:
+        # Nothing to preview (a cloud insert per tick); isValidResult stays False so OK builds.
+        _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
+        # Toothless sprockets make the preview the full result, so OK keeps it.
         _create_chain(inputs, is_preview=True)
-    else:
-        command_execute(args)
         args.isValidResult = True
+        _clear_ref_face_highlight()
+    else:
+        # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
+        # a value) — don't pop a blocking message box on every tick, and report failure
+        # honestly instead of always claiming success (previously masked here).
+        ok, ref_face = _run_part_creation(inputs, show_message_box=False, is_preview=True)
+        # A shaft/tube preview skips sketch constraining to stay responsive, so it must
+        # not be reused as the result — let command_execute rebuild it fully constrained.
+        # Likewise a pulley preview skips its 3D print adapter (a cloud insert per tick).
+        adapterInp = inputs.itemById('pulley_adapter')
+        pulley_adapter = (part_type == PART_PULLEY and adapterInp is not None
+                          and adapterInp.value)
+        args.isValidResult = (ok and part_type not in (PART_SHAFT, PART_TUBE, PART_HARDWARE)
+                              and not pulley_adapter)
+        highlightRefFaceInp = inputs.itemById('highlight_ref_face')
+        highlight_enabled = highlightRefFaceInp is None or highlightRefFaceInp.value
+        try:
+            _draw_ref_face_highlight(ref_face if highlight_enabled else None)
+        except Exception:
+            futil.handle_error('PartsGen ref face highlight', show_message_box=False)
 
 
 # ===========================================================================
@@ -616,18 +1542,27 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     lenTypeInp:     adsk.core.DropDownCommandInput  = inputs.itemById('length_type')
     face1Sel:       adsk.core.SelectionCommandInput = inputs.itemById('face1_selection')
     face2Sel:       adsk.core.SelectionCommandInput = inputs.itemById('face2_selection')
+    refPointSel:    adsk.core.SelectionCommandInput = inputs.itemById('ref_point_selection')
     customLenInp:   adsk.core.ValueCommandInput     = inputs.itemById('custom_length')
 
     part_type = partTypeInp.selectedItem.name
+    # A Hardware > Spacer validates as a Shaft (it is built as one).
+    spacer_type = selected_spacer_type(inputs)
+    shaft_like  = part_type == PART_SHAFT or spacer_type is not None
 
     # --- Timing Pulley validation -------------------------------------------
     if part_type == PART_PULLEY:
         toothCountInp:  adsk.core.ValueCommandInput     = inputs.itemById('tooth_count')
-        beltWidthInp:   adsk.core.ValueCommandInput     = inputs.itemById('belt_width')
+        beltWidthInp:   adsk.core.DropDownCommandInput  = inputs.itemById('belt_width')
         if toothCountInp is None or toothCountInp.value < 8:
             args.areInputsValid = False
             return
-        if beltWidthInp is None or beltWidthInp.value <= 0:
+        if beltWidthInp is None or beltWidthInp.selectedItem is None:
+            args.areInputsValid = False
+            return
+        # Bore offset is per side; keep it to a sane clearance/interference range.
+        boreOffsetInp = inputs.itemById('pulley_bore_offset')
+        if boreOffsetInp is not None and abs(boreOffsetInp.value) > 0.05 * 2.54:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -649,14 +1584,39 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # --- Timing Belt validation ---------------------------------------------
     if part_type == PART_BELT:
         tbCirclesInp:   adsk.core.SelectionCommandInput = inputs.itemById('tb_pitch_circles')
-        tbBeltWidthInp: adsk.core.ValueCommandInput     = inputs.itemById('tb_belt_width')
+        tbBeltWidthInp: adsk.core.DropDownCommandInput  = inputs.itemById('tb_belt_width')
         if tbCirclesInp is None or tbCirclesInp.selectionCount < 2:
             args.areInputsValid = False
             return
-        if tbBeltWidthInp is None or tbBeltWidthInp.value <= 0:
+        if tbBeltWidthInp is None or tbBeltWidthInp.selectedItem is None:
+            args.areInputsValid = False
+            return
+        # Same per-side bore offset range as the Timing Pulley.
+        tbBoreOffsetInp = inputs.itemById('tb_bore_offset')
+        if tbBoreOffsetInp is not None and abs(tbBoreOffsetInp.value) > 0.05 * 2.54:
             args.areInputsValid = False
             return
         args.areInputsValid = True
+        return
+
+    # --- Gear validation ----------------------------------------------------
+    if part_type == PART_GEAR:
+        gearCirclesInp = inputs.itemById('gear_pitch_circles')
+        pair = gearCirclesInp is not None and gearCirclesInp.selectionCount > 0
+        if pair and gearCirclesInp.selectionCount != 2:
+            args.areInputsValid = False
+            return
+        toothInp = inputs.itemById('gear_tooth_count')
+        if not pair and toothInp is not None and toothInp.isEnabled and toothInp.value < 8:
+            args.areInputsValid = False
+            return
+        args.areInputsValid = True
+        return
+
+    # --- Hardware validation ------------------------------------------------
+    if part_type == PART_HARDWARE and spacer_type is None:
+        hwHolesInp = inputs.itemById('hw_holes')
+        args.areInputsValid = hwHolesInp is not None and hwHolesInp.selectionCount >= 1
         return
 
     # --- Chain validation ---------------------------------------------------
@@ -669,28 +1629,55 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         if chainWidthInp is None or chainWidthInp.value <= 0:
             args.areInputsValid = False
             return
+        # Same per-side bore offset range as the Timing Pulley.
+        chainBoreOffsetInp = inputs.itemById('chain_bore_offset')
+        if chainBoreOffsetInp is not None and abs(chainBoreOffsetInp.value) > 0.05 * 2.54:
+            args.areInputsValid = False
+            return
         args.areInputsValid = True
         return
 
     len_type  = lenTypeInp.selectedItem.name
 
-    # Length validation (shared by Shaft and Tube)
+    # Length validation -- Shaft uses Reference Point, Tube uses Face 1
     if len_type == LEN_FACES:
-        if face1Sel.selectionCount < 1 or face2Sel.selectionCount < 1:
-            args.areInputsValid = False
-            return
+        if shaft_like:
+            if refPointSel is None or refPointSel.selectionCount < 1 or face2Sel.selectionCount < 1:
+                args.areInputsValid = False
+                return
+        else:
+            if face1Sel.selectionCount < 1 or face2Sel.selectionCount < 1:
+                args.areInputsValid = False
+                return
     else:
         if customLenInp.value <= 0:
             args.areInputsValid = False
             return
+        # Custom Length's Reference Point is optional -- but "Create Joint" needs a real
+        # target, so require the pick only once the checkbox is actually turned on.
+        if shaft_like:
+            createJointInp = inputs.itemById('create_joint')
+            if (createJointInp is not None and createJointInp.value
+                    and (refPointSel is None or refPointSel.selectionCount < 1)):
+                args.areInputsValid = False
+                return
 
-    if part_type == PART_SHAFT:
-        if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
+    if shaft_like:
+        shaft_type = spacer_type or shaftTypeInp.selectedItem.name
+        if shaft_type == SHAFT_CUSTOM:
             od = customOD.value
             id_ = customID.value
             if od <= 0 or id_ <= 0 or id_ >= od:
                 args.areInputsValid = False
                 return
+        elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+            od = customOD.value
+            _, bore_round_dia_cm = _hex_spacer_bore_dims_cm(shaft_type)
+            if od <= 0 or od <= bore_round_dia_cm:
+                args.areInputsValid = False
+                return
+        # No separate joint-point check needed -- Reference Point is already required
+        # above whenever len_type == LEN_FACES, and it doubles as the joint's target.
     else:
         w = tubeWidthInp.value
         h = tubeHeightInp.value
@@ -717,9 +1704,128 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 # destroy
 # ===========================================================================
 
-def command_destroy(args: adsk.core.CommandEventArgs):
+def command_destroy(args: adsk.core.CommandEventArgs, handlers: list):
     global local_handlers
+    # An Apply's pre-empted dialog is destroyed after the next one opened -- leave the
+    # newer dialog's handlers and reference-face highlight alone.
+    if handlers is not local_handlers:
+        return
     local_handlers = []
+    _clear_ref_face_highlight()
+    _restore_preview_selectable()
+    try:
+        app.activeViewport.refresh()
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# Reference-face highlight (live preview only)
+# ===========================================================================
+# A transient CustomGraphics overlay on the real start-cap face an extrude feature was
+# built from (Shaft/Tube), so the user can tell which side of the part is the
+# reference/extrude-from side while the dialog is still open and being adjusted.
+# Cleared in command_destroy — the color that stays after OK is a separate, permanent
+# BRepFace.appearance override applied by _create_shaft/_create_tube themselves once
+# the real (non-preview) geometry is built. CustomGraphics is used here rather than
+# that same appearance override, because per LESSONS_LEARNED.md, writing
+# Occurrence.appearance from a live command handler either throws (read-only context)
+# or, deferred, destabilizes an open SelectionCommandInput — CustomGraphics never
+# mutates the design, so neither failure applies, and it's proven safe to redraw every
+# executePreview tick even with Face 1/Face 2 selection inputs open (see
+# commands/JointInspector/entry.py, the source of this pattern).
+
+def _is_live(entity) -> bool:
+    try:
+        return entity is not None and entity.isValid
+    except Exception:
+        return False
+
+
+def _solid_color(rgb):
+    r, g, b = rgb
+    return adsk.fusion.CustomGraphicsSolidColorEffect.create(adsk.core.Color.create(r, g, b, 255))
+
+
+def _calc_mesh(entity):
+    """Compute a fresh triangle mesh for `entity` (a BRepFace or BRepBody).
+
+    Deliberately not entity.meshManager.displayMeshes.bestMesh: that reads Fusion's
+    cached display mesh, which is empty for geometry created moments earlier in this
+    same preview tick (confirmed live: bestMesh threw "InternalValidationError:
+    count > 0" on a body extruded seconds before, in the same script). The reference
+    face/body here is always freshly rebuilt every executePreview call, so the mesh
+    has to be calculated on demand instead of assumed to already be cached.
+    """
+    try:
+        calc = entity.meshManager.createMeshCalculator()
+        calc.setQuality(adsk.fusion.TriangleMeshQualityOptions.NormalQualityTriangleMesh)
+        return calc.calculate()
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: could not calculate mesh: {err}')
+        return None
+
+
+def _add_mesh(group, mesh, rgb, opacity, depth):
+    if mesh is None:
+        return
+    try:
+        points  = mesh.nodeCoordinatesAsDouble
+        indices = mesh.nodeIndices
+        normals = mesh.normalVectorsAsDouble
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: display mesh unreadable, skipping: {err}')
+        return
+
+    # An empty or inconsistent display mesh -- what a body that is hidden, suppressed
+    # or mid-recompute hands back -- takes addMesh down with it (a Fusion crash, not a
+    # Python exception), so it is rejected here rather than trusted.
+    node_count = len(points) // 3
+    if node_count == 0 or not indices or len(normals) != len(points):
+        futil.log(f'{CMD_NAME}: skipping degenerate mesh (nodes={node_count}, '
+                  f'indices={len(indices) if indices else 0}, '
+                  f'normals={len(normals) if normals else 0})')
+        return
+    if max(indices) >= node_count:
+        futil.log(f'{CMD_NAME}: skipping mesh with out-of-range node indices')
+        return
+
+    coords = adsk.fusion.CustomGraphicsCoordinates.create(points)
+    entity = group.addMesh(coords, indices, normals, [])
+    entity.color = _solid_color(rgb)
+    entity.setOpacity(opacity, True)
+    entity.depthPriority = depth
+
+
+def _highlight_face(group, face: adsk.fusion.BRepFace, rgb):
+    if not _is_live(face):
+        return
+    _add_mesh(group, _calc_mesh(face), rgb, _REF_FACE_OPACITY, _DEPTH_REF_FACE)
+
+
+def _clear_ref_face_highlight():
+    global _ref_face_highlight_group
+    if _ref_face_highlight_group is None:
+        return
+    group = _ref_face_highlight_group
+    _ref_face_highlight_group = None
+    try:
+        if group.isValid:
+            group.deleteMe()
+    except Exception as err:
+        futil.log(f'{CMD_NAME}: failed to delete reference face highlight: {err}')
+
+
+def _draw_ref_face_highlight(ref_face):
+    global _ref_face_highlight_group
+    _clear_ref_face_highlight()
+    if not _is_live(ref_face):
+        return
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    group = design.rootComponent.customGraphicsGroups.add()
+    _ref_face_highlight_group = group  # set immediately so a half-built group is
+                                        # still reachable if something below throws
+    _highlight_face(group, ref_face, _REF_FACE_COLOR)
 
 
 # ===========================================================================
@@ -906,8 +2012,30 @@ def ui_marking_menu(args: adsk.core.MarkingMenuEventArgs):
 # Edit command — created (dialog pre-populated from stored attributes)
 # ===========================================================================
 
+def _resolve_entity_token(token: str, label: str):
+    """Resolve a stored entity token back to the entity it came from, or None.
+
+    `Design.findEntityByToken` returns a (possibly empty) list and preserves the entity's
+    assembly context, so a token taken from a proxy comes back as that same proxy --
+    verified live. Unlike `Component.entityToken`, which collides across unrelated
+    components, BRep and sketch entity tokens are reliable for this.
+    """
+    if not token:
+        return None
+    try:
+        design = adsk.fusion.Design.cast(app.activeProduct)
+        found  = design.findEntityByToken(token)
+        if found and len(found) > 0:
+            return found[0]
+    except Exception:
+        pass
+    futil.log(f'{CMD_NAME} edit: stored {label} could not be resolved; '
+              'falling back to Custom Length')
+    return None
+
+
 def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
-    global _edit_target_occ
+    global _edit_target_occ, _edit_ref_entities, _edit_belt_entities, _edit_chain_entities
 
     inputs = args.command.commandInputs
 
@@ -919,13 +2047,25 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_TUBE_WIDTH, ATTR_TUBE_HEIGHT, ATTR_TUBE_THICK, ATTR_CUSTOM_THICK,
                     ATTR_ADD_HOLES, ATTR_HOLE_SIZE, ATTR_HOLE_DIAM, ATTR_LEN_EXPR,
                     ATTR_PULLEY_BELT_TYPE, ATTR_PULLEY_TOOTH_COUNT, ATTR_PULLEY_BELT_WIDTH,
-                    ATTR_PULLEY_SHOW_TEETH,
+                    ATTR_PULLEY_SHOW_TEETH, ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET,
+                    ATTR_PULLEY_ADAPTER,
                     ATTR_BELT_TYPE, ATTR_BELT_WIDTH, ATTR_BELT_SUPPRESS,
-                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_PULLEY_WIDTH,
+                    ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_BORE_TYPE,
+                    ATTR_BELT_BORE_OFFSET, ATTR_BELT_ADAPTER,
+                    *(f'{k}_{i}' for k in (ATTR_BELT_BORE_TYPE, ATTR_BELT_ADAPTER,
+                                           ATTR_BELT_CC_CIRCLE) for i in (1, 2)),
+                    ATTR_BELT_OFFSET_EXPR, ATTR_BELT_OFFSET_FACE, ATTR_BELT_OFFSET_FLANGE,
                     ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
-                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH):
+                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_BORE_OFFSET, ATTR_CHAIN_OFFSET_EXPR,
+                    ATTR_CHAIN_OFFSET_FACE, ATTR_CHAIN_OFFSET_SIDE,
+                    *(f'{ATTR_CHAIN_CC_CIRCLE}_{i}' for i in (1, 2)),
+                    ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
+                    ATTR_GEAR_CC_CIRCLE,
+                    ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE, ATTR_JOINT_FLIP,
+                    ATTR_REVERSE_DIR, ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN,
+                    ATTR_BEARING_ENDS):
             a = comp.attributes.itemByName(ATTR_GROUP, key)
             if a:
                 attrs[key] = a.value
@@ -945,7 +2085,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     is_belt         = (part_type == PART_BELT)
     is_sprocket     = (part_type == PART_SPROCKET)
     is_chain        = (part_type == PART_CHAIN)
+    is_gear         = (part_type == PART_GEAR)
     is_custom_shaft = (shaft_type == SHAFT_CUSTOM)
+    is_spacer_shaft = (shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
 
     tube_thick      = _s(ATTR_TUBE_THICK,   THICK_1_8)
     is_custom_thick = (tube_thick == THICK_CUSTOM)
@@ -963,14 +2105,30 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     hole_diam_expr  = _s(ATTR_HOLE_DIAM,          '0.25 in')
     pulley_belt       = _s(ATTR_PULLEY_BELT_TYPE,   'HTD 5mm Pitch')
     pulley_teeth      = _s(ATTR_PULLEY_TOOTH_COUNT, '18')
-    pulley_width      = _s(ATTR_PULLEY_BELT_WIDTH,  '0.394 in')
+    pulley_width      = _s(ATTR_PULLEY_BELT_WIDTH,  PULLEY_BELT_WIDTH_ITEMS[0])
     pulley_show_teeth = _b(ATTR_PULLEY_SHOW_TEETH,  False)
+    pulley_adapter    = _b(ATTR_PULLEY_ADAPTER,     False)
+    pulley_bore_type  = _s(ATTR_PULLEY_BORE_TYPE,   BORE_HALF_HEX)
+    pulley_bore_off   = _s(ATTR_PULLEY_BORE_OFFSET, f'{BORE_OFFSET_DEFAULT_IN} in')
     belt_type_val     = _s(ATTR_BELT_TYPE,          'HTD 5mm Pitch')
     belt_width_val    = _s(ATTR_BELT_WIDTH,         '9 mm')
     belt_suppress     = _b(ATTR_BELT_SUPPRESS,       False)
     belt_gen_pulleys  = _b(ATTR_BELT_GEN_PULLEYS,   True)
     belt_pulley_teeth = _b(ATTR_BELT_PULLEY_TEETH,  False)
-    belt_pulley_width = _s(ATTR_BELT_PULLEY_WIDTH,  '0.394 in')
+    belt_bore_off     = _s(ATTR_BELT_BORE_OFFSET,   f'{BORE_OFFSET_DEFAULT_IN} in')
+    # Per-pulley bore/adapter; belts saved before that fall back to the one shared value.
+    belt_bore_types   = tuple(_s(f'{ATTR_BELT_BORE_TYPE}_{i}', _s(ATTR_BELT_BORE_TYPE, BORE_HALF_HEX))
+                              for i in (1, 2))
+    belt_adapters     = tuple(_b(f'{ATTR_BELT_ADAPTER}_{i}', _b(ATTR_BELT_ADAPTER, False))
+                              for i in (1, 2))
+    # Older belts stored a free-typed width expression ('9', '9 mm'); map it onto the
+    # Width dropdown (falls back to its first item when it isn't one of the options).
+    try:
+        belt_width_mm = round(adsk.fusion.Design.cast(app.activeProduct).unitsManager
+                              .evaluateExpression(belt_width_val, 'mm') * 10)
+        belt_width_name = f'{belt_width_mm} mm'
+    except Exception:
+        belt_width_name = PULLEY_BELT_WIDTH_ITEMS[0]
     sprocket_teeth    = _s(ATTR_SPROCKET_TOOTH_COUNT, '12')
     sprocket_width_val = _s(ATTR_SPROCKET_WIDTH,     '0.375 in')
     sprocket_show_teeth_val = _b(ATTR_SPROCKET_SHOW_TEETH, False)
@@ -978,10 +2136,50 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     chain_type_val       = _s(ATTR_CHAIN_TYPE,          '25')
     chain_spr_width_val  = _s(ATTR_CHAIN_SPROCKET_WIDTH, '0.375 in')
     chain_gen_spr_val    = _b(ATTR_CHAIN_GEN_SPROCKETS,  True)
-    chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
+    chain_bore_off_val   = _s(ATTR_CHAIN_BORE_OFFSET,    f'{BORE_OFFSET_DEFAULT_IN} in')
+    chain_offset_expr    = _s(ATTR_CHAIN_OFFSET_EXPR,    '0 in')
+    chain_offset_side    = _s(ATTR_CHAIN_OFFSET_SIDE,    CHAIN_OFFSET_BOTTOM)
+    custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
+    create_joint_val     = _b(ATTR_CREATE_JOINT, False)
+    bearing_ends_val     = _s(ATTR_BEARING_ENDS, BEARING_NONE)
+    joint_type_val       = _s(ATTR_JOINT_TYPE,  JOINT_REVOLUTE)
+    joint_flip_val       = _b(ATTR_JOINT_FLIP,  False)
+    reverse_dir_val      = _b(ATTR_REVERSE_DIR, False)
+
+    # Recover the original Reference Point (and, for Between-Two-Faces, Face 2) picks. When
+    # both Between-Two-Faces picks still resolve the shaft can be rebuilt exactly where it
+    # stands, joint and all. A Custom Length shaft only ever stored a Reference Point (no
+    # Face 2), so `keep_ref_point` alone covers re-selecting it there. When a pick is gone
+    # (the other part was deleted, say) fall back to the old behaviour of editing as a plain
+    # Custom Length at the world origin.
+    edit_ref_point = _resolve_entity_token(_s(ATTR_REF_POINT_TOKEN, ''), 'Reference Point')
+    edit_face2     = _resolve_entity_token(_s(ATTR_FACE2_TOKEN, ''),     'Face 2')
+    keep_faces     = is_shaft and edit_ref_point is not None and edit_face2 is not None
+    keep_ref_point = is_shaft and edit_ref_point is not None
+    _edit_ref_entities = (edit_ref_point, edit_face2) if keep_ref_point else None
+    # A belt's End Circles and Offset From face, re-selected the same way (belts saved
+    # before these were stored come back empty, and the user re-picks as before).
+    _edit_belt_entities = (tuple(_resolve_entity_token(_s(key, ''), label) for key, label in (
+                               (f'{ATTR_BELT_CC_CIRCLE}_1', 'End Circle 1'),
+                               (f'{ATTR_BELT_CC_CIRCLE}_2', 'End Circle 2'),
+                               (ATTR_BELT_OFFSET_FACE,      'Offset From face')))
+                           if is_belt else None)
+    _edit_chain_entities = (tuple(_resolve_entity_token(_s(key, ''), label) for key, label in (
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_1', 'End Circle 1'),
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_2', 'End Circle 2'),
+                                (ATTR_CHAIN_OFFSET_FACE,      'Offset From face')))
+                            if is_chain else None)
+    belt_offset_expr   = _s(ATTR_BELT_OFFSET_EXPR,   '0 in')
+    belt_offset_flange = _s(ATTR_BELT_OFFSET_FLANGE, OFFSET_FLANGE_BOTTOM)
+
+    # Same three groups as the create dialog (see command_created).
+    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain and not is_gear
+    partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
+    inputs.itemById('placement_group').isVisible = has_len
+    inputs.itemById('display_group').isVisible = has_len
 
     # --- Part type ---
-    partTypeInp = inputs.addDropDownCommandInput(
+    partTypeInp = partInputs.addDropDownCommandInput(
         'part_type', 'Part Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     partTypeInp.listItems.add(PART_SHAFT,    is_shaft,    '')
@@ -990,42 +2188,57 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    is_belt,     '')
     partTypeInp.listItems.add(PART_SPROCKET, is_sprocket, '')
     partTypeInp.listItems.add(PART_CHAIN,   is_chain,    '')
+    partTypeInp.listItems.add(PART_GEAR,    is_gear,     '')
+    # An existing C-C gear is edited in place (its joints are kept), so it stays a gear.
+    edit_cc_gear = is_gear and _edit_target_occ is not None and is_cc_gear(_edit_target_occ.component)
+    partTypeInp.isEnabled = not edit_cc_gear
+
+    # --- Component name (optional override; blank = auto-generated name) -----
+    customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', custom_name_val)
+    customNameInp.tooltip = 'Leave blank to use the automatically generated name.'
 
     # --- Shaft group ---
-    shaftTypeInp = inputs.addDropDownCommandInput(
+    shaftTypeInp = partInputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    shaftTypeInp.listItems.add(SHAFT_HALF_HEX,         shaft_type == SHAFT_HALF_HEX,         '')
-    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX, shaft_type == SHAFT_THREE_EIGHTH_HEX, '')
-    shaftTypeInp.listItems.add(SHAFT_CUSTOM,           is_custom_shaft,                      '')
+    # A spacer (Hardware > Spacers, or a Shaft made before they moved there) is edited as a
+    # Shaft, but only among the spacer types; a shaft only among the shafts.
+    if shaft_type in SPACER_BY_SHAFT_TYPE:
+        shaft_items = (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER, SHAFT_CUSTOM)
+    else:
+        shaft_items = (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX, SHAFT_MAXSPLINE)
+    for name in shaft_items:
+        shaftTypeInp.listItems.add(name, shaft_type == name, '')
+    if shaftTypeInp.selectedItem is None:
+        shaftTypeInp.listItems.item(0).isSelected = True
     shaftTypeInp.isVisible = is_shaft
 
-    customOD = inputs.addValueInput(
+    customOD = partInputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
         adsk.core.ValueInput.createByString(od_expr)
     )
-    customOD.isVisible = is_shaft and is_custom_shaft
+    customOD.isVisible = is_shaft and (is_custom_shaft or is_spacer_shaft)
 
-    customID = inputs.addValueInput(
+    customID = partInputs.addValueInput(
         'custom_id', 'Bore Diameter', 'in',
         adsk.core.ValueInput.createByString(id_expr)
     )
     customID.isVisible = is_shaft and is_custom_shaft
 
     # --- Tube group ---
-    tubeWidthInp = inputs.addValueInput(
+    tubeWidthInp = partInputs.addValueInput(
         'tube_width', 'Width', 'in',
         adsk.core.ValueInput.createByString(w_expr)
     )
     tubeWidthInp.isVisible = is_tube
 
-    tubeHeightInp = inputs.addValueInput(
+    tubeHeightInp = partInputs.addValueInput(
         'tube_height', 'Height', 'in',
         adsk.core.ValueInput.createByString(h_expr)
     )
     tubeHeightInp.isVisible = is_tube
 
-    tubeThickInp = inputs.addDropDownCommandInput(
+    tubeThickInp = partInputs.addDropDownCommandInput(
         'tube_thickness', 'Wall Thickness', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     tubeThickInp.listItems.add(THICK_1_16,   tube_thick == THICK_1_16,    '')
@@ -1033,17 +2246,17 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     tubeThickInp.listItems.add(THICK_CUSTOM, is_custom_thick,             '')
     tubeThickInp.isVisible = is_tube
 
-    customThickInp = inputs.addValueInput(
+    customThickInp = partInputs.addValueInput(
         'custom_thickness', 'Custom Thickness', 'in',
         adsk.core.ValueInput.createByString(thick_expr)
     )
     customThickInp.isVisible = is_tube and is_custom_thick
 
     # --- Tube face holes ---
-    tubeHolesInp = inputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', add_holes)
+    tubeHolesInp = partInputs.addBoolValueInput('tube_add_holes', 'Add Corner Holes', True, '', add_holes)
     tubeHolesInp.isVisible = is_tube
 
-    holeSizeInp = inputs.addDropDownCommandInput(
+    holeSizeInp = partInputs.addDropDownCommandInput(
         'hole_size', 'Hole Size', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     holeSizeInp.listItems.add(HOLE_RIVENUT, hole_size == HOLE_RIVENUT, '')
@@ -1051,91 +2264,59 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     holeSizeInp.listItems.add(HOLE_CUSTOM,  is_custom_hole,            '')
     holeSizeInp.isVisible = is_tube and add_holes
 
-    holeDiamInp = inputs.addValueInput(
+    holeDiamInp = partInputs.addValueInput(
         'hole_diameter', 'Custom Hole Diameter', 'in',
         adsk.core.ValueInput.createByString(hole_diam_expr)
     )
     holeDiamInp.isVisible = is_tube and add_holes and is_custom_hole
 
     # --- Pulley group — values pre-filled from stored attributes ---
-    beltTypeInp = inputs.addDropDownCommandInput(
+    beltTypeInp = partInputs.addDropDownCommandInput(
         'belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     beltTypeInp.listItems.add('HTD 5mm Pitch', pulley_belt == 'HTD 5mm Pitch', '')
     beltTypeInp.listItems.add('GT2 3mm Pitch', pulley_belt == 'GT2 3mm Pitch', '')
     beltTypeInp.isVisible = is_pulley
 
-    toothCountInp = inputs.addValueInput(
+    toothCountInp = partInputs.addValueInput(
         'tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString(pulley_teeth)
     )
     toothCountInp.isVisible = is_pulley
 
-    beltWidthInp = inputs.addValueInput(
-        'belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString(pulley_width)
-    )
-    beltWidthInp.isVisible = is_pulley
+    _add_pulley_belt_width_input(partInputs, pulley_width, is_pulley)
 
-    pulleyShowTeethInp = inputs.addBoolValueInput(
+    pulleyShowTeethInp = partInputs.addBoolValueInput(
         'pulley_show_teeth', 'Show Teeth', True, '', pulley_show_teeth)
     pulleyShowTeethInp.isVisible = is_pulley
 
-    # --- Timing Belt group — circles must be re-selected; other values pre-filled ---
-    tbCirclesInp = inputs.addSelectionInput(
-        'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
-    )
-    tbCirclesInp.addSelectionFilter('SketchCurves')
-    tbCirclesInp.setSelectionLimits(0, 2)
-    tbCirclesInp.isVisible = is_belt
+    _add_pulley_bore_inputs(partInputs, pulley_bore_type, pulley_bore_off, is_pulley,
+                            pulley_adapter)
 
-    tbBeltTypeInp = inputs.addDropDownCommandInput(
-        'tb_belt_type', 'Timing Belt Type', adsk.core.DropDownStyles.TextListDropDownStyle
-    )
-    tbBeltTypeInp.listItems.add('HTD 5mm Pitch', belt_type_val == 'HTD 5mm Pitch', '')
-    tbBeltTypeInp.listItems.add('GT2 3mm Pitch', belt_type_val == 'GT2 3mm Pitch', '')
-    tbBeltTypeInp.isEnabled = True   # always enabled in edit mode (no CCLine auto-lock)
-    tbBeltTypeInp.isVisible = is_belt
-
-    tbBeltWidthInp = inputs.addValueInput(
-        'tb_belt_width', 'Belt Width', 'mm',
-        adsk.core.ValueInput.createByString(belt_width_val)
-    )
-    tbBeltWidthInp.isVisible = is_belt
-
-    tbSuppressInp = inputs.addBoolValueInput('tb_suppress_teeth', 'Toothless Belt', True, '', belt_suppress)
-    tbSuppressInp.isVisible = is_belt
-
-    tbGenPulleysInp = inputs.addBoolValueInput('tb_gen_pulleys', 'Generate Pulleys', True, '', belt_gen_pulleys)
-    tbGenPulleysInp.isVisible = is_belt
-
-    tbPulleyTeethInp = inputs.addBoolValueInput('tb_pulley_teeth', 'Pulley Teeth', True, '', belt_pulley_teeth)
-    tbPulleyTeethInp.isVisible = is_belt and belt_gen_pulleys
-
-    tbPulleyWidthInp = inputs.addValueInput(
-        'tb_pulley_width', 'Pulley Width', 'mm',
-        adsk.core.ValueInput.createByString(belt_pulley_width)
-    )
-    tbPulleyWidthInp.isVisible = is_belt and belt_gen_pulleys
+    # --- Timing Belt groups — End Circles and Offset From re-selected in activate ---
+    # Belt type is always enabled in edit mode (no CCLine auto-lock).
+    _add_belt_groups(inputs, is_belt, belt_type_val, belt_width_name, belt_suppress, True,
+                     belt_gen_pulleys, belt_pulley_teeth, belt_bore_off, belt_bore_types,
+                     belt_adapters, belt_offset_expr, belt_offset_flange)
 
     # --- Chain Sprocket group ---
-    sprocketToothCountInp = inputs.addValueInput(
+    sprocketToothCountInp = partInputs.addValueInput(
         'sprocket_tooth_count', 'Tooth Count', '',
         adsk.core.ValueInput.createByString(sprocket_teeth)
     )
     sprocketToothCountInp.isVisible = is_sprocket
 
-    sprocketWidthInpEdit = inputs.addValueInput(
+    sprocketWidthInpEdit = partInputs.addValueInput(
         'sprocket_width', 'Sprocket Width', 'in',
         adsk.core.ValueInput.createByString(sprocket_width_val)
     )
     sprocketWidthInpEdit.isVisible = is_sprocket
 
-    sprocketShowTeethInpEdit = inputs.addBoolValueInput(
+    sprocketShowTeethInpEdit = partInputs.addBoolValueInput(
         'sprocket_show_teeth', 'Show Teeth', True, '', sprocket_show_teeth_val)
     sprocketShowTeethInpEdit.isVisible = is_sprocket
 
-    sprocketChainTypeInpEdit = inputs.addDropDownCommandInput(
+    sprocketChainTypeInpEdit = partInputs.addDropDownCommandInput(
         'sprocket_chain_type', 'Chain Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
     sprocketChainTypeInpEdit.listItems.add('#25 Chain', sprocket_chain_type_val == '#25 Chain', '')
@@ -1143,57 +2324,96 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInpEdit.isVisible = is_sprocket
 
     # --- Chain group ---
-    chainCirclesInpEdit = inputs.addSelectionInput(
-        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
-    )
-    chainCirclesInpEdit.addSelectionFilter('SketchCurves')
-    chainCirclesInpEdit.setSelectionLimits(0, 2)
-    chainCirclesInpEdit.isVisible = is_chain
+    _add_chain_inputs(partInputs, is_chain, chain_spr_width_val, chain_gen_spr_val,
+                      chain_bore_off_val, chain_offset_expr, chain_offset_side)
 
-    chainSprocketWidthInpEdit = inputs.addValueInput(
-        'chain_sprocket_width', 'Chain Width', 'in',
-        adsk.core.ValueInput.createByString(chain_spr_width_val)
-    )
-    chainSprocketWidthInpEdit.isVisible = is_chain
+    # --- Gear group ---
+    _add_gear_group(inputs, is_gear,
+                    tooth_expr=_s(ATTR_GEAR_LABEL_TEETH, _s(ATTR_GEAR_TOOTH_COUNT, '60')),
+                    bore_types=(_s(ATTR_GEAR_BORE_TYPE, BORE_HALF_HEX), BORE_HALF_HEX),
+                    edit_cc_gear=edit_cc_gear)
 
-    chainGenSprocketsInpEdit = inputs.addBoolValueInput(
-        'chain_gen_sprockets', 'Generate Sprockets', True, '', chain_gen_spr_val)
-    chainGenSprocketsInpEdit.isVisible = is_chain
-
-    chainSprocketTeethInpEdit = inputs.addBoolValueInput(
-        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
-    chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
-
-    # --- Length — always use Custom Length in edit mode; face refs are gone ---
-    lenTypeInp = inputs.addDropDownCommandInput(
+    # --- Length ---------------------------------------------------------------
+    # Between-Two-Faces survives an edit whenever both stored picks still resolve, so the
+    # shaft rebuilds where it stands with its joint intact. Otherwise fall back to editing
+    # it as a Custom Length, which rebuilds it at the world origin -- the old behaviour,
+    # and all that is possible once the referenced geometry is gone.
+    lenTypeInp = partInputs.addDropDownCommandInput(
         'length_type', 'Length', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    lenTypeInp.listItems.add(LEN_FACES,  False, '')
-    lenTypeInp.listItems.add(LEN_CUSTOM, True,  '')
-    lenTypeInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    lenTypeInp.listItems.add(LEN_FACES,  keep_faces,      '')
+    lenTypeInp.listItems.add(LEN_CUSTOM, not keep_faces,  '')
+    lenTypeInp.isVisible = has_len
 
-    face1Sel = inputs.addSelectionInput(
-        'face1_selection', 'Face 1', 'Select the starting planar face'
+    customLenInp = partInputs.addValueInput(
+        'custom_length', 'Length', 'in',
+        adsk.core.ValueInput.createByString(len_expr)
+    )
+    customLenInp.isVisible = has_len and not keep_faces
+
+    # Placement order matches the create dialog (see command_created).
+    # Reference-face joint -- offered for a Shaft in either length mode (matches the create
+    # dialog); actually creating one still needs a Reference Point pick, enforced the same
+    # way as the create dialog in command_validate_input.
+    createJointInpEdit = placeInputs.addBoolValueInput(
+        'create_joint', 'Create Joint at Reference Face', True, '', create_joint_val)
+    createJointInpEdit.isVisible = is_shaft
+
+    face1Sel = placeInputs.addSelectionInput(
+        'face1_selection', 'Reference Face', 'Select the starting planar face'
     )
     face1Sel.addSelectionFilter('PlanarFaces')
     face1Sel.setSelectionLimits(0, 1)
     face1Sel.isVisible = False
 
-    face2Sel = inputs.addSelectionInput(
+    refPointSelEdit = placeInputs.addSelectionInput(
+        'ref_point_selection', 'Reference Point',
+        'Select a point, edge, or face that the shaft is built from -- just like picking a '
+        'joint origin in the Joint command'
+    )
+    refPointSelEdit.addSelectionFilter('Vertices')
+    refPointSelEdit.addSelectionFilter('SketchPoints')
+    refPointSelEdit.addSelectionFilter('ConstructionPoints')
+    refPointSelEdit.addSelectionFilter('Edges')
+    refPointSelEdit.addSelectionFilter('Faces')
+    refPointSelEdit.setSelectionLimits(0, 1)
+    # Matches the create dialog's rule (command_input_changed): always shown in
+    # Between-Two-Faces, and in Custom Length only while "Create Joint" is checked -- a
+    # shaft originally built as a plain Custom Length can still get a Reference Point (and
+    # a joint) on Edit by ticking the checkbox.
+    refPointSelEdit.isVisible = has_len and is_shaft and (keep_faces or create_joint_val)
+
+    face2Sel = placeInputs.addSelectionInput(
         'face2_selection', 'Face 2', 'Select the ending planar face'
     )
     face2Sel.addSelectionFilter('PlanarFaces')
     face2Sel.setSelectionLimits(0, 1)
-    face2Sel.isVisible = False
+    face2Sel.isVisible = keep_faces
 
-    customLenInp = inputs.addValueInput(
-        'custom_length', 'Length', 'in',
-        adsk.core.ValueInput.createByString(len_expr)
+    reverseDirInpEdit = placeInputs.addBoolValueInput(
+        'reverse_direction', 'Reverse Direction', True, '', reverse_dir_val)
+    reverseDirInpEdit.isVisible = has_len and not keep_faces and is_shaft
+
+    jointTypeInpEdit = placeInputs.addDropDownCommandInput(
+        'joint_type', 'Joint Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    customLenInp.isVisible = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    jointTypeInpEdit.listItems.add(JOINT_REVOLUTE, joint_type_val != JOINT_RIGID, '')
+    jointTypeInpEdit.listItems.add(JOINT_RIGID, joint_type_val == JOINT_RIGID, '')
+    jointTypeInpEdit.isVisible = is_shaft and create_joint_val
+
+    flipJointInpEdit = placeInputs.addBoolValueInput('flip_joint', 'Flip', True, '', joint_flip_val)
+    flipJointInpEdit.isVisible = is_shaft and create_joint_val
+
+    bearingEndsInpEdit = _add_bearing_ends_input(placeInputs, bearing_ends_val, shaft_type)
+    bearingEndsInpEdit.isVisible = has_len and is_shaft and len(bearing_choices(shaft_type)) > 1
+
+    highlightRefFaceInpEdit = displayInputs.addBoolValueInput(
+        'highlight_ref_face', 'Highlight Reference Face', True, '', True)
+    highlightRefFaceInpEdit.isVisible = has_len
 
     # Wire events — reuse the same input-changed and validate handlers
     futil.add_handler(args.command.execute,        edit_command_execute,   local_handlers=edit_local_handlers)
+    futil.add_handler(args.command.activate,       edit_command_activate,  local_handlers=edit_local_handlers)
     futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=edit_local_handlers)
     futil.add_handler(args.command.executePreview, edit_command_preview,   local_handlers=edit_local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=edit_local_handlers)
@@ -1205,11 +2425,32 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 # ===========================================================================
 
 def edit_command_execute(args: adsk.core.CommandEventArgs):
-    global _edit_target_occ
+    global _edit_target_occ, _edit_ref_entities
+
+    # A C-C gear is edited in place: deleting and rebuilding it would drop the joints the
+    # user made to it (the C-C sync keeps its size; here only bore and name change).
+    if _edit_target_occ and is_cc_gear(_edit_target_occ.component):
+        update_gear_from_dialog(_edit_target_occ, args.command.commandInputs)
+        _edit_target_occ = None
+        return
+
+    # A spacer is rebuilt in the Hardware folder it was in (or, one made before spacers
+    # moved to Hardware, in the usual one).
+    spacer_parent = _hardware_parent(_edit_target_occ) if _edit_target_occ else None
 
     if _edit_target_occ:
+        # A shaft built with bearings lives in a "<shaft>_Group" with them, so delete the
+        # whole group. Older shafts have their bearings as separate root occurrences --
+        # deleting the shaft only cascades away their joints -- so remove those first; the
+        # rebuild re-adds them either way.
         try:
-            _edit_target_occ.deleteMe()
+            delete_shaft_bearings(_edit_target_occ.component)
+        except Exception:
+            futil.log('PartsGen edit: could not delete old shaft bearings')
+        try:
+            # A shaft's or pulley's group (bearings / adapter included), else the part.
+            outer = pulley_outer_occurrence(shaft_outer_occurrence(_edit_target_occ))
+            outer.deleteMe()
         except Exception:
             futil.log('PartsGen edit: could not delete old occurrence')
         _edit_target_occ = None
@@ -1217,7 +2458,13 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
-    if part_type == PART_SHAFT:
+    shaft_type = inputs.itemById('shaft_type').selectedItem.name
+    if part_type == PART_SHAFT and shaft_type in SPACER_BY_SHAFT_TYPE:
+        if spacer_parent is None:
+            spacer_parent, _ = _hardware_folder(adsk.fusion.Design.cast(app.activeProduct))
+        _create_shaft(inputs, parent_occ=spacer_parent,
+                      hardware_part=SPACER_BY_SHAFT_TYPE[shaft_type])
+    elif part_type == PART_SHAFT:
         _create_shaft(inputs)
     elif part_type == PART_TUBE:
         _create_tube(inputs)
@@ -1227,8 +2474,53 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         _create_sprocket(inputs)
     elif part_type == PART_CHAIN:
         _create_chain(inputs)
+    elif part_type == PART_GEAR:
+        _create_gear(inputs)
     else:
         _create_belt(inputs)
+
+
+def edit_command_activate(args: adsk.core.CommandEventArgs):
+    """Re-select the shaft's original Reference Point and Face 2 in the dialog.
+
+    This has to happen on `activate` rather than in `edit_command_created`:
+    `SelectionCommandInput.addSelection()` silently does nothing when the command's inputs
+    are still being built. If a selection doesn't take, leave the input empty rather than
+    dropping back to Custom Length -- the user can re-pick and still keep the placement.
+    A belt's End Circles and Offset From face are re-selected here too.
+    """
+    for entities, circles_id, face_id, what in (
+            (_edit_belt_entities,  'tb_pitch_circles',    'tb_offset_face',    'belt'),
+            (_edit_chain_entities, 'chain_pitch_circles', 'chain_offset_face', 'chain')):
+        if not entities:
+            continue
+        inputs = args.command.commandInputs
+        circle1, circle2, offset_face = entities
+        circlesSel = inputs.itemById(circles_id)
+        faceSel    = inputs.itemById(face_id)
+        try:
+            if circlesSel is not None and circle1 is not None and circle2 is not None:
+                circlesSel.addSelection(circle1)
+                circlesSel.addSelection(circle2)
+            if faceSel is not None and offset_face is not None:
+                faceSel.addSelection(offset_face)
+        except Exception:
+            futil.log(f'{CMD_NAME} edit: could not re-select the {what}\'s stored geometry')
+    if not _edit_ref_entities:
+        return
+    ref_point, face2 = _edit_ref_entities
+    inputs      = args.command.commandInputs
+    refPointSel = inputs.itemById('ref_point_selection')
+    face2Sel    = inputs.itemById('face2_selection')
+    try:
+        # Skip a hidden input (Custom Length with "Create Joint" off) -- a pick there would
+        # silently place the shaft with nothing in the dialog showing why.
+        if refPointSel is not None and ref_point is not None and refPointSel.isVisible:
+            refPointSel.addSelection(ref_point)
+        if face2Sel is not None and face2 is not None:
+            face2Sel.addSelection(face2)
+    except Exception:
+        futil.log(f'{CMD_NAME} edit: could not re-select the stored reference geometry')
 
 
 def edit_command_preview(args: adsk.core.CommandEventArgs):
@@ -1237,6 +2529,10 @@ def edit_command_preview(args: adsk.core.CommandEventArgs):
 
 
 def edit_command_destroy(args: adsk.core.CommandEventArgs):
-    global edit_local_handlers, _edit_target_occ
+    global edit_local_handlers, _edit_target_occ, _edit_ref_entities, _edit_belt_entities
+    global _edit_chain_entities
     edit_local_handlers = []
     _edit_target_occ    = None
+    _edit_ref_entities  = None
+    _edit_belt_entities = None
+    _edit_chain_entities = None

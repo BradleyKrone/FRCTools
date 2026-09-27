@@ -14,13 +14,25 @@ def run(context):
         # Get the target workspace the button will be created in.
         workspace = ui.workspaces.itemById( config.WORKSPACE_ID )
 
-        # Get the panel the FRCTools dropdown will be created in.
-        solid_panel = workspace.toolbarPanels.itemById( config.SOLID_CREATE_ID )
+        # Create our own "FRC" panel in the SOLID tab, next to the stock Create /
+        # Modify panels. A leftover panel from a previous run (e.g. after a crash)
+        # would make add() fail, so reuse it if it's still there.
+        solid_tab = config.get_solid_tab()
+        frc_panel = solid_tab.toolbarPanels.itemById( config.FRC_PANEL_ID )
+        if not frc_panel:
+            frc_panel = solid_tab.toolbarPanels.add(
+                config.FRC_PANEL_ID,
+                config.FRC_PANEL_NAME,
+                config.FRC_PANEL_POSITION,
+                config.FRC_PANEL_BEFORE
+            )
+
+        # Get the panels the FRCTools dropdowns will be created in.
         sketch_create_panel = workspace.toolbarPanels.itemById( config.SKETCH_CREATE_ID )
         sketch_modify_panel = workspace.toolbarPanels.itemById( config.SKETCH_MODIFY_ID )
 
-        # Create the the FRCTool submenu in the solid-create, sketch-create, and sketch-modify panels.
-        solid_panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
+        # Create the FRCTool submenu in the sketch-create and sketch-modify panels.
+        # (Solid commands go straight into the FRC panel above, no submenu needed.)
         sketch_create_panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
         sketch_modify_panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
 
@@ -40,14 +52,8 @@ def stop(context):
         commands.stop()
 
         workspace = ui.workspaces.itemById(config.WORKSPACE_ID)
-        solid_panel = workspace.toolbarPanels.itemById( config.SOLID_CREATE_ID )
         sketch_create_panel = workspace.toolbarPanels.itemById( config.SKETCH_CREATE_ID )
         sketch_modify_panel = workspace.toolbarPanels.itemById( config.SKETCH_MODIFY_ID )
-
-        solid_submenu = solid_panel.controls.itemById( config.FRC_TOOLS_DROPDOWN_ID )
-        # Delete the Solid->Create FRCTools submenu
-        if solid_submenu:
-            solid_submenu.deleteMe()
 
         sketch_create_submenu = sketch_create_panel.controls.itemById( config.FRC_TOOLS_DROPDOWN_ID )
         # Delete Sketch->Create FRCTools submenu
@@ -58,6 +64,12 @@ def stop(context):
         # Delete Sketch->Modify FRCTools submenu
         if sketch_modify_submenu:
             sketch_modify_submenu.deleteMe()
+
+        # Delete the FRC panel itself -- leaving it behind means a stale empty
+        # panel in the ribbon and a duplicate-id failure on the next run().
+        frc_panel = config.get_frc_panel()
+        if frc_panel:
+            frc_panel.deleteMe()
 
     except:
         futil.handle_error('stop')
