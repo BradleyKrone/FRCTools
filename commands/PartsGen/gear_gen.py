@@ -364,8 +364,8 @@ def _add_gear_cc_joint(occ: adsk.fusion.Occurrence, joint_circle: adsk.fusion.Sk
                 raise RuntimeError('Joints.add returned null')
             return joint
 
-        # `occ` is the gear's proxy in its group; the group sits at identity, so the
-        # native occurrence's transform (the one that can be put back) is the world one.
+        # `occ` is the gear's root-context proxy; its native occurrence's (group-local)
+        # transform is the one that can be put back.
         native = occ.nativeObject or occ
         before = native.transform2
         joint = _add(False)
@@ -448,11 +448,12 @@ def create_gears(inputs: adsk.core.CommandInputs, is_preview: bool = False) -> b
     return _create_gear(inputs, is_preview)
 
 
-def _new_occurrence(transform: adsk.core.Matrix3D, is_preview: bool,
-                    parent: adsk.fusion.Component = None):
+def _new_occurrence(world_transform: adsk.core.Matrix3D, is_preview: bool,
+                    parent_occ: adsk.fusion.Occurrence = None):
+    """A root-context occurrence in `parent_occ`, or else the active component."""
     try:
         design = adsk.fusion.Design.cast(app.activeProduct)
-        return (parent or design.rootComponent).occurrences.addNewComponent(transform)
+        return futil.add_occurrence_in_active(design, world_transform, parent_occ)
     except RuntimeError:
         _warn('Cannot create gear: this document is in Part Design mode, which only '
               'supports a single component.\n\nPlease open or create an Assembly document '
@@ -472,7 +473,7 @@ def _create_gear(inputs: adsk.core.CommandInputs, is_preview: bool = False) -> b
 
     design = adsk.fusion.Design.cast(app.activeProduct)
     start_marker = design.timeline.markerPosition
-    occ = _new_occurrence(adsk.core.Matrix3D.create(), is_preview)
+    occ = _new_occurrence(None, is_preview)
     if occ is None:
         return False
     comp = occ.component
@@ -523,7 +524,7 @@ def _create_gear_pair(inputs: adsk.core.CommandInputs, is_preview: bool = False)
     group_name = custom_name or f'Gears_20DP-{n1}T-{n2}T'
     design = adsk.fusion.Design.cast(app.activeProduct)
     start_marker = design.timeline.markerPosition
-    group_occ = _new_occurrence(adsk.core.Matrix3D.create(), is_preview)
+    group_occ = _new_occurrence(None, is_preview)
     if group_occ is None:
         return False
     try:
@@ -531,7 +532,7 @@ def _create_gear_pair(inputs: adsk.core.CommandInputs, is_preview: bool = False)
         for i, (circle, n, label, bore_type, joint_offset_cm) in enumerate(specs):
             center, normal = _circle_world_frame(circle)
             occ = _new_occurrence(_placement(center, normal), is_preview,
-                                  parent=group_occ.component)
+                                  parent_occ=group_occ)
             if occ is None:
                 raise RuntimeError('could not add the gear occurrence')
             comp = occ.component
@@ -541,10 +542,9 @@ def _create_gear_pair(inputs: adsk.core.CommandInputs, is_preview: bool = False)
             joint_circle = _build_gear(comp, n, label, bore_type, is_preview)
             _save_attributes(comp, n, label, bore_type, name if custom_name else '', circle,
                              joint_offset_expr, offset_face, offset_side)
-            # The joint lives in the root (the C-C circle is outside the group), so it
-            # takes the gear's proxy through the group.
-            _add_gear_cc_joint(occ.createForAssemblyContext(group_occ), joint_circle, circle,
-                               joint_offset_cm, is_preview)
+            # The joint lives in the root (the C-C circle is outside the group); `occ` is
+            # already the gear's root-context proxy through the group.
+            _add_gear_cc_joint(occ, joint_circle, circle, joint_offset_cm, is_preview)
         futil.group_timeline_features(design, start_marker, group_name)
         return True
     except Exception:

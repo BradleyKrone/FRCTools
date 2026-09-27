@@ -263,9 +263,11 @@ def _cc_joint_offset_cm(belt_occ: adsk.fusion.Occurrence,
     origin, face_n = _world_plane(face)
     if abs(face_n.dotProduct(n)) < 0.999:
         return None
-    # The belt occurrence is still at identity here, so the sketch point's world
-    # geometry is on the C-C sketch plane.
+    # The belt hasn't been jointed yet, so the sketch point is on the C-C sketch plane.
+    # worldGeometry of a native entity is component space: move it by the belt's (root
+    # proxy) transform, which isn't identity when the belt was built in a sub-assembly.
     center = circle_proj.centerSketchPoint.worldGeometry
+    center.transformBy(belt_occ.transform2)
     s_face   = n.dotProduct(origin.asVector())
     s_sketch = n.dotProduct(center.asVector())
     return s_face + dist_cm - s_sketch - part_face_z_cm
@@ -323,7 +325,9 @@ def _add_cc_joint(belt_occ: adsk.fusion.Occurrence, pulley: tuple,
             belt_occ.transform2 = before
             joint = _add(True)
         if circle_idx == 0 and abs(offset_cm) > 1e-9:
-            moved = _belt_normal(belt_occ, sketch_name).dotProduct(belt_occ.transform2.translation)
+            shift = belt_occ.transform2.translation
+            shift.subtract(before.translation)   # not 0 when built in a moved sub-assembly
+            moved = _belt_normal(belt_occ, sketch_name).dotProduct(shift)
             if abs(moved + offset_cm) < abs(moved - offset_cm):
                 joint.offset.value = -joint.offset.value   # went the wrong way
         joint.name = name + ('_cc_revolute' if circle_idx == 0 else '_cc_cylindrical')
@@ -675,11 +679,9 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     originalSketch: adsk.fusion.Sketch = userSelections[0].parentSketch
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
-    rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
-    trans     = adsk.core.Matrix3D.create()
     try:
-        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+        workingOcc  = futil.add_occurrence_in_active(design)   # root-context proxy
     except RuntimeError:
         futil.popup_error(
             'Cannot create belt: this document is in Part Design mode, '

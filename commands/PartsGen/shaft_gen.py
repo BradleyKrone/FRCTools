@@ -101,6 +101,8 @@ ATTR_CREATE_JOINT = 'shaft_create_joint'
 ATTR_JOINT_TYPE   = 'shaft_joint_type'
 ATTR_JOINT_FLIP   = 'shaft_joint_flip'
 ATTR_REVERSE_DIR  = 'shaft_reverse_direction'
+# Must match hardware_gen.py's ATTR_HARDWARE_PART -- set on spacers built from Hardware.
+ATTR_HARDWARE_PART = 'hardware_part'
 
 # Entity tokens for the Between-Two-Faces picks, so right-click Edit can rebuild the shaft
 # where it was instead of dropping back to a Custom Length at the world origin. A Custom
@@ -1209,7 +1211,18 @@ def delete_shaft_bearings(shaft_comp: adsk.fusion.Component):
 # Shaft creation
 # ===========================================================================
 
-def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
+_UNSET = object()
+
+
+def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True,
+                  shaft_type: str = None, ref_point_entity=_UNSET,
+                  parent_occ: adsk.fusion.Occurrence = None, group_timeline: bool = True,
+                  hardware_part: str = None):
+    """Build a shaft (or spacer) from the dialog inputs. Hardware > Spacers calls this once
+    per pick: `shaft_type` overrides the Shaft Type dropdown, `ref_point_entity` the
+    Reference Point pick, `parent_occ` builds it inside that occurrence (the Hardware
+    folder) instead of the root, `group_timeline=False` leaves grouping to the caller, and
+    `hardware_part` is stored so the part reads as Hardware."""
     shaftTypeInp:   adsk.core.DropDownCommandInput  = inputs.itemById('shaft_type')
     customOD:       adsk.core.ValueCommandInput     = inputs.itemById('custom_od')
     customID:       adsk.core.ValueCommandInput     = inputs.itemById('custom_id')
@@ -1221,7 +1234,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
     flipJointInp:   adsk.core.BoolValueCommandInput = inputs.itemById('flip_joint')
     reverseDirInp:  adsk.core.BoolValueCommandInput = inputs.itemById('reverse_direction')
 
-    shaft_type = shaftTypeInp.selectedItem.name
+    if shaft_type is None:
+        shaft_type = shaftTypeInp.selectedItem.name
     len_type   = lenTypeInp.selectedItem.name
 
     # Read the Reference Point entity now, before this function starts adding
@@ -1230,7 +1244,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
     # to 0 selections with no error once other document changes happen -- this bit the
     # joint entirely, with no message, before the read was moved this early. It doubles
     # as the joint's target when "Create Joint" is checked -- one selection, two roles.
-    ref_point_entity = _selected_entity(refPointSel)
+    if ref_point_entity is _UNSET:
+        ref_point_entity = _selected_entity(refPointSel)
     face2_entity      = _selected_entity(face2Sel)
 
     # Defensive guard — command_validate_input already blocks these values from the
@@ -1284,6 +1299,10 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
             groupOcc.component.attributes.add(ATTR_GROUP, ATTR_SHAFT_GROUP, shaft_uid)
             workingOcc = groupOcc.component.occurrences.addNewComponent(
                 trans).createForAssemblyContext(groupOcc)
+        elif parent_occ is not None:
+            parent_native = parent_occ.nativeObject or parent_occ
+            workingOcc = parent_native.component.occurrences.addNewComponent(
+                trans).createForAssemblyContext(parent_occ)
         else:
             workingOcc = rootComp.occurrences.addNewComponent(trans)
     except RuntimeError:
@@ -1457,7 +1476,7 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         else:
             od_cm = customOD.value
             od_in = od_cm / IN_TO_CM
-            workingComp.name = f'Shaft_Custom_{od_in:.4g}in'
+            workingComp.name = f'Spacer_Custom_{od_in:.4g}in'
             _draw_circle(sketch, center, od_cm, constrain=constrain)
 
         customNameInp = inputs.itemById('custom_name')
@@ -1530,11 +1549,13 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
         try:
             comp_attrs = workingComp.attributes
             comp_attrs.add(ATTR_GROUP, ATTR_PART_TYPE,  PART_SHAFT)
-            comp_attrs.add(ATTR_GROUP, ATTR_SHAFT_TYPE, shaftTypeInp.selectedItem.name)
-            if shaftTypeInp.selectedItem.name == SHAFT_CUSTOM:
+            comp_attrs.add(ATTR_GROUP, ATTR_SHAFT_TYPE, shaft_type)
+            if hardware_part:
+                comp_attrs.add(ATTR_GROUP, ATTR_HARDWARE_PART, hardware_part)
+            if shaft_type == SHAFT_CUSTOM:
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_ID, customID.expression)
-            elif shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
+            elif shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER):
                 comp_attrs.add(ATTR_GROUP, ATTR_CUSTOM_OD, customOD.expression)
             if len_type == LEN_FACES:
                 # The shaft's centreline length. Start from the perpendicular distance from
@@ -1657,7 +1678,8 @@ def _create_shaft(inputs: adsk.core.CommandInputs, constrain: bool = True):
 
         # Grouped last so the joint above lands inside the shaft's timeline group and is
         # deleted or suppressed along with it, instead of being orphaned outside it.
-        futil.group_timeline_features(design, start_marker, workingComp.name)
+        if group_timeline:
+            futil.group_timeline_features(design, start_marker, workingComp.name)
 
         return ref_face
     except Exception:

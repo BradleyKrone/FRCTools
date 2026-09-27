@@ -7,7 +7,8 @@ import adsk.fusion
 from ...lib import fusionAddInUtils as futil
 from .shaft_gen import (BEARING_PARTS, ATTR_GROUP, BEARING_RADIUS_TOL_CM, _insert_bearing,
                         _occurrence_bodies_recursive, _circle_radii, _true_face_normal,
-                        _native, _world_xform, _world_circle, _hide_joint)
+                        _native, _world_xform, _world_circle, _hide_joint, _create_shaft,
+                        SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER, SHAFT_CUSTOM)
 from .hardware_thumbs import ensure_thumbnails, preview_file
 
 app = adsk.core.Application.get()
@@ -18,6 +19,8 @@ app = adsk.core.Application.get()
 #   flange (default) -- bearings/bushings: flange seat face down on the part, body down the
 #       hole. The seat is found by geometry (see `_find_flange_seat_face`), so any flanged
 #       part works.
+#   generated -- spacers: not library files but built by shaft_gen._create_shaft, placed
+#       with the dialog's Placement inputs (see `create_spacers`).
 #   origin -- bolts, washers, nuts: the file is modelled with its component origin on
 #       the seat and +Z pointing away from the picked face, so the origin is jointed straight
 #       to the hole rim. A bolt's `washer` names the washer "Add washer" stacks under it.
@@ -30,6 +33,7 @@ PART_HARDWARE = 'Hardware'
 
 MOUNT_FLANGE = 'flange'
 MOUNT_ORIGIN = 'origin'
+MOUNT_GENERATED = 'generated'
 
 HARDWARE_CATEGORIES = {
     'Bearings': {
@@ -66,9 +70,22 @@ HARDWARE_CATEGORIES = {
         '1/4-20 Locknut': dict(urn='urn:adsk.wipprod:dm.lineage:KOBQlzjKQiOWoU8gTEtcEA',
                                file='1/4-20_Locknut', folder='Nuts', mount=MOUNT_ORIGIN),
     },
+    # Generated, not inserted: `shaft_type` is the shaft_gen profile to build, `thumb` the
+    # resources/hardware/<thumb>/preview.png tile (see hardware_thumbs.py).
+    'Spacers': {
+        '1/2" Hex Spacer':     dict(mount=MOUNT_GENERATED, shaft_type=SHAFT_HALF_HEX_SPACER,
+                                   file='HexSpacer_HalfInchHex', thumb='spacer_half_hex'),
+        '3/8" Hex Spacer':     dict(mount=MOUNT_GENERATED, shaft_type=SHAFT_THREE_EIGHTH_SPACER,
+                                   file='HexSpacer_ThreeEighthHex', thumb='spacer_three_eighth_hex'),
+        'Custom (Round Tube)': dict(mount=MOUNT_GENERATED, shaft_type=SHAFT_CUSTOM,
+                                   file='Spacer_Custom', thumb='spacer_custom'),
+    },
 }
 HARDWARE_PARTS = {name: part for parts in HARDWARE_CATEGORIES.values()
                   for name, part in parts.items()}
+# Spacer name by the shaft_gen shaft type it builds (right-click Edit reads the type back).
+SPACER_BY_SHAFT_TYPE = {part['shaft_type']: name for name, part in HARDWARE_PARTS.items()
+                        if part.get('mount') == MOUNT_GENERATED}
 
 ATTR_HARDWARE_PART   = 'hardware_part'
 ATTR_HARDWARE_FOLDER = 'hardware_folder'
@@ -129,6 +146,16 @@ def _selected_part_name(inputs: adsk.core.CommandInputs):
     return item.name if item is not None else None
 
 
+def selected_spacer_type(inputs: adsk.core.CommandInputs):
+    """The shaft_gen shaft type of the selected spacer, or None when the Hardware part type
+    isn't on a spacer."""
+    partTypeInp = inputs.itemById('part_type')
+    if partTypeInp is None or partTypeInp.selectedItem.name != PART_HARDWARE:
+        return None
+    part = HARDWARE_PARTS.get(_selected_part_name(inputs))
+    return part['shaft_type'] if part is not None and part.get('mount') == MOUNT_GENERATED else None
+
+
 def add_hardware_group(inputs: adsk.core.CommandInputs, visible: bool):
     """Add the "Hardware" group: a category, which part, the hole rims to put it in, an
     optional washer under a bolt, and a Flip. The part is picked by clicking its thumbnail
@@ -185,10 +212,20 @@ def handle_hardware_input_changed(inputs: adsk.core.CommandInputs, changed_id: s
     if changed_id == 'hw_category' and partInp is not None:
         _fill_parts(partInp, inputs.itemById('hw_category').selectedItem.name)
         _update_picker(inputs)
+    part = HARDWARE_PARTS.get(_selected_part_name(inputs))
     washerInp = inputs.itemById('hw_washer')
     if washerInp is not None:
-        part = HARDWARE_PARTS.get(_selected_part_name(inputs))
         washerInp.isVisible = part is not None and 'washer' in part
+    # A spacer is placed with the Placement inputs instead of hole picks (entry.py shows
+    # those), so the hole-mount inputs go away and stop requiring a pick.
+    is_spacer = part is not None and part.get('mount') == MOUNT_GENERATED
+    for inp_id in ('hw_holes', 'hw_offset', 'hw_flip'):
+        inp = inputs.itemById(inp_id)
+        if inp is not None:
+            inp.isVisible = not is_spacer
+    holesInp = inputs.itemById('hw_holes')
+    if holesInp is not None:
+        holesInp.setSelectionLimits(0 if is_spacer else 1, 0)
 
 
 # ===========================================================================
@@ -513,6 +550,8 @@ def create_hardware(inputs: adsk.core.CommandInputs, is_preview: bool = False) -
     offset_cm = offsetInp.value if offsetInp is not None else 0.0
     part_name = _selected_part_name(inputs)
     part  = HARDWARE_PARTS[part_name]
+    if part.get('mount') == MOUNT_GENERATED:
+        return False   # spacers are built by create_spacers
     flip  = flipInp is not None and flipInp.value
     washer_name = part.get('washer') if (washerInp is not None and washerInp.isVisible
                                          and washerInp.value) else None
@@ -609,3 +648,51 @@ def create_hardware(inputs: adsk.core.CommandInputs, is_preview: bool = False) -
             f'{", ".join(str(n) for n in failed)} (in pick order). See the Text Command '
             'window for details.')
     return added > 0
+
+
+# ===========================================================================
+# Spacers
+# ===========================================================================
+
+def _hardware_parent(occ: adsk.fusion.Occurrence):
+    """`occ`'s parent occurrence if that's a Hardware folder, else None."""
+    parent = occ.assemblyContext if occ is not None else None
+    return parent if parent is not None and _is_hardware_folder(parent.component) else None
+
+
+def create_spacers(inputs: adsk.core.CommandInputs, constrain: bool = True,
+                   parent_occ: adsk.fusion.Occurrence = None):
+    """Build the selected spacer (a shaft_gen profile) at each Reference Point pick, inside
+    the Hardware folder. Between Two Faces takes one pick; Custom Length any number (or
+    none: one spacer at the origin, as a Shaft does). Returns the first spacer's reference
+    face, for the preview highlight. `parent_occ` overrides the folder (right-click Edit
+    rebuilds a spacer where it was)."""
+    shaft_type = selected_spacer_type(inputs)
+    part_name  = SPACER_BY_SHAFT_TYPE.get(shaft_type)
+    if shaft_type is None:
+        return None
+    # Every pick up front: a live selection can go stale once the first spacer changes the
+    # timeline (see _create_shaft).
+    refPointSel = inputs.itemById('ref_point_selection')
+    picks = _selected_edges(refPointSel) if refPointSel is not None else []
+    if not picks:
+        picks = [None]
+
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    start_marker = design.timeline.markerPosition
+    if parent_occ is not None and parent_occ.isValid:
+        hw_occ, hw_created = parent_occ, False
+    else:
+        hw_occ, hw_created = _hardware_folder(design)
+
+    ref_face = None
+    for pick in picks:
+        face = _create_shaft(inputs, constrain, shaft_type=shaft_type, ref_point_entity=pick,
+                             parent_occ=hw_occ, group_timeline=False, hardware_part=part_name)
+        if ref_face is None:
+            ref_face = face
+
+    if hw_created and hw_occ.isValid and hw_occ.childOccurrences.count == 0:
+        hw_occ.deleteMe()
+    futil.group_timeline_features(design, start_marker, f'Hardware_{HARDWARE_PARTS[part_name]["file"]}')
+    return ref_face

@@ -622,11 +622,9 @@ def _create_chain(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     chain_type_str = '35' if motion == MOTION_CHAIN_35 else '25'
 
     design    = adsk.fusion.Design.cast(app.activeProduct)
-    rootComp  = design.rootComponent
     start_marker = design.timeline.markerPosition
-    trans     = adsk.core.Matrix3D.create()
     try:
-        workingOcc  = rootComp.occurrences.addNewComponent(trans)
+        workingOcc  = futil.add_occurrence_in_active(design)   # root-context proxy
     except RuntimeError:
         if not is_preview:
             futil.popup_error(

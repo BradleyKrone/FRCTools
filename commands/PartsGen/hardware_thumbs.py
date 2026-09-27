@@ -18,6 +18,9 @@ NO_THUMBNAIL = os.path.join(THUMB_DIR, '_none.png')
 
 
 def _preview_path(part: dict) -> str:
+    # A generated part (a spacer) names its own folder; the tile was captured in Fusion.
+    if 'thumb' in part:
+        return os.path.join(THUMB_DIR, part['thumb'], 'preview.png')
     # The lineage id is filesystem-safe and stable; `file` names contain '/'.
     return os.path.join(THUMB_DIR, part['urn'].rsplit(':', 1)[-1], 'preview.png')
 
@@ -35,8 +38,8 @@ def ensure_thumbnails(parts, timeout_s: float = 3.0):
     times out is logged and tried again next time. A no-op once all are cached."""
     pending = []
     for part in parts:
-        if os.path.isfile(_preview_path(part)):
-            continue
+        if 'urn' not in part or os.path.isfile(_preview_path(part)):
+            continue   # cached, or generated (nothing to fetch)
         try:
             data_file = app.data.findFileById(part['urn'])
             if data_file is None:

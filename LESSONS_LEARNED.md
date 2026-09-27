@@ -23,6 +23,45 @@ session.
 
 ## Lessons
 
+### Build generated groups in the active component, not the root
+Gears/belts/chains always landed in the root even with a sub-assembly active. **Fix:** `futil.add_occurrence_in_active`
+(returns a root-context proxy; converts a world placement to the parent's frame). Anything that read `worldGeometry` of a
+native entity or treated `transform2.translation` as "moved from 0" must go through the proxy's `transform2`.
+`root.joints.add(...)` with a sub-component active files the joint in that component -- fine, left as is.
+`lib/fusionAddInUtils/general_utils.py`, `commands/PartsGen/belt_gen.py` (`_cc_joint_offset_cm`, `_add_cc_joint`)
+
+### A command dialog's OK/Cancel row can't hold custom buttons
+There's no API to add an "Apply" button next to OK — `Command` only exposes `okButtonText`,
+`cancelButtonText` and `isOKButtonVisible`. **Fix:** add a button-style `BoolValueCommandInput`
+(`isCheckBox=False`) as the *last* input so it sits right above OK.
+`commands/PartsGen/entry.py` (`apply_btn`)
+
+### "Apply" (commit + keep going): re-execute the command def, never `doExecute(True)` from a CustomEvent
+`doExecute(True)` fired from a CustomEvent logs "API Command destroyed during a callback" and leaves
+Fusion's command state broken — after a few Applies, commits silently stop happening (preview still
+builds) and autosave reports "Global command is running". **Fix:** from the CustomEvent, just call
+`cmdDef.execute()` on the same command: the open dialog is pre-empted, and pre-empted commands with
+valid inputs are executed like OK (`Command.isExecutedWhenPreEmpted`, default True). Restore saved
+inputs in `commandCreated`, and disable the button when `areInputsValid` is False (invalid = dropped).
+**Gotcha:** the new dialog's `commandCreated` fires *before* the pre-empted one's `destroy`, so a
+module-level `local_handlers = []` reset in `destroy` wipes the new dialog's handlers (blank
+BrowserCommandInput, dead inputs). Give each dialog its own list and only reset if it's still current.
+`commands/PartsGen/entry.py` (`_on_apply_event`, `_restore_apply_state`, `command_destroy`)
+
+### Thumbnail for a *generated* part: capture the viewport, not the cloud
+A generated part (a Hardware spacer) has no DataFile for `.thumbnail`. **Fix:** build it alone at the
+origin in a scratch doc (every other occurrence, origin and joints folders hidden), set an iso camera
+and `fit()`, `saveAsImageFileWithOptions` (256px, `isBackgroundTransparent`), then
+`futil.downscale_png` to 128. The result matches the white picker tiles.
+`commands/PartsGen/hardware_thumbs.py` (`_preview_path`: a part's `thumb` key)
+
+### Building a PartsGen part inside a folder component: add it to the native component, then proxy it
+To file spacers under the Hardware folder, `_create_shaft(parent_occ=...)` uses
+`(parent_occ.nativeObject or parent_occ).component.occurrences.addNewComponent(m).createForAssemblyContext(parent_occ)`.
+Hole-rim placement, joints and full constraining all worked unchanged inside it (checked live). Read
+every selection before the first build when making one part per pick.
+`commands/PartsGen/hardware_gen.py` (`create_spacers`)
+
 ### Pictures of library parts in a dialog: `DataFile.thumbnail`, pre-scaled, no PIL
 `DataFile.thumbnail` is a `DataObjectFuture` (poll `.state` with `adsk.doEvents()`, then
 `.dataObject.saveToFile(png)`) giving a 256x256 RGBA PNG; all 12 hardware parts took ~3 s.

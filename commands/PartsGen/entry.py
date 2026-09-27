@@ -25,7 +25,9 @@ from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_select
                        ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
                        ATTR_GEAR_CC_CIRCLE)
 from .hardware_gen import (PART_HARDWARE, add_hardware_group, create_hardware,
-                           handle_hardware_input_changed, handle_hardware_html)
+                           handle_hardware_input_changed, handle_hardware_html,
+                           selected_spacer_type, create_spacers, SPACER_BY_SHAFT_TYPE,
+                           _hardware_folder, _hardware_parent)
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -50,6 +52,17 @@ _edit_belt_entities    = None   # (C-C circle 1, C-C circle 2, offset face) for 
 _edit_chain_entities   = None   # the same three picks for a chain
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
 _belt_live_preview     = True   # the Timing Belt's "Live Preview" checkbox, kept between dialogs
+
+# ---------------------------------------------------------------------------
+# Apply button -- commit the part and reopen the dialog with the same settings.
+# The click fires a CustomEvent that, once Fusion is idle, starts Parts Gen again. That
+# pre-empts the open dialog, which Fusion executes just like OK (isExecutedWhenPreEmpted
+# defaults to True), and command_created restores the saved input values. Don't call
+# doExecute() for this -- it destroys the command inside our own callback, which leaves
+# Fusion's command state broken so later commits silently don't happen.
+# ---------------------------------------------------------------------------
+_APPLY_EVENT_ID  = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_PartsGenApplyEvent'
+_apply_state     = None   # [(input id, value)] saved by an Apply click, restored on reopen
 
 # ---------------------------------------------------------------------------
 # Reference-face highlight (Shaft/Tube preview) -- see command_preview /
@@ -223,6 +236,14 @@ def start():
     register_chain_name_sync()
     register_gear_sync()
 
+    # A leftover registration from a crashed run makes registerCustomEvent return None.
+    try:
+        app.unregisterCustomEvent(_APPLY_EVENT_ID)
+    except Exception:
+        pass
+    apply_event = app.registerCustomEvent(_APPLY_EVENT_ID)
+    futil.add_handler(apply_event, _on_apply_event, local_handlers=ui_handlers)
+
 
 def stop():
     panel = config.get_frc_panel()
@@ -241,6 +262,10 @@ def stop():
     unregister_belt_name_sync()
     unregister_chain_name_sync()
     unregister_gear_sync()
+    try:
+        app.unregisterCustomEvent(_APPLY_EVENT_ID)
+    except Exception:
+        pass
 
     global ui_handlers
     ui_handlers = []
@@ -634,9 +659,8 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     shaftTypeInp.listItems.add(SHAFT_HALF_HEX, True, '')
     shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX, False, '')
     shaftTypeInp.listItems.add(SHAFT_MAXSPLINE, False, '')
-    shaftTypeInp.listItems.add(SHAFT_HALF_HEX_SPACER, False, '')
-    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_SPACER, False, '')
-    shaftTypeInp.listItems.add(SHAFT_CUSTOM, False, '')
+    # The spacers (Hex Spacers, Custom Round Tube) are under Hardware > Spacers now; they
+    # still build through _create_shaft, so custom_od/custom_id and Placement are shared.
 
     customOD = partInputs.addValueInput(
         'custom_od', 'Outer Diameter', 'in',
@@ -835,12 +859,44 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # --- Hardware ("Hardware" group) ------------------------------------------
     add_hardware_group(inputs, False)
 
-    futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
-    futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=local_handlers)
-    futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
-    futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
-    futil.add_handler(args.command.destroy,        command_destroy,        local_handlers=local_handlers)
-    futil.add_handler(args.command.incomingFromHTML, handle_hardware_html, local_handlers=local_handlers)
+    # --- Apply (commit this part, keep the dialog open for the next one) ------
+    # Last, so it sits right above OK -- the API can't put a button in the OK/Cancel row.
+    applyBtn = inputs.addBoolValueInput('apply_btn', 'Create and Continue', False, '', False)
+    applyBtn.text = 'Apply'
+    applyBtn.tooltip = ('Create this part and reopen Parts Gen with the same settings, '
+                        'ready to place the next one.')
+
+    global _apply_state
+    if _apply_state is not None:
+        state, _apply_state = _apply_state, None
+        try:
+            _restore_apply_state(inputs, state)
+        except Exception:
+            futil.handle_error('PartsGen restore Apply settings', show_message_box=False)
+
+    # A fresh list per dialog: Apply opens the next dialog *before* the pre-empted one is
+    # destroyed, so a shared list would be emptied by the old dialog's destroy and take the
+    # new dialog's handlers with it (blank thumbnail picker, dead inputs).
+    global local_handlers
+    handlers = local_handlers = []
+    futil.add_handler(args.command.execute,        command_execute,        local_handlers=handlers)
+    futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=handlers)
+    futil.add_handler(args.command.executePreview, command_preview,        local_handlers=handlers)
+    futil.add_handler(args.command.validateInputs, command_validate_input_create, local_handlers=handlers)
+    futil.add_handler(args.command.destroy,        lambda a: command_destroy(a, handlers),
+                      name='command_destroy', local_handlers=handlers)
+    futil.add_handler(args.command.incomingFromHTML, _hardware_html, local_handlers=handlers)
+
+
+def _hardware_html(args: adsk.core.HTMLEventArgs):
+    """The Hardware thumbnail picker. A tile click changes the hidden part dropdown without
+    an inputChanged event, so re-run the dialog's visibility for it here (a spacer shows the
+    Placement inputs, the other parts hide them)."""
+    handle_hardware_html(args)
+    if args.action == 'select' and args.browserCommandInput is not None:
+        hwPartInp = args.browserCommandInput.parentCommand.commandInputs.itemById('hw_part')
+        if hwPartInp is not None:
+            _refresh_inputs(hwPartInp)
 
 
 # ===========================================================================
@@ -848,8 +904,112 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 # ===========================================================================
 
 def command_input_changed(args: adsk.core.InputChangedEventArgs):
+    if args.input.id == 'apply_btn':
+        global _apply_state
+        _apply_state = _save_apply_state(args.input.parentCommand.commandInputs)
+        app.fireCustomEvent(_APPLY_EVENT_ID)
+        return
+    _refresh_inputs(args.input)
+
+
+# Not carried over by Apply: the button itself and the name override (it named the part
+# just made). Picks aren't saved either -- they belong to the part just made.
+_APPLY_SKIP_IDS = ('apply_btn', 'custom_name')
+
+
+def _walk_inputs(inputs: adsk.core.CommandInputs):
+    """Every input in dialog order, descending into groups."""
+    for i in range(inputs.count):
+        inp = inputs.item(i)
+        yield inp
+        if isinstance(inp, adsk.core.GroupCommandInput):
+            yield from _walk_inputs(inp.children)
+
+
+def _save_apply_state(inputs: adsk.core.CommandInputs):
+    state = []
+    for inp in _walk_inputs(inputs):
+        if inp.id in _APPLY_SKIP_IDS:
+            continue
+        if isinstance(inp, adsk.core.DropDownCommandInput):
+            if inp.selectedItem is not None:
+                state.append((inp.id, inp.selectedItem.name))
+        elif isinstance(inp, adsk.core.BoolValueCommandInput):
+            if inp.isCheckBox:
+                state.append((inp.id, inp.value))
+        elif isinstance(inp, adsk.core.ValueCommandInput):
+            state.append((inp.id, inp.expression))
+        elif isinstance(inp, (adsk.core.StringValueCommandInput,
+                              adsk.core.IntegerSpinnerCommandInput)):
+            state.append((inp.id, inp.value))
+    return state
+
+
+def _restore_apply_state(inputs: adsk.core.CommandInputs, state):
+    """Put an Apply click's saved values back into a freshly built dialog.
+
+    Dropdowns go first, in dialog order, each followed by _refresh_inputs as if the user
+    had picked it -- that refills dependent lists (a Hardware category's parts, a shaft
+    type's bearings) before the dropdowns after it are restored. The refresh also resets
+    some values to per-type defaults, so every other value goes second, overwriting them.
+    """
+    for inp_id, name in state:
+        inp = inputs.itemById(inp_id)
+        if not isinstance(inp, adsk.core.DropDownCommandInput) or \
+                (inp.selectedItem is not None and inp.selectedItem.name == name):
+            continue
+        for j in range(inp.listItems.count):
+            item = inp.listItems.item(j)
+            if item.name == name:
+                item.isSelected = True
+                _refresh_inputs(inp)
+                break
+    for inp_id, value in state:
+        inp = inputs.itemById(inp_id)
+        if inp is None or isinstance(inp, adsk.core.DropDownCommandInput):
+            continue
+        try:
+            if isinstance(inp, adsk.core.ValueCommandInput):
+                inp.expression = value
+            else:
+                inp.value = value
+        except Exception:
+            futil.log(f'PartsGen: Apply could not restore {inp_id}')
+    # Visibility follows the restored checkboxes (tube holes, joint options, ...). The
+    # id is one _refresh_inputs has no special case for, so nothing else is reset.
+    _refresh_inputs(inputs.itemById('custom_length'))
+    for sel_id in ('ref_point_selection', 'face1_selection', 'hw_holes', 'tb_pitch_circles',
+                   'chain_pitch_circles', 'gear_pitch_circles'):
+        sel = inputs.itemById(sel_id)
+        if sel is not None and sel.isVisible:
+            sel.hasFocus = True
+            break
+
+
+def _on_apply_event(args: adsk.core.CustomEventArgs):
+    """Runs once Fusion is idle after an Apply click: starting Parts Gen again commits the
+    open dialog (pre-empted = OK) and opens a fresh one with the saved settings."""
+    global _apply_state
+    try:
+        ui.commandDefinitions.itemById(CMD_ID).execute()
+    except Exception:
+        _apply_state = None
+        futil.handle_error('PartsGen Apply', show_message_box=True)
+
+
+def command_validate_input_create(args: adsk.core.ValidateInputsEventArgs):
+    """The create dialog's validateInputs: Apply is only clickable when OK is, since a
+    pre-empted command with invalid inputs is dropped instead of executed."""
+    command_validate_input(args)
+    applyBtn = args.inputs.itemById('apply_btn')
+    if applyBtn is not None:
+        applyBtn.isEnabled = args.areInputsValid
+
+
+def _refresh_inputs(changed_input: adsk.core.CommandInput):
+    """Show / hide the dialog's inputs after `changed_input` changed."""
     # Not args.inputs -- that's only the changed input's own group (see _add_dialog_groups).
-    inputs = args.input.parentCommand.commandInputs
+    inputs = changed_input.parentCommand.commandInputs
 
     partTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('part_type')
     shaftTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('shaft_type')
@@ -888,8 +1048,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_chain    = (part_type == PART_CHAIN)
     part_is_gear     = (part_type == PART_GEAR)
     part_is_hardware = (part_type == PART_HARDWARE)
-    is_custom_shaft  =(shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
-    is_spacer_shaft  = (shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
+    # First, so a category change has refilled the part list before the spacer check reads it.
+    if part_is_hardware and changed_input.id in ('part_type', 'hw_category', 'hw_part'):
+        handle_hardware_input_changed(inputs, changed_input.id)
+    # Hardware > Spacers are built by _create_shaft, so they take the Shaft's OD/ID and
+    # Placement inputs ("shaft-like"). The edit dialog edits a spacer as a Shaft.
+    spacer_type      = selected_spacer_type(inputs)
+    part_is_spacer   = spacer_type is not None
+    shaft_like       = part_is_shaft or part_is_spacer
+    shaft_type_name  = spacer_type or shaftTypeInp.selectedItem.name
+    is_custom_shaft  = (shaft_type_name == SHAFT_CUSTOM)
+    is_spacer_shaft  = (shaft_type_name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
 
@@ -897,7 +1066,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # custom length (e.g. a spacer), while Shaft is most often built Between Two Faces so
     # its joint has both faces to reference -- default each part type to whichever is more
     # common as soon as it's selected, same spirit as the customOD reset below.
-    if args.input.id == 'part_type':
+    if changed_input.id == 'part_type':
         if part_is_tube:
             lenTypeInp.listItems.item(1).isSelected = True  # Custom Length
         elif part_is_shaft:
@@ -905,21 +1074,21 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
     hide_length      = (part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
-                        or part_is_gear or part_is_hardware)
+                        or part_is_gear or (part_is_hardware and not part_is_spacer))
 
     # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
     # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
     # inputs stay invalid, executePreview never fires and the shaft never shows up. Turn it
     # off on entering Custom Length unless a Reference Point is already there to joint to.
-    if (args.input.id in ('part_type', 'length_type') and part_is_shaft
+    if (changed_input.id in ('part_type', 'length_type', 'hw_part') and shaft_like
             and not is_between_faces and createJointInp is not None
             and (refPointSel is None or refPointSel.selectionCount < 1)):
         createJointInp.value = False
 
     # Shaft inputs
     shaftTypeInp.isVisible   = part_is_shaft
-    customOD.isVisible       = part_is_shaft and (is_custom_shaft or is_spacer_shaft)
-    customID.isVisible       = part_is_shaft and is_custom_shaft
+    customOD.isVisible       = shaft_like and (is_custom_shaft or is_spacer_shaft)
+    customID.isVisible       = shaft_like and is_custom_shaft
 
     # Tube inputs
     tubeWidthInp.isVisible   = part_is_tube
@@ -990,21 +1159,19 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         gearGroup.isVisible = part_is_gear
     gearCirclesInp = inputs.itemById('gear_pitch_circles')
     if part_is_gear and gearCirclesInp is not None and gearCirclesInp.isVisible \
-            and args.input.id == 'part_type':
+            and changed_input.id == 'part_type':
         gearCirclesInp.hasFocus = True
-    if args.input.id == 'gear_pitch_circles':
+    if changed_input.id == 'gear_pitch_circles':
         handle_gear_selection_changed(inputs)
 
     # Hardware group
     hardwareGroup = inputs.itemById('hardware_group')
     if hardwareGroup is not None:
         hardwareGroup.isVisible = part_is_hardware
-    if part_is_hardware and args.input.id in ('part_type', 'hw_category', 'hw_part'):
-        handle_hardware_input_changed(inputs, args.input.id)
     hwHolesInp = inputs.itemById('hw_holes')
     if hwHolesInp is not None:
-        hwHolesInp.setSelectionLimits(1 if part_is_hardware else 0, 0)
-        if part_is_hardware and args.input.id == 'part_type':
+        hwHolesInp.setSelectionLimits(1 if part_is_hardware and not part_is_spacer else 0, 0)
+        if part_is_hardware and not part_is_spacer and changed_input.id == 'part_type':
             hwHolesInp.hasFocus = True
 
     # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
@@ -1019,9 +1186,10 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # Reference Point is required in Between-Two-Faces (positions the shaft). In Custom
     # Length it only exists to give the joint below a target, so it's shown only while
     # "Create Joint" is checked -- and cleared when hidden, so a stale pick can't silently
-    # keep placing the shaft somewhere the user can no longer see.
-    show_ref_point = (not hide_length and part_is_shaft
-                      and (is_between_faces
+    # keep placing the shaft somewhere the user can no longer see. A spacer always shows it:
+    # in Custom Length it takes any number of picks, one spacer at each.
+    show_ref_point = (not hide_length and shaft_like
+                      and (is_between_faces or part_is_spacer
                            or (createJointInp is not None and createJointInp.value)))
     if refPointSel is not None:
         refPointSel.isVisible = show_ref_point
@@ -1030,7 +1198,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     face2Sel.isVisible     = not hide_length and is_between_faces
     customLenInp.isVisible = not hide_length and not is_between_faces
     if reverseDirInp is not None:
-        reverseDirInp.isVisible = not hide_length and not is_between_faces and part_is_shaft
+        reverseDirInp.isVisible = not hide_length and not is_between_faces and shaft_like
     if highlightRefFaceInp is not None:
         highlightRefFaceInp.isVisible = not hide_length
 
@@ -1039,7 +1207,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # joint's target -- no separate pick. Custom Length still requires an actual pick before
     # "Create Joint" can be turned on (enforced in command_validate_input), since the point is
     # optional there.
-    show_joint = part_is_shaft
+    show_joint = shaft_like
     show_joint_options = (show_joint and createJointInp is not None and createJointInp.value)
     if createJointInp is not None:
         createJointInp.isVisible = show_joint
@@ -1052,8 +1220,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # part fits it at all.
     bearingEndsInp = inputs.itemById('bearing_ends')
     if bearingEndsInp is not None:
-        shaft_type_name = shaftTypeInp.selectedItem.name
-        if args.input.id == 'shaft_type':
+        if changed_input.id == 'shaft_type':
             _refresh_bearing_items(bearingEndsInp, shaft_type_name)
         bearingEndsInp.isVisible = (not hide_length and part_is_shaft
                                     and len(bearing_choices(shaft_type_name)) > 1)
@@ -1064,10 +1231,18 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     else:
         face1Sel.setSelectionLimits(0, 1)
     if refPointSel is not None:
-        if not hide_length and is_between_faces and part_is_shaft:
+        if not hide_length and is_between_faces and shaft_like:
+            if refPointSel.selectionCount > 1:
+                refPointSel.clearSelection()   # a spacer's Custom Length picks; one here
             refPointSel.setSelectionLimits(1, 1)
+        elif part_is_spacer:
+            refPointSel.setSelectionLimits(0, 0)   # any number, one spacer each
         else:
             refPointSel.setSelectionLimits(0, 1)
+        refPointSel.tooltip = (
+            'Pick where each spacer goes -- as many as you like, one spacer at each.'
+            if part_is_spacer and not is_between_faces else
+            'Select a point, edge, or face that the part is built from.')
     if not hide_length and is_between_faces:
         face2Sel.setSelectionLimits(1, 1)
     else:
@@ -1084,16 +1259,16 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         else:
             chainCirclesInp.setSelectionLimits(0, 2)
 
-    if part_is_belt and tbCirclesInp is not None and args.input.id == 'part_type':
+    if part_is_belt and tbCirclesInp is not None and changed_input.id == 'part_type':
         tbCirclesInp.hasFocus = True
 
-    if part_is_chain and chainCirclesInp is not None and args.input.id == 'part_type':
+    if part_is_chain and chainCirclesInp is not None and changed_input.id == 'part_type':
         chainCirclesInp.hasFocus = True
 
     # Outer Diameter is shared between Custom (Round Tube) and the two Hex Spacer shaft
     # types; reset it to a sensible starting point for whichever one was just picked
     # instead of leaving whatever the field last held.
-    if args.input.id == 'shaft_type':
+    if changed_input.id == 'shaft_type' or (part_is_spacer and changed_input.id == 'hw_part'):
         if is_spacer_shaft:
             customOD.value = 0.65 * IN_TO_CM
         elif is_custom_shaft:
@@ -1102,30 +1277,30 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # Auto-focus Face 1 (Tube) / Reference Point (Shaft) when switching length mode --
     # Reference Point is now offered (optionally) in Custom Length too, so focus it there
     # as well rather than only when switching to Between Two Faces.
-    if args.input.id in ('length_type', 'create_joint'):
-        if part_is_shaft and refPointSel is not None and show_ref_point:
+    if changed_input.id in ('length_type', 'create_joint', 'hw_part'):
+        if shaft_like and refPointSel is not None and show_ref_point:
             refPointSel.hasFocus = True
         elif part_is_tube and is_between_faces:
             face1Sel.hasFocus = True
 
     # Auto-advance to Face 2 once Face 1 / Reference Point is filled
-    if args.input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
+    if changed_input.id == 'face1_selection' and face1Sel.selectionCount >= 1:
         face2Sel.hasFocus = True
-    if (args.input.id == 'ref_point_selection' and refPointSel is not None
-            and refPointSel.selectionCount >= 1):
+    if (changed_input.id == 'ref_point_selection' and refPointSel is not None
+            and refPointSel.selectionCount >= 1 and is_between_faces):
         face2Sel.hasFocus = True
 
     # Remember the belt's Live Preview choice for the next time the dialog opens
-    if args.input.id == 'tb_live_preview':
+    if changed_input.id == 'tb_live_preview':
         global _belt_live_preview
-        _belt_live_preview = args.input.value
+        _belt_live_preview = changed_input.value
 
     # CCLine detection for Timing Belt circles
-    if args.input.id == 'tb_pitch_circles':
+    if changed_input.id == 'tb_pitch_circles':
         handle_belt_selection_changed(inputs)
 
     # CCLine detection for Chain circles
-    if args.input.id == 'chain_pitch_circles':
+    if changed_input.id == 'chain_pitch_circles':
         handle_chain_selection_changed(inputs)
 
 
@@ -1166,6 +1341,8 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
             # Reports its own errors (quietly in preview) and returns False.
             if not create_gears(inputs, is_preview=is_preview):
                 return False, None
+        elif part_type == PART_HARDWARE and selected_spacer_type(inputs) is not None:
+            ref_face = create_spacers(inputs, constrain=not is_preview)
         elif part_type == PART_HARDWARE:
             create_hardware(inputs, is_preview=is_preview)
         else:
@@ -1201,7 +1378,7 @@ def command_preview(args: adsk.core.CommandEventArgs):
         if suppressTeethInp and suppressTeethInp.value and not belt_adapter:
             args.isValidResult = True
         _clear_ref_face_highlight()
-    elif part_type == PART_HARDWARE:
+    elif part_type == PART_HARDWARE and selected_spacer_type(inputs) is None:
         # Nothing to preview (a cloud insert per tick); isValidResult stays False so OK builds.
         _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
@@ -1220,7 +1397,7 @@ def command_preview(args: adsk.core.CommandEventArgs):
         adapterInp = inputs.itemById('pulley_adapter')
         pulley_adapter = (part_type == PART_PULLEY and adapterInp is not None
                           and adapterInp.value)
-        args.isValidResult = (ok and part_type not in (PART_SHAFT, PART_TUBE)
+        args.isValidResult = (ok and part_type not in (PART_SHAFT, PART_TUBE, PART_HARDWARE)
                               and not pulley_adapter)
         highlightRefFaceInp = inputs.itemById('highlight_ref_face')
         highlight_enabled = highlightRefFaceInp is None or highlightRefFaceInp.value
@@ -1252,6 +1429,9 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     customLenInp:   adsk.core.ValueCommandInput     = inputs.itemById('custom_length')
 
     part_type = partTypeInp.selectedItem.name
+    # A Hardware > Spacer validates as a Shaft (it is built as one).
+    spacer_type = selected_spacer_type(inputs)
+    shaft_like  = part_type == PART_SHAFT or spacer_type is not None
 
     # --- Timing Pulley validation -------------------------------------------
     if part_type == PART_PULLEY:
@@ -1317,7 +1497,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         return
 
     # --- Hardware validation ------------------------------------------------
-    if part_type == PART_HARDWARE:
+    if part_type == PART_HARDWARE and spacer_type is None:
         hwHolesInp = inputs.itemById('hw_holes')
         args.areInputsValid = hwHolesInp is not None and hwHolesInp.selectionCount >= 1
         return
@@ -1344,7 +1524,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
     # Length validation -- Shaft uses Reference Point, Tube uses Face 1
     if len_type == LEN_FACES:
-        if part_type == PART_SHAFT:
+        if shaft_like:
             if refPointSel is None or refPointSel.selectionCount < 1 or face2Sel.selectionCount < 1:
                 args.areInputsValid = False
                 return
@@ -1358,15 +1538,15 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             return
         # Custom Length's Reference Point is optional -- but "Create Joint" needs a real
         # target, so require the pick only once the checkbox is actually turned on.
-        if part_type == PART_SHAFT:
+        if shaft_like:
             createJointInp = inputs.itemById('create_joint')
             if (createJointInp is not None and createJointInp.value
                     and (refPointSel is None or refPointSel.selectionCount < 1)):
                 args.areInputsValid = False
                 return
 
-    if part_type == PART_SHAFT:
-        shaft_type = shaftTypeInp.selectedItem.name
+    if shaft_like:
+        shaft_type = spacer_type or shaftTypeInp.selectedItem.name
         if shaft_type == SHAFT_CUSTOM:
             od = customOD.value
             id_ = customID.value
@@ -1407,8 +1587,12 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 # destroy
 # ===========================================================================
 
-def command_destroy(args: adsk.core.CommandEventArgs):
+def command_destroy(args: adsk.core.CommandEventArgs, handlers: list):
     global local_handlers
+    # An Apply's pre-empted dialog is destroyed after the next one opened -- leave the
+    # newer dialog's handlers and reference-face highlight alone.
+    if handlers is not local_handlers:
+        return
     local_handlers = []
     _clear_ref_face_highlight()
     try:
@@ -1899,12 +2083,16 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     shaftTypeInp = partInputs.addDropDownCommandInput(
         'shaft_type', 'Shaft Type', adsk.core.DropDownStyles.TextListDropDownStyle
     )
-    shaftTypeInp.listItems.add(SHAFT_HALF_HEX,            shaft_type == SHAFT_HALF_HEX,            '')
-    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_HEX,    shaft_type == SHAFT_THREE_EIGHTH_HEX,    '')
-    shaftTypeInp.listItems.add(SHAFT_MAXSPLINE,           shaft_type == SHAFT_MAXSPLINE,           '')
-    shaftTypeInp.listItems.add(SHAFT_HALF_HEX_SPACER,     shaft_type == SHAFT_HALF_HEX_SPACER,     '')
-    shaftTypeInp.listItems.add(SHAFT_THREE_EIGHTH_SPACER, shaft_type == SHAFT_THREE_EIGHTH_SPACER, '')
-    shaftTypeInp.listItems.add(SHAFT_CUSTOM,              is_custom_shaft,                         '')
+    # A spacer (Hardware > Spacers, or a Shaft made before they moved there) is edited as a
+    # Shaft, but only among the spacer types; a shaft only among the shafts.
+    if shaft_type in SPACER_BY_SHAFT_TYPE:
+        shaft_items = (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER, SHAFT_CUSTOM)
+    else:
+        shaft_items = (SHAFT_HALF_HEX, SHAFT_THREE_EIGHTH_HEX, SHAFT_MAXSPLINE)
+    for name in shaft_items:
+        shaftTypeInp.listItems.add(name, shaft_type == name, '')
+    if shaftTypeInp.selectedItem is None:
+        shaftTypeInp.listItems.item(0).isSelected = True
     shaftTypeInp.isVisible = is_shaft
 
     customOD = partInputs.addValueInput(
@@ -2128,6 +2316,10 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         _edit_target_occ = None
         return
 
+    # A spacer is rebuilt in the Hardware folder it was in (or, one made before spacers
+    # moved to Hardware, in the usual one).
+    spacer_parent = _hardware_parent(_edit_target_occ) if _edit_target_occ else None
+
     if _edit_target_occ:
         # A shaft built with bearings lives in a "<shaft>_Group" with them, so delete the
         # whole group. Older shafts have their bearings as separate root occurrences --
@@ -2148,7 +2340,13 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
-    if part_type == PART_SHAFT:
+    shaft_type = inputs.itemById('shaft_type').selectedItem.name
+    if part_type == PART_SHAFT and shaft_type in SPACER_BY_SHAFT_TYPE:
+        if spacer_parent is None:
+            spacer_parent, _ = _hardware_folder(adsk.fusion.Design.cast(app.activeProduct))
+        _create_shaft(inputs, parent_occ=spacer_parent,
+                      hardware_part=SPACER_BY_SHAFT_TYPE[shaft_type])
+    elif part_type == PART_SHAFT:
         _create_shaft(inputs)
     elif part_type == PART_TUBE:
         _create_tube(inputs)

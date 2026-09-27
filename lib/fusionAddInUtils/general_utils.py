@@ -178,6 +178,27 @@ def group_timeline_features(design: adsk.fusion.Design, start_marker: int, group
         log(f'FRCTools: failed to create timeline group "{group_name}"')
 
 
+def add_occurrence_in_active(design: adsk.fusion.Design,
+                             world_transform: adsk.core.Matrix3D = None,
+                             parent_occ: adsk.fusion.Occurrence = None) -> adsk.fusion.Occurrence:
+    """A new component occurrence in the active component (the root when none is active) --
+    or in `parent_occ`, a root-context occurrence -- returned as a root-context proxy so
+    createForAssemblyContext / sketch / joint calls on it work unchanged. `world_transform`
+    (default identity in its parent) is where it goes in world space. Raises RuntimeError in
+    a Part Design document, like addNewComponent."""
+    active = parent_occ if parent_occ is not None else design.activeOccurrence
+    parent = active.component if active is not None else design.rootComponent
+    local = adsk.core.Matrix3D.create()
+    if world_transform is not None:
+        local = world_transform.copy()
+        if active is not None:
+            to_local = active.transform2.copy()     # the proxy's full world transform
+            to_local.invert()
+            local.transformBy(to_local)
+    occ = parent.occurrences.addNewComponent(local)
+    return occ.createForAssemblyContext(active) if active is not None else occ
+
+
 def get_or_create_appearance(design: adsk.fusion.Design, name: str, rgb) -> adsk.core.Base:
     """Return a design-local Appearance named `name`, colored `rgb` (an (r, g, b) 0-255
     tuple) -- reusing it if a previous call already created it in this design, or copying
