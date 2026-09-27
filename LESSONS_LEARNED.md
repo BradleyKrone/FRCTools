@@ -23,6 +23,39 @@ session.
 
 ## Lessons
 
+### `Sketch.referencePlane` raises for a sketch on a BRepFace unless the timeline is rolled back
+Deleting a label cut + its sketch (`ConstructionPlane.cast(sk.referencePlane)`) threw "referencePlane is a BRefFace -
+need to roll timeline back", which sent the sprocket's in-place update to its delete-and-rebuild fallback (user joints
+lost). **Fix:** wrap the read in `try/except RuntimeError` and treat it as "no plane to delete".
+`commands/PartsGen/sprocket_gen.py` (`_delete_cut`)
+
+### Curved text on a round face: face sketch + `setAsAlongPath` on a fixed arc centred on the sketch's -Y
+SketchArcs always run CCW and along-path text reads in the path's direction, so an arc over the top gives upside-down
+text. **Fix:** sketch on the face (`sketches.add(face)`, normal points out, so both faces read right from outside with
+no mirroring), draw the arc across the bottom (-Y) with its 3 points fixed, `setAsAlongPath(arc, True, Center, 0)`: text
+sits *inside* the arc, tops towards the centre. Sketch every face before cutting any (a cut remakes faces).
+`commands/PartsGen/sprocket_gen.py` (`_sketch_arc_label`)
+
+### WCP double-hub sprocket geometry (measured off WCP's STEP files)
+#25 (WCP-0558/0560/0581/2106): 0.375in hub-to-hub, 0.110in plate centred; #35 (WCP-0973/0975): 17/32in, 0.169in plate.
+Both: Ø0.750in hubs, ~0.02in end chamfer, 0.039in hub-plate fillet, 1/2in hex; OD = ANSI P(0.6 + cot(180/N)) (not pitch
++ roller dia). Teeth are chamfered both sides at 1:4 (75.96 deg cone): 1/32in x 1/8in (#25), 3/64 x 3/16 (#35) -- skip it
+and a smooth plate looks far too thick next to the real part even at the right width. STEP links are on each WCP product
+page (`wcproducts.info/files/frc/cad/WCP-xxxx.step`); import with `importManager.createSTEPImportOptions`.
+`commands/PartsGen/sprocket_gen.py` (`WCP_DOUBLE_HUB`, `_taper_rim`)
+
+### A two-distance chamfer's distance order can't be predicted -- try both flips and check the removed volume
+`addTwoDistancesChamferEdgeSet(edges, d1, d2, isFlipped, ...)` on a disk's rim: which face gets d1 isn't knowable up front
+(and differs for the top and bottom edge). **Fix:** one feature per edge; add it, compare `body.volume` drop to the
+revolved triangle `pi*d1*d2*(R - d2/3)`, `deleteMe()` and retry flipped if off. Chamfers survive a later diameter change.
+`commands/PartsGen/sprocket_gen.py` (`_taper_rim`)
+
+### Fusion can't nest timeline groups -- a sub-part that groups itself breaks the parent's group
+`group_timeline_features` for a chain failed ("failed to create timeline group") because each sprocket had already
+grouped its own features inside the chain's range. **Fix:** a `group_timeline=False` flag on the sub-part builder when
+called from a parent that groups; verified live the chain and belt groups then form (belt with a 3D-print adapter too).
+`commands/PartsGen/sprocket_gen.py` (`create_sprocket_for_chain`), `commands/PartsGen/pulley_gen.py` (`create_pulley_for_belt`)
+
 ### A commandTerminated sync that refuses an update must say so -- it fails silently otherwise
 Switching a C-C gear to a motor pinion (drawn at 12T) left the 40T gear unchanged: `update_gear` refused
 because 1/2in hex needs 17T or more, and only logged it, again after every command. **Fix:** fall back to a bore that

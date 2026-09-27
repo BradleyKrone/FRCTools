@@ -1038,7 +1038,8 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
                            bore_type: str = BORE_HALF_HEX,
                            bore_offset_cm: float = BORE_OFFSET_DEFAULT_IN * 2.54,
                            use_adapter: bool = False,
-                           is_preview: bool = False):
+                           is_preview: bool = False,
+                           group_timeline: bool = True):
     """Create a timing pulley component from raw parameters.
 
     Called by belt_gen._create_belt() to auto-generate matched pulleys when
@@ -1053,7 +1054,9 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
     3D print adapter are built inside a "<pulley>_Group" component in `parent_comp`.
 
     Returns (pulley occurrence as seen from `parent`, its joint circle) so the caller can
-    add more joints to it, or None if the pulley wasn't built.
+    add more joints to it, or None if the pulley wasn't built. `group_timeline` False leaves
+    its features ungrouped for a caller that groups a wider range -- Fusion can't nest
+    timeline groups, so a group per pulley made the belt's own group fail.
     """
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
@@ -1184,7 +1187,8 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
         except Exception:
             futil.handle_error(f'PartsGen: joint for {comp_name}', show_message_box=not is_preview)
 
-    futil.group_timeline_features(design, start_marker, comp_name)
+    if group_timeline:
+        futil.group_timeline_features(design, start_marker, comp_name)
     return joint_occ, joint_circle
 
 

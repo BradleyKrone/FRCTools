@@ -12,7 +12,12 @@ from .pulley_gen import (_create_pulley, BORE_HALF_HEX, BORE_TYPES, BORE_OFFSET_
 from .belt_gen import (_create_belt, handle_belt_selection_changed, register_belt_name_sync,
                        unregister_belt_name_sync, OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP)
 from .sprocket_gen import _create_sprocket
-from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
+from .chain_gen import (_create_chain, handle_chain_selection_changed, register_chain_name_sync,
+                        unregister_chain_name_sync,
+                        OFFSET_SIDE_BOTTOM as CHAIN_OFFSET_BOTTOM,
+                        OFFSET_SIDE_TOP as CHAIN_OFFSET_TOP,
+                        ATTR_CHAIN_BORE_OFFSET, ATTR_CHAIN_OFFSET_EXPR, ATTR_CHAIN_OFFSET_FACE,
+                        ATTR_CHAIN_OFFSET_SIDE, ATTR_CHAIN_CC_CIRCLE)
 from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_selection_changed,
                        update_gear_dialog, update_gear_from_dialog, selected_pitch_circles,
                        is_cc_gear, register_gear_sync, unregister_gear_sync,
@@ -40,6 +45,7 @@ _edit_ref_entities     = None   # (ref_point, face2) recovered from the edited s
                                 # SelectionCommandInput.addSelection() doesn't stick when it is
                                 # called from commandCreated.
 _edit_belt_entities    = None   # (C-C circle 1, C-C circle 2, offset face) for a belt, same idea
+_edit_chain_entities   = None   # the same three picks for a chain
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
 _belt_live_preview     = True   # the Timing Belt's "Live Preview" checkbox, kept between dialogs
 
@@ -170,7 +176,6 @@ ATTR_SPROCKET_CHAIN_TYPE  = 'sprocket_chain_type'
 ATTR_CHAIN_TYPE           = 'chain_type'
 ATTR_CHAIN_SPROCKET_WIDTH = 'chain_sprocket_width_expr'
 ATTR_CHAIN_GEN_SPROCKETS  = 'chain_gen_sprockets'
-ATTR_CHAIN_SPROCKET_TEETH = 'chain_sprocket_teeth'
 
 ATTR_CUSTOM_NAME          = 'custom_name'
 
@@ -456,6 +461,75 @@ def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
                 offsetFlangeInp.listItems.item(0).isSelected = True
             offsetFlangeInp.tooltip = ('Which of this pulley\'s flanges (its outer face) the Z '
                                        'Offset is measured to. Only used with an Offset From face.')
+
+
+CHAIN_SPROCKET_INPUT_IDS = ('chain_bore_offset', 'chain_offset_face', 'chain_offset_dist',
+                            'chain_offset_side')
+
+
+def _add_chain_inputs(partInputs: adsk.core.CommandInputs, visible: bool,
+                      width_expr: str = '0.375 in', gen_sprockets: bool = True,
+                      bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
+                      offset_expr: str = '0 in', offset_side: str = CHAIN_OFFSET_BOTTOM):
+    """Add the Chain's inputs (shared by the create and edit dialogs). Kept flat in the
+    Part group, not a group of their own: a group changes InputChangedEventArgs.inputs.
+
+    The sprockets are toothless with a 1/2in hex bore. Sprocket 1's joint to its C-C
+    circle carries the chain's height (Z Offset, from an optional face); Sprocket 2's
+    follows it -- the same scheme as the belt's pulleys."""
+    chainCirclesInp = partInputs.addSelectionInput(
+        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
+    )
+    chainCirclesInp.addSelectionFilter('SketchCurves')
+    chainCirclesInp.setSelectionLimits(0, 2)
+    chainCirclesInp.isVisible = visible
+
+    chainSprocketWidthInp = partInputs.addValueInput(
+        'chain_sprocket_width', 'Sprocket Width', 'in',
+        adsk.core.ValueInput.createByString(width_expr)
+    )
+    chainSprocketWidthInp.tooltip = ('Hub-to-hub width of the WCP double-hub sprockets (0.375 in '
+                                     'for #25, 17/32 in for #35 -- set automatically when a C-C '
+                                     'line is picked). The chain is centred on their plates.')
+    chainSprocketWidthInp.isVisible = visible
+
+    chainGenSprocketsInp = partInputs.addBoolValueInput(
+        'chain_gen_sprockets', 'Generate Sprockets', True, '', gen_sprockets)
+    chainGenSprocketsInp.isVisible = visible
+    show = visible and gen_sprockets
+
+    boreOffsetInp = partInputs.addValueInput(
+        'chain_bore_offset', 'Bore Offset', 'in',
+        adsk.core.ValueInput.createByString(bore_offset_expr))
+    boreOffsetInp.tooltip = ('Added to every side of both sprockets\' 1/2" hex bores: '
+                             'positive = looser, negative = tighter.')
+    boreOffsetInp.isVisible = show
+
+    offsetFaceInp = partInputs.addSelectionInput(
+        'chain_offset_face', 'Offset From', 'Optional: a face to measure the Z Offset from')
+    offsetFaceInp.addSelectionFilter('PlanarFaces')
+    offsetFaceInp.setSelectionLimits(0, 1)
+    offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is measured '
+                             'from. Leave empty to offset from the C-C sketch plane.')
+    offsetFaceInp.isVisible = show
+
+    offsetDistInp = partInputs.addValueInput(
+        'chain_offset_dist', 'Z Offset', 'in', adsk.core.ValueInput.createByString(offset_expr))
+    offsetDistInp.tooltip = ('Gap from the Offset From face to the Measured To face of Sprocket 1 '
+                             '(first End Circle), along the sprocket axis. The chain and the other '
+                             'sprocket move with it. With no face picked, how far the chain is '
+                             'moved off the C-C sketch plane.')
+    offsetDistInp.isVisible = show
+
+    offsetSideInp = partInputs.addDropDownCommandInput(
+        'chain_offset_side', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for name in (CHAIN_OFFSET_BOTTOM, CHAIN_OFFSET_TOP):
+        offsetSideInp.listItems.add(name, name == offset_side, '')
+    if offsetSideInp.selectedItem is None:
+        offsetSideInp.listItems.item(0).isSelected = True
+    offsetSideInp.tooltip = ('Which face of Sprocket 1 the Z Offset is measured to. Only used '
+                             'with an Offset From face.')
+    offsetSideInp.isVisible = show
 
 
 def _add_gear_group(inputs: adsk.core.CommandInputs, visible: bool,
@@ -750,26 +824,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInp.isVisible = False
 
     # --- Chain group ---------------------------------------------------------
-    chainCirclesInp = partInputs.addSelectionInput(
-        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
-    )
-    chainCirclesInp.addSelectionFilter('SketchCurves')
-    chainCirclesInp.setSelectionLimits(0, 2)
-    chainCirclesInp.isVisible = False
-
-    chainSprocketWidthInp = partInputs.addValueInput(
-        'chain_sprocket_width', 'Chain Width', 'in',
-        adsk.core.ValueInput.createByString('0.375 in')
-    )
-    chainSprocketWidthInp.isVisible = False
-
-    chainGenSprocketsInp = partInputs.addBoolValueInput(
-        'chain_gen_sprockets', 'Generate Sprockets', True, '', True)
-    chainGenSprocketsInp.isVisible = False
-
-    chainSprocketTeethInp = partInputs.addBoolValueInput(
-        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', False)
-    chainSprocketTeethInp.isVisible = False
+    _add_chain_inputs(partInputs, False)
 
     # --- Gear ("Gears" group) -------------------------------------------------
     _add_gear_group(inputs, False)
@@ -909,16 +964,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     chainCirclesInp       = inputs.itemById('chain_pitch_circles')
     chainSprocketWidthInp = inputs.itemById('chain_sprocket_width')
     chainGenSprocketsInp  = inputs.itemById('chain_gen_sprockets')
-    chainSprocketTeethInp = inputs.itemById('chain_sprocket_teeth')
     if chainCirclesInp is not None:
         chainCirclesInp.isVisible = part_is_chain
     if chainSprocketWidthInp is not None:
         chainSprocketWidthInp.isVisible = part_is_chain
     if chainGenSprocketsInp is not None:
         chainGenSprocketsInp.isVisible = part_is_chain
-    if chainSprocketTeethInp is not None:
-        chainSprocketTeethInp.isVisible = (
-            part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
+    for chain_inp_id in CHAIN_SPROCKET_INPUT_IDS:
+        chain_inp = inputs.itemById(chain_inp_id)
+        if chain_inp is not None:
+            chain_inp.isVisible = (part_is_chain and chainGenSprocketsInp is not None
+                                   and chainGenSprocketsInp.value)
 
     # Gear group
     gearGroup = inputs.itemById('gear_group')
@@ -1124,7 +1180,9 @@ def command_preview(args: adsk.core.CommandEventArgs):
             args.isValidResult = True
         _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
+        # Toothless sprockets make the preview the full result, so OK keeps it.
         _create_chain(inputs, is_preview=True)
+        args.isValidResult = True
         _clear_ref_face_highlight()
     else:
         # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
@@ -1241,6 +1299,11 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             args.areInputsValid = False
             return
         if chainWidthInp is None or chainWidthInp.value <= 0:
+            args.areInputsValid = False
+            return
+        # Same per-side bore offset range as the Timing Pulley.
+        chainBoreOffsetInp = inputs.itemById('chain_bore_offset')
+        if chainBoreOffsetInp is not None and abs(chainBoreOffsetInp.value) > 0.05 * 2.54:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -1639,7 +1702,7 @@ def _resolve_entity_token(token: str, label: str):
 
 
 def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
-    global _edit_target_occ, _edit_ref_entities, _edit_belt_entities
+    global _edit_target_occ, _edit_ref_entities, _edit_belt_entities, _edit_chain_entities
 
     inputs = args.command.commandInputs
 
@@ -1662,7 +1725,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
-                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
+                    ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_BORE_OFFSET, ATTR_CHAIN_OFFSET_EXPR,
+                    ATTR_CHAIN_OFFSET_FACE, ATTR_CHAIN_OFFSET_SIDE,
+                    *(f'{ATTR_CHAIN_CC_CIRCLE}_{i}' for i in (1, 2)),
                     ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
                     ATTR_GEAR_CC_CIRCLE,
                     ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE, ATTR_JOINT_FLIP,
@@ -1738,7 +1803,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     chain_type_val       = _s(ATTR_CHAIN_TYPE,          '25')
     chain_spr_width_val  = _s(ATTR_CHAIN_SPROCKET_WIDTH, '0.375 in')
     chain_gen_spr_val    = _b(ATTR_CHAIN_GEN_SPROCKETS,  True)
-    chain_spr_teeth_val  = _b(ATTR_CHAIN_SPROCKET_TEETH, False)
+    chain_bore_off_val   = _s(ATTR_CHAIN_BORE_OFFSET,    f'{BORE_OFFSET_DEFAULT_IN} in')
+    chain_offset_expr    = _s(ATTR_CHAIN_OFFSET_EXPR,    '0 in')
+    chain_offset_side    = _s(ATTR_CHAIN_OFFSET_SIDE,    CHAIN_OFFSET_BOTTOM)
     custom_name_val      = _s(ATTR_CUSTOM_NAME, '')
     create_joint_val     = _b(ATTR_CREATE_JOINT, False)
     bearing_ends_val     = _s(ATTR_BEARING_ENDS, BEARING_NONE)
@@ -1764,6 +1831,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                                (f'{ATTR_BELT_CC_CIRCLE}_2', 'End Circle 2'),
                                (ATTR_BELT_OFFSET_FACE,      'Offset From face')))
                            if is_belt else None)
+    _edit_chain_entities = (tuple(_resolve_entity_token(_s(key, ''), label) for key, label in (
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_1', 'End Circle 1'),
+                                (f'{ATTR_CHAIN_CC_CIRCLE}_2', 'End Circle 2'),
+                                (ATTR_CHAIN_OFFSET_FACE,      'Offset From face')))
+                            if is_chain else None)
     belt_offset_expr   = _s(ATTR_BELT_OFFSET_EXPR,   '0 in')
     belt_offset_flange = _s(ATTR_BELT_OFFSET_FLANGE, OFFSET_FLANGE_BOTTOM)
 
@@ -1915,26 +1987,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     sprocketChainTypeInpEdit.isVisible = is_sprocket
 
     # --- Chain group ---
-    chainCirclesInpEdit = partInputs.addSelectionInput(
-        'chain_pitch_circles', 'End Circles', 'Select a #25 or #35 Chain C-C Line or two pitch circles'
-    )
-    chainCirclesInpEdit.addSelectionFilter('SketchCurves')
-    chainCirclesInpEdit.setSelectionLimits(0, 2)
-    chainCirclesInpEdit.isVisible = is_chain
-
-    chainSprocketWidthInpEdit = partInputs.addValueInput(
-        'chain_sprocket_width', 'Chain Width', 'in',
-        adsk.core.ValueInput.createByString(chain_spr_width_val)
-    )
-    chainSprocketWidthInpEdit.isVisible = is_chain
-
-    chainGenSprocketsInpEdit = partInputs.addBoolValueInput(
-        'chain_gen_sprockets', 'Generate Sprockets', True, '', chain_gen_spr_val)
-    chainGenSprocketsInpEdit.isVisible = is_chain
-
-    chainSprocketTeethInpEdit = partInputs.addBoolValueInput(
-        'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
-    chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
+    _add_chain_inputs(partInputs, is_chain, chain_spr_width_val, chain_gen_spr_val,
+                      chain_bore_off_val, chain_offset_expr, chain_offset_side)
 
     # --- Gear group ---
     _add_gear_group(inputs, is_gear,
@@ -2088,11 +2142,15 @@ def edit_command_activate(args: adsk.core.CommandEventArgs):
     dropping back to Custom Length -- the user can re-pick and still keep the placement.
     A belt's End Circles and Offset From face are re-selected here too.
     """
-    if _edit_belt_entities:
+    for entities, circles_id, face_id, what in (
+            (_edit_belt_entities,  'tb_pitch_circles',    'tb_offset_face',    'belt'),
+            (_edit_chain_entities, 'chain_pitch_circles', 'chain_offset_face', 'chain')):
+        if not entities:
+            continue
         inputs = args.command.commandInputs
-        circle1, circle2, offset_face = _edit_belt_entities
-        circlesSel = inputs.itemById('tb_pitch_circles')
-        faceSel    = inputs.itemById('tb_offset_face')
+        circle1, circle2, offset_face = entities
+        circlesSel = inputs.itemById(circles_id)
+        faceSel    = inputs.itemById(face_id)
         try:
             if circlesSel is not None and circle1 is not None and circle2 is not None:
                 circlesSel.addSelection(circle1)
@@ -2100,7 +2158,7 @@ def edit_command_activate(args: adsk.core.CommandEventArgs):
             if faceSel is not None and offset_face is not None:
                 faceSel.addSelection(offset_face)
         except Exception:
-            futil.log(f'{CMD_NAME} edit: could not re-select the belt\'s stored geometry')
+            futil.log(f'{CMD_NAME} edit: could not re-select the {what}\'s stored geometry')
     if not _edit_ref_entities:
         return
     ref_point, face2 = _edit_ref_entities
@@ -2125,7 +2183,9 @@ def edit_command_preview(args: adsk.core.CommandEventArgs):
 
 def edit_command_destroy(args: adsk.core.CommandEventArgs):
     global edit_local_handlers, _edit_target_occ, _edit_ref_entities, _edit_belt_entities
+    global _edit_chain_entities
     edit_local_handlers = []
     _edit_target_occ    = None
     _edit_ref_entities  = None
     _edit_belt_entities = None
+    _edit_chain_entities = None
