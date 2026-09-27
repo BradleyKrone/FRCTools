@@ -1303,6 +1303,14 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
     if changed_input.id == 'chain_pitch_circles':
         handle_chain_selection_changed(inputs)
 
+    # Auto-advance to Offset From once both End Circles are picked; the preview then ghosts
+    # the part (see _offset_face_picking) so the face behind it is easy to see and click.
+    if changed_input.id in ('tb_pitch_circles', 'chain_pitch_circles'):
+        offsetFaceInp = _offset_face_input(inputs)
+        if (offsetFaceInp is not None and changed_input.selectionCount == 2
+                and offsetFaceInp.selectionCount == 0):
+            offsetFaceInp.hasFocus = True
+
 
 # ===========================================================================
 # execute / preview
@@ -1357,7 +1365,116 @@ def command_execute(args: adsk.core.CommandEventArgs):
     _run_part_creation(args.command.commandInputs, show_message_box=True)
 
 
+def _preview_parent_comp():
+    """The component a preview part gets added to (see futil.add_occurrence_in_active)."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return None
+    active = design.activeOccurrence
+    return active.component if active is not None else design.rootComponent
+
+
+# Opacity of a belt/chain/gear preview while its Offset From face is being picked
+_OFFSET_PICK_OPACITY = 0.3
+
+
+def _offset_face_input(inputs: adsk.core.CommandInputs):
+    """The shown Offset From input of the Timing Belt / Chain / Gear pair, or None."""
+    partTypeInp = inputs.itemById('part_type')
+    part_type = partTypeInp.selectedItem.name if partTypeInp.selectedItem is not None else ''
+    if part_type == PART_BELT:
+        # It lives in Pulley 1's group, which is hidden when pulleys aren't generated.
+        group = inputs.itemById('belt_pulley1_group')
+        if group is None or not group.isVisible:
+            return None
+        return inputs.itemById('tb_offset_face')
+    if part_type == PART_CHAIN:
+        offsetFaceInp = inputs.itemById('chain_offset_face')
+        return offsetFaceInp if offsetFaceInp is not None and offsetFaceInp.isVisible else None
+    if part_type == PART_GEAR:
+        # Only used (and enabled) for a C-C gear pair.
+        offsetFaceInp = inputs.itemById('gear_offset_face')
+        return (offsetFaceInp if offsetFaceInp is not None and offsetFaceInp.isVisible
+                and offsetFaceInp.isEnabled else None)
+    return None
+
+
+def _offset_face_picking(inputs: adsk.core.CommandInputs) -> bool:
+    """True while the user is picking the Offset From face: it has focus and is still empty."""
+    offsetFaceInp = _offset_face_input(inputs)
+    return (offsetFaceInp is not None and offsetFaceInp.hasFocus
+            and offsetFaceInp.selectionCount == 0)
+
+
+def _make_preview_unselectable(parent_comp, occ_count_before: int, opacity: float = None):
+    """Make every body of the occurrences the preview just added to `parent_comp` click-through,
+    so the dialog's face picks (e.g. the belt's Offset From) reach the model *behind* the preview.
+    The browser eye can't hide preview geometry while the command runs, and a pick that lands on
+    the preview would be a face that's deleted on the next preview tick anyway. `opacity`
+    also ghosts them (they are brand-new components, so nothing else shares the setting)."""
+    if parent_comp is None:
+        return
+    occs = parent_comp.occurrences
+    for i in range(occ_count_before, occs.count):
+        comp = occs.item(i).component
+        comps = [comp] + [sub.component for sub in comp.allOccurrences]
+        for c in comps:
+            old_opacity = c.opacity
+            if opacity is not None:
+                try:
+                    c.opacity = opacity
+                except Exception:
+                    pass    # e.g. a read-only linked library part (bearing)
+            for body in c.bRepBodies:
+                try:
+                    body.isSelectable = False
+                    # A gear/chain/toothless-belt preview is kept as the result on OK, so
+                    # tag it for _restore_preview_selectable to undo when the dialog closes.
+                    body.attributes.add(_PREVIEW_ATTR_GROUP, _PREVIEW_ATTR_NAME,
+                                        str(old_opacity))
+                except Exception:
+                    pass    # e.g. a read-only linked library part (bearing)
+
+
+_PREVIEW_ATTR_GROUP = 'FRCTools'
+_PREVIEW_ATTR_NAME  = 'previewUnselectable'
+
+
+def _restore_preview_selectable():
+    """Make bodies tagged by _make_preview_unselectable selectable (and opaque) again. The
+    tags only survive on a preview Fusion kept as the committed result."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is None:
+        return
+    for attr in design.findAttributes(_PREVIEW_ATTR_GROUP, _PREVIEW_ATTR_NAME):
+        body = adsk.fusion.BRepBody.cast(attr.parent)
+        try:
+            if body is not None and body.isValid:
+                body.isSelectable = True
+                try:
+                    body.parentComponent.opacity = float(attr.value)
+                except Exception:
+                    pass
+            attr.deleteMe()
+        except Exception:
+            futil.handle_error('PartsGen restore selectable', show_message_box=False)
+
+
 def command_preview(args: adsk.core.CommandEventArgs):
+    parent_comp = _preview_parent_comp()
+    occ_count_before = parent_comp.occurrences.count if parent_comp is not None else 0
+    try:
+        _command_preview(args)
+    finally:
+        try:
+            ghost = _offset_face_picking(args.command.commandInputs)
+            _make_preview_unselectable(parent_comp, occ_count_before,
+                                       _OFFSET_PICK_OPACITY if ghost else None)
+        except Exception:
+            futil.handle_error('PartsGen preview selectability', show_message_box=False)
+
+
+def _command_preview(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
@@ -1595,6 +1712,7 @@ def command_destroy(args: adsk.core.CommandEventArgs, handlers: list):
         return
     local_handlers = []
     _clear_ref_face_highlight()
+    _restore_preview_selectable()
     try:
         app.activeViewport.refresh()
     except Exception:

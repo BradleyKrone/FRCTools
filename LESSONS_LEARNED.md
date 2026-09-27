@@ -23,6 +23,12 @@ session.
 
 ## Lessons
 
+### Anything you set on preview geometry survives into the result when `isValidResult = True`
+Click-through preview bodies (`isSelectable = False`) of a gear pair stayed unpickable after OK, so a belt's Offset
+From couldn't select the 60T gear. **Fix:** tag each changed body with an attribute and undo the change for every
+tagged body (`design.findAttributes`) in `command_destroy`; the tags only survive on a kept preview.
+`commands/PartsGen/entry.py` (`_make_preview_unselectable`, `_restore_preview_selectable`)
+
 ### Build generated groups in the active component, not the root
 Gears/belts/chains always landed in the root even with a sub-assembly active. **Fix:** `futil.add_occurrence_in_active`
 (returns a root-context proxy; converts a world placement to the parent's frame). Anything that read `worldGeometry` of a
@@ -1788,3 +1794,11 @@ one. Ask before applying this pattern to a new command, rather than assuming a m
 strictly better. The sketch-constraining skip (previous entry) was kept, since it has no visible effect
 on the preview either way — only the *visible* hole pattern was walked back.
 `commands/PartsGen/tube_gen.py` (`_create_tube`)
+
+### Preview bodies block face picks, and the browser eye can't hide them mid-command -- set `BRepBody.isSelectable = False`
+With the belt preview up, its bodies covered the face the user wanted for Offset From, and the eye toggle is locked for preview geometry. **Fix:** at the end of `executePreview`, set `isSelectable = False` on every body of the occurrences the preview added (snapshot `occurrences.count` of the active component first), so clicks go through to the model behind. Verified the property sets on a just-built body; the live dialog itself can't be driven via MCP.
+`commands/PartsGen/entry.py` (`_make_preview_unselectable`)
+
+### Ghost a preview only while one pick is active: check `SelectionCommandInput.hasFocus` in `executePreview`
+Focusing a selection input fires no event, so the preview can't react to the click itself. **Fix:** auto-focus the pick from `inputChanged` (here: Offset From once both End Circles are in) so the preview that follows sees `hasFocus`, and ghost only while it is focused *and* empty -- the pick fires another preview that goes back to opaque. Set `Component.opacity` on the preview's new components (safe: nothing else shares them).
+`commands/PartsGen/entry.py` (`_offset_face_picking`)
