@@ -24,6 +24,7 @@ from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_select
                        OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP,
                        ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
                        ATTR_GEAR_CC_CIRCLE)
+from .hardware_gen import PART_HARDWARE, add_hardware_group, create_hardware
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -619,6 +620,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_SPROCKET, False, '')
     partTypeInp.listItems.add(PART_CHAIN,   False, '')
     partTypeInp.listItems.add(PART_GEAR,    False, '')
+    partTypeInp.listItems.add(PART_HARDWARE, False, '')
 
     # --- Component name (optional override; blank = auto-generated name) -----
     customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', '')
@@ -829,6 +831,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # --- Gear ("Gears" group) -------------------------------------------------
     _add_gear_group(inputs, False)
 
+    # --- Hardware ("Hardware" group) ------------------------------------------
+    add_hardware_group(inputs, False)
+
     futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
     futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
@@ -880,7 +885,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_sprocket = (part_type == PART_SPROCKET)
     part_is_chain    = (part_type == PART_CHAIN)
     part_is_gear     = (part_type == PART_GEAR)
-    is_custom_shaft  = (shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
+    part_is_hardware = (part_type == PART_HARDWARE)
+    is_custom_shaft  =(shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
     is_spacer_shaft  = (shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
     is_custom_hole   = (holeSizeInp.selectedItem.name  == HOLE_CUSTOM)
@@ -897,7 +903,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
     hide_length      = (part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
-                        or part_is_gear)
+                        or part_is_gear or part_is_hardware)
 
     # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
     # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
@@ -986,6 +992,16 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         gearCirclesInp.hasFocus = True
     if args.input.id == 'gear_pitch_circles':
         handle_gear_selection_changed(inputs)
+
+    # Hardware group
+    hardwareGroup = inputs.itemById('hardware_group')
+    if hardwareGroup is not None:
+        hardwareGroup.isVisible = part_is_hardware
+    hwHolesInp = inputs.itemById('hw_holes')
+    if hwHolesInp is not None:
+        hwHolesInp.setSelectionLimits(1 if part_is_hardware else 0, 0)
+        if part_is_hardware and args.input.id == 'part_type':
+            hwHolesInp.hasFocus = True
 
     # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
     # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
@@ -1146,6 +1162,8 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
             # Reports its own errors (quietly in preview) and returns False.
             if not create_gears(inputs, is_preview=is_preview):
                 return False, None
+        elif part_type == PART_HARDWARE:
+            create_hardware(inputs, is_preview=is_preview)
         else:
             _create_belt(inputs)
         return True, ref_face
@@ -1178,6 +1196,9 @@ def command_preview(args: adsk.core.CommandEventArgs):
                                 and inputs.itemById(f'tb_adapter_{i}').value for i in (1, 2)))
         if suppressTeethInp and suppressTeethInp.value and not belt_adapter:
             args.isValidResult = True
+        _clear_ref_face_highlight()
+    elif part_type == PART_HARDWARE:
+        # Nothing to preview (a cloud insert per tick); isValidResult stays False so OK builds.
         _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
         # Toothless sprockets make the preview the full result, so OK keeps it.
@@ -1289,6 +1310,12 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
             args.areInputsValid = False
             return
         args.areInputsValid = True
+        return
+
+    # --- Hardware validation ------------------------------------------------
+    if part_type == PART_HARDWARE:
+        hwHolesInp = inputs.itemById('hw_holes')
+        args.areInputsValid = hwHolesInp is not None and hwHolesInp.selectionCount >= 1
         return
 
     # --- Chain validation ---------------------------------------------------

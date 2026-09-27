@@ -23,6 +23,14 @@ session.
 
 ## Lessons
 
+### Joint a library part to a hole rim: check the seat's position + axis afterwards, not the full transform
+A planar-face (CenterKeyPoint) to hole-edge rigid joint re-clocks a round part to the edge's X axis, so a whole-matrix
+"did it move?" check read every correct joint as wrong and swapped a nested-plate bearing to the flipped (upside-down)
+one. **Fix:** after `add()` compare only the seat's world centre and true normal to the placement; retry flipped only if
+those changed. Into-the-part = minus the rim's flat neighbour face's true normal (native face, `_world_xform`). One cloud
+insert + `occurrences.addExistingComponent(comp, identity)` per extra hole: 4 bearings in ~0.9 s.
+`commands/PartsGen/hardware_gen.py` (`_moved`, `_hole_frame`, `create_hardware`)
+
 ### `importlib.reload()` of a PartsGen module silently kills its commandTerminated sync hook
 Editing a chain's C-C distance/tooth counts left the sprockets (and chain name) stale. The code was fine: `chain_gen`
 and `belt_gen` had been reloaded from an MCP test script, which re-runs `_chain_sync_registered = False` /
