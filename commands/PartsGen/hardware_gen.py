@@ -1,3 +1,6 @@
+import json
+import os
+import pathlib
 import re
 import adsk.core
 import adsk.fusion
@@ -5,6 +8,7 @@ from ...lib import fusionAddInUtils as futil
 from .shaft_gen import (BEARING_PARTS, ATTR_GROUP, BEARING_RADIUS_TOL_CM, _insert_bearing,
                         _occurrence_bodies_recursive, _circle_radii, _true_face_normal,
                         _native, _world_xform, _world_circle, _hide_joint)
+from .hardware_thumbs import ensure_thumbnails, preview_file
 
 app = adsk.core.Application.get()
 
@@ -70,6 +74,10 @@ ATTR_HARDWARE_PART   = 'hardware_part'
 ATTR_HARDWARE_FOLDER = 'hardware_folder'
 HARDWARE_FOLDER_NAME = 'Hardware'
 
+# The thumbnail grid that replaces the part dropdown (a BrowserCommandInput page).
+PICKER_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources')
+PICKER_HTML = os.path.join(PICKER_DIR, 'hardware_picker.html')
+
 
 # ===========================================================================
 # Dialog
@@ -82,6 +90,39 @@ def _fill_parts(partInp: adsk.core.DropDownCommandInput, category: str):
         partInp.listItems.add(name, i == 0, '')
 
 
+def _picker_data(inputs: adsk.core.CommandInputs) -> str:
+    """The thumbnail picker's contents (see hardware_picker.html) for the current category:
+    each part's name and thumbnail path relative to the page, and which one is selected."""
+    category = inputs.itemById('hw_category').selectedItem.name
+    parts = [dict(name=name, img=os.path.relpath(preview_file(part), PICKER_DIR).replace('\\', '/'))
+             for name, part in HARDWARE_CATEGORIES[category].items()]
+    return json.dumps(dict(parts=parts, selected=_selected_part_name(inputs)))
+
+
+def _update_picker(inputs: adsk.core.CommandInputs):
+    pickerInp = inputs.itemById('hw_picker')
+    if pickerInp is not None:
+        pickerInp.sendInfoToHTML('parts', _picker_data(inputs))
+
+
+def handle_hardware_html(args: adsk.core.HTMLEventArgs):
+    """The thumbnail picker's messages: 'ready' is answered with its contents, and 'select'
+    (a tile was clicked) selects that part in the hidden part dropdown."""
+    if args.browserCommandInput is None or args.browserCommandInput.id != 'hw_picker':
+        return
+    inputs = args.browserCommandInput.parentCommand.commandInputs
+    if args.action == 'ready':
+        args.returnData = _picker_data(inputs)
+    elif args.action == 'select':
+        partInp = inputs.itemById('hw_part')
+        for i in range(partInp.listItems.count):
+            item = partInp.listItems.item(i)
+            if item.name == args.data:
+                item.isSelected = True
+        handle_hardware_input_changed(inputs, 'hw_part')
+        args.returnData = 'OK'
+
+
 def _selected_part_name(inputs: adsk.core.CommandInputs):
     partInp = inputs.itemById('hw_part')
     item = partInp.selectedItem if partInp is not None else None
@@ -90,7 +131,9 @@ def _selected_part_name(inputs: adsk.core.CommandInputs):
 
 def add_hardware_group(inputs: adsk.core.CommandInputs, visible: bool):
     """Add the "Hardware" group: a category, which part, the hole rims to put it in, an
-    optional washer under a bolt, and a Flip."""
+    optional washer under a bolt, and a Flip. The part is picked by clicking its thumbnail
+    in a grid (hardware_picker.html); the hidden `hw_part` dropdown holds the pick."""
+    ensure_thumbnails(HARDWARE_PARTS.values())
     group = inputs.addGroupCommandInput('hardware_group', 'Hardware')
     group.isExpanded = True
     group.isVisible  = visible
@@ -104,6 +147,11 @@ def add_hardware_group(inputs: adsk.core.CommandInputs, visible: bool):
     partInp = children.addDropDownCommandInput(
         'hw_part', 'Hardware', adsk.core.DropDownStyles.TextListDropDownStyle)
     _fill_parts(partInp, categoryInp.selectedItem.name)
+    partInp.isVisible = False
+
+    # Empty name: centred, full dialog width. The page asks for its contents once loaded.
+    # A real file:/// URL -- a bare Windows path's backslashes come through as %5C.
+    children.addBrowserCommandInput('hw_picker', '', pathlib.Path(PICKER_HTML).as_uri(), 150, 300)
 
     holesInp = children.addSelectionInput(
         'hw_holes', 'Holes', 'Click the rim of each hole, on the face the flange sits on')
@@ -131,11 +179,12 @@ def add_hardware_group(inputs: adsk.core.CommandInputs, visible: bool):
 
 
 def handle_hardware_input_changed(inputs: adsk.core.CommandInputs, changed_id: str):
-    """Keep the part list in step with the category, and show "Add Washer" only for a
-    part that has one. `inputs` must be the command's top-level inputs."""
+    """Keep the part list and the thumbnail grid in step with the category, and show "Add
+    Washer" only for a part that has one. `inputs` must be the command's top-level inputs."""
     partInp = inputs.itemById('hw_part')
     if changed_id == 'hw_category' and partInp is not None:
         _fill_parts(partInp, inputs.itemById('hw_category').selectedItem.name)
+        _update_picker(inputs)
     washerInp = inputs.itemById('hw_washer')
     if washerInp is not None:
         part = HARDWARE_PARTS.get(_selected_part_name(inputs))

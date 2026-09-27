@@ -23,6 +23,16 @@ session.
 
 ## Lessons
 
+### Pictures of library parts in a dialog: `DataFile.thumbnail`, pre-scaled, no PIL
+`DataFile.thumbnail` is a `DataObjectFuture` (poll `.state` with `adsk.doEvents()`, then
+`.dataObject.saveToFile(png)`) giving a 256x256 RGBA PNG; all 12 hardware parts took ~3 s.
+`ImageCommandInput`/icons show PNGs at actual size and Fusion's Python has no PIL. **Fix:** cache per
+part, box-downscale with `futil.downscale_png` (pure zlib). For a *clickable* thumbnail grid (ButtonRow
+icons are too small) use `addBrowserCommandInput` + `command.incomingFromHTML`: page sends 'ready', is
+answered via `args.returnData`; later updates go by `browserInput.sendInfoToHTML`. Pass the page as
+`pathlib.Path(p).as_uri()` -- a bare Windows path's backslashes arrive as `%5C` ("site can't be reached").
+`commands/PartsGen/hardware_thumbs.py`, `commands/PartsGen/resources/hardware_picker.html`
+
 ### Origin-modelled library parts (bolts, washers): joint the component origin, no face-finding
 The Bolt and Washers files have their origin on the seat, +Z away from the face, bodies in one sub-occurrence (read
 geometry via the proxy occurrence tree, not `component.bRepBodies`). **Fix:** `setWithCoordinateSystem(center, x, y,

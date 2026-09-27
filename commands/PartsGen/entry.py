@@ -25,7 +25,7 @@ from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_select
                        ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
                        ATTR_GEAR_CC_CIRCLE)
 from .hardware_gen import (PART_HARDWARE, add_hardware_group, create_hardware,
-                           handle_hardware_input_changed)
+                           handle_hardware_input_changed, handle_hardware_html)
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -840,6 +840,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy,        command_destroy,        local_handlers=local_handlers)
+    futil.add_handler(args.command.incomingFromHTML, handle_hardware_html, local_handlers=local_handlers)
 
 
 # ===========================================================================

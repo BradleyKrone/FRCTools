@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<!-- Parts Gen > Hardware thumbnail picker, shown in the dialog by a BrowserCommandInput.
+     Fusion -> page: action 'parts', data {parts: [{name, img}], selected} (also the reply to 'ready').
+     Page -> Fusion: 'ready' once loaded, 'select' with the clicked part's name. -->
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow-x: hidden;
+               font: 11px "Segoe UI", Arial, sans-serif; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+          gap: 6px; padding: 4px; }
+  .tile { display: flex; flex-direction: column; align-items: center; gap: 2px;
+          padding: 4px 2px 5px; background: #fff; color: #222; border: 2px solid #d0d0d0;
+          border-radius: 6px; cursor: pointer; user-select: none; }
+  .tile:hover { border-color: #8ab4e8; }
+  .tile.selected { border-color: #0696d7; background: #e6f4fb; }
+  .tile img { width: 72px; height: 72px; object-fit: contain; pointer-events: none; }
+  .tile span { text-align: center; line-height: 1.2; }
+</style>
+</head>
+<body>
+<div id="grid"></div>
+<script>
+  function render(json) {
+    var info = typeof json === 'string' ? JSON.parse(json) : json;
+    var grid = document.getElementById('grid');
+    grid.innerHTML = '';
+    info.parts.forEach(function (p) {
+      var tile = document.createElement('div');
+      tile.className = 'tile' + (p.name === info.selected ? ' selected' : '');
+      tile.title = p.name;
+      var img = document.createElement('img');
+      img.src = p.img;
+      var label = document.createElement('span');
+      label.textContent = p.name;
+      tile.appendChild(img);
+      tile.appendChild(label);
+      tile.onclick = function () {
+        document.querySelectorAll('.tile.selected').forEach(function (t) {
+          t.classList.remove('selected');
+        });
+        tile.classList.add('selected');
+        adsk.fusionSendData('select', p.name);
+      };
+      grid.appendChild(tile);
+    });
+  }
+
+  window.fusionJavaScriptHandler = {
+    handle: function (action, data) {
+      try {
+        if (action === 'parts') render(data);
+      } catch (e) {
+        return 'ERROR: ' + e;
+      }
+      return 'OK';
+    }
+  };
+
+  // Fusion injects `adsk` after load; the reply to 'ready' is a string (old browser) or a
+  // Promise of one (new browser).
+  function sayReady() {
+    if (!window.adsk || !adsk.fusionSendData) { setTimeout(sayReady, 50); return; }
+    Promise.resolve(adsk.fusionSendData('ready', '')).then(function (reply) {
+      if (reply) render(reply);
+    });
+  }
+  window.addEventListener('load', sayReady);
+</script>
+</body>
+</html>
