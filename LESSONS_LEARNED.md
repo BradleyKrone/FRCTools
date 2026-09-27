@@ -23,6 +23,33 @@ session.
 
 ## Lessons
 
+### Origin-modelled library parts (bolts, washers): joint the component origin, no face-finding
+The Bolt and Washers files have their origin on the seat, +Z away from the face, bodies in one sub-occurrence (read
+geometry via the proxy occurrence tree, not `component.bRepBodies`). **Fix:** `setWithCoordinateSystem(center, x, y,
+out)` on `transform2`, then a rigid joint of `createByPoint(comp.originConstructionPoint.createForAssemblyContext(occ))`
+to the rim; check origin + Z afterwards, retry flipped. A bolt-on-washer joint lands in the Hardware folder's `joints`.
+A Z offset goes in `JointInput.offset` on a pre-offset placement; try both offset signs x both flips (`_rigid_joint`).
+`commands/PartsGen/hardware_gen.py` (`_joint_origin`, `_washer_top_rim`)
+
+### MCP test scripts DO persist in the user's open design -- clean up with `deleteAllAfterMarker`
+Test plates and parts from `fusion_mcp_execute` runs were all still in the timeline on the next call (this contradicts
+an older entry below). **Fix:** before testing, note `timeline.count`. Afterwards, check each item past that count is
+yours, then set `markerPosition` to it and call `deleteAllAfterMarker()`. Parts go into the *active* component's
+Hardware folder.
+
+### Library parts are found by lineage URN, which survives moving the file between folders
+Reorganising Parts_Gen into subfolders didn't break any insert, only the paths quoted in error text.
+**Fix:** keep a `folder` key per part dict for messages; get the real path live by walking
+`app.data.findFileById(urn).parentFolder` up (the project's root folder carries the project's name).
+`commands/PartsGen/shaft_gen.py` (`PARTS_GEN_PATH`, `_insert_bearing`)
+
+### A "folder" component per sub-assembly: component names are design-unique, so find it by attribute
+Filing hardware in a `Hardware` component inside the active component: the second one Fusion silently named
+`Hardware (1)`. **Fix:** tag it with an attribute and look it up by that (name match only as a fallback).
+`design.activeOccurrence` is already a root-context proxy -- build under it and pass
+`folder.createForAssemblyContext(active)` down; seating/joints in a rotated sub-assembly then work unchanged.
+`commands/PartsGen/hardware_gen.py` (`_hardware_folder`)
+
 ### Joint a library part to a hole rim: check the seat's position + axis afterwards, not the full transform
 A planar-face (CenterKeyPoint) to hole-edge rigid joint re-clocks a round part to the edge's X axis, so a whole-matrix
 "did it move?" check read every correct joint as wrong and swapped a nested-plate bearing to the flipped (upside-down)
@@ -1303,7 +1330,7 @@ before trusting an environment-level theory — it's a five-minute check that ru
 of wrong turns.
 `commands/JointInspector/entry.py`
 
-### Fusion MCP `fusion_mcp_execute` script mutations don't persist across separate calls
+### SUPERSEDED (they DID persist on 2026-09-27, see top) -- Fusion MCP `fusion_mcp_execute` script mutations don't persist across separate calls
 Building a test assembly in one `fusion_mcp_execute` script call, then reading it back in a
 following call, consistently showed 0 occurrences/joints even though the first call's own prints
 showed the objects existed and worked. **Fix:** each script execution appears to run in its own

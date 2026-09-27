@@ -24,7 +24,8 @@ from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_select
                        OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP,
                        ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
                        ATTR_GEAR_CC_CIRCLE)
-from .hardware_gen import PART_HARDWARE, add_hardware_group, create_hardware
+from .hardware_gen import (PART_HARDWARE, add_hardware_group, create_hardware,
+                           handle_hardware_input_changed)
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -997,6 +998,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     hardwareGroup = inputs.itemById('hardware_group')
     if hardwareGroup is not None:
         hardwareGroup.isVisible = part_is_hardware
+    if part_is_hardware and args.input.id in ('part_type', 'hw_category', 'hw_part'):
+        handle_hardware_input_changed(inputs, args.input.id)
     hwHolesInp = inputs.itemById('hw_holes')
     if hwHolesInp is not None:
         hwHolesInp.setSelectionLimits(1 if part_is_hardware else 0, 0)

@@ -98,9 +98,9 @@ SPLINEXS_ROOT_CENTER_R_CM   = 0.1552 * 2.54  # space's bottom arc: centre distan
 SPLINEXS_ROOT_RADIUS_CM     = 0.0105 * 2.54  # ... and radius
 
 # Optional 3D-printed hub adapter pressed into the pulley's bottom flange, one per bore
-# type, inserted as a linked component from Team 1756's library (Argos CAD > Parts_1 >
-# Parts_Gen) the same way shaft_gen inserts bearings. The pulley is pocketed with a
-# Combine Cut (Keep Tools) so the adapter's shape is cut out of it and the adapter stays.
+# type, inserted as a linked component from Team 1756's library (Argos CAD > 1 Parts >
+# Standard Parts > Parts_Gen > 3D Print) the same way shaft_gen inserts bearings. The
+# pulley is pocketed with a Combine Cut (Keep Tools) so the adapter's shape is cut out of it and the adapter stays.
 #   radius_cm -- the adapter's outer radius (measured live), to refuse pulleys too small
 #   clock_deg -- turn about Z that lines the adapter's bore up with the pulley's: the hex
 #                adapter's corners already sit at 30 deg + 60k like _draw_hex_bore's; the
@@ -108,10 +108,10 @@ SPLINEXS_ROOT_RADIUS_CM     = 0.0105 * 2.54  # ... and radius
 #                tooth) puts one on +Y like _draw_splinexs_bore's.
 ADAPTER_PARTS = {
     BORE_HALF_HEX: dict(urn='urn:adsk.wipprod:dm.lineage:GwLsJoJcQ3Gm1N-zSSlrsQ',
-                        file='Hex_3d_print_adapter_WCP-1121',
+                        file='Hex_3d_print_adapter_WCP-1121', folder='3D Print',
                         radius_cm=0.5 * 2.54, clock_deg=0.0),
     BORE_SPLINEXS: dict(urn='urn:adsk.wipprod:dm.lineage:3-SH0GSKSUenPJK5KGzDMw',
-                        file='SplineXS_3d_print_adapter_WCP-1021',
+                        file='SplineXS_3d_print_adapter_WCP-1021', folder='3D Print',
                         radius_cm=0.7754, clock_deg=12.0),
 }
 # Pulley material left between the adapter and the bottom of the tooth spaces.

@@ -110,25 +110,29 @@ ATTR_FACE2_TOKEN     = 'shaft_face2_token'
 
 # Optional bearing/bushing on both of the shaft's ends, picked from the "Add Bearing"
 # dropdown. Each part is inserted as a linked component from Team 1756's own library files
-# (Argos CAD > Parts_1 > Parts_Gen), never redrawn. A lineage URN (no ?version=) always
-# resolves to the latest version. entry.py builds its dropdown straight from this table.
+# (Argos CAD > 1 Parts > Standard Parts > Parts_Gen > Bearing), never redrawn. A lineage
+# URN (no ?version=) always resolves to the latest version, and survives the file being
+# moved between folders.
+# entry.py builds its dropdown straight from this table.
+#   folder    -- the file's subfolder under PARTS_GEN_PATH (only used in error messages)
 #   shaft     -- the shaft type the part fits (it's only offered for that type)
 #   flange_cm -- axial distance from the flange's seat (the face that sits against the
 #                plate) to its outer face -- how far the shaft end sticks out past the
 #                plate. Measured live off each file.
+PARTS_GEN_PATH = 'Argos CAD > 1 Parts > Standard Parts > Parts_Gen'
 BEARING_NONE = 'None'
 BEARING_PARTS = {
     'Bearing (WCP-0785)': dict(urn='urn:adsk.wipprod:dm.lineage:d9ZIwsI6QNWLT3Khg8p3Dw',
-                               file='Hex_Bearing_WCP-0785',
+                               file='Hex_Bearing_WCP-0785', folder='Bearing',
                                shaft=SHAFT_HALF_HEX, flange_cm=0.1587),
     'Bushing (WCP-0999)': dict(urn='urn:adsk.wipprod:dm.lineage:LPU6SMqwSF-tge9jFnPPTA',
-                               file='Hex_Bushing_WCP-0999',
+                               file='Hex_Bushing_WCP-0999', folder='Bearing',
                                shaft=SHAFT_HALF_HEX, flange_cm=0.1588),
     'Bearing (WCP-0784)': dict(urn='urn:adsk.wipprod:dm.lineage:Qh1CTEEoS4CFexctUFifMQ',
-                               file='Hex_3_8_WCP-0784',
+                               file='Hex_3_8_WCP-0784', folder='Bearing',
                                shaft=SHAFT_THREE_EIGHTH_HEX, flange_cm=0.1587),
     'Bearing (TTB-0065)': dict(urn='urn:adsk.wipprod:dm.lineage:ySAXuVQ8QHK9p0QCAX94cw',
-                               file='MaxSpline_Bearing_TTB-0065',
+                               file='MaxSpline_Bearing_TTB-0065', folder='Bearing',
                                shaft=SHAFT_MAXSPLINE, flange_cm=0.15),
 }
 # Values the dropdown stored before it picked a part (it picked which ends instead, and
@@ -1037,9 +1041,9 @@ def _insert_bearing(parentOcc: adsk.fusion.Occurrence, part: dict,
     so joints and faces work exactly as for a root-level insert -- else into the root."""
     data_file = app.data.findFileById(part['urn'])
     if data_file is None:
+        location = ' > '.join(p for p in (PARTS_GEN_PATH, part.get('folder'), part['file']) if p)
         futil.popup_error(
-            f'Parts Gen: could not find the {part["file"]} file '
-            f'(Argos CAD > Parts_1 > Parts_Gen > {part["file"]}).\n\n'
+            f'Parts Gen: could not find the {part["file"]} file ({location}).\n\n'
             f'{missing_note}')
         return None
     design = adsk.fusion.Design.cast(app.activeProduct)
