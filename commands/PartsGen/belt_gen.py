@@ -9,6 +9,7 @@ import adsk.core
 import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
+from ... import config
 from ..CCDistance.CCLine import getCCLineFromEntity
 from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, update_pulley_teeth,
                           _belt_width_mm, _tooth_length_cm,
@@ -747,20 +748,21 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         offsetInput = geoConstraints.createOffsetInput(curves, half_belt_thickness)
         geoConstraints.addTwoSidesOffset(offsetInput, True)
 
-        futil.log(f'Belt offset created {sketch.profiles.count} profiles')
-        if sketch.profiles.count < 2:
+        profile_areas = _profile_areas(sketch)
+        futil.log(f'Belt offset created {len(profile_areas)} profiles')
+        if len(profile_areas) < 2:
             futil.popup_error('Parts Gen: belt offset profiles not created correctly.')
             workingOcc.deleteMe()
             return
 
-        # Find the annular belt profile (neither the smallest nor the largest area)
-        maxArea = max(sketch.profiles.item(i).areaProperties().area for i in range(sketch.profiles.count))
-        insideLoop = None
-        for i in range(sketch.profiles.count):
-            profile = sketch.profiles.item(i)
-            if profile.areaProperties().area == maxArea:
-                insideLoop = profile.profileLoops.item(0)
-                break
+        # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
+        # Returns before the tooth-profile sketch, which only the tooth pattern uses.
+        if is_preview and not (suppressTeethInp and suppressTeethInp.value):
+            extrudeBeltPreview(sketch, pathCurves, belt_width_cm, profile_areas)
+            return
+
+        # The largest profile is the region inside the belt; its loop is the belt's inner face
+        insideLoop = max(profile_areas, key=lambda pa: pa[1])[0].profileLoops.item(0)
 
         if insideLoop is None:
             futil.popup_error('Parts Gen: could not find belt inside loop.')
@@ -780,11 +782,6 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
         angleDim.value = 0.1
         angleDim.deleteMe()
         geoConstraints.addCollinear(baseLine, lineCurve)
-
-        # Non-final preview (suppress_teeth is off): just show the shell; execute will finalize.
-        if is_preview and not (suppressTeethInp and suppressTeethInp.value):
-            extrudeBeltPreview(sketch, pathCurves, belt_width_cm)
-            return
 
         # Final creation: suppress_teeth uses preview extrude (no patterning); otherwise full belt.
         if suppressTeethInp and suppressTeethInp.value:
@@ -865,27 +862,40 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 # Belt extrude helpers
 # ---------------------------------------------------------------------------
 
+def _profile_areas(sketch: adsk.fusion.Sketch) -> list:
+    """(profile, area) for every profile in the sketch -- areaProperties() is slow, so the
+    belt helpers compute it once per profile and reuse it."""
+    profiles = sketch.profiles
+    result = []
+    for i in range(profiles.count):
+        profile = profiles.item(i)
+        result.append((profile, profile.areaProperties().area))
+    return result
+
+
 def extrudeBeltPreview(sketch: adsk.fusion.Sketch,
                        path: adsk.core.ObjectCollection,
-                       beltWidth: float):
-    """Extrude only the belt shell (no tooth patterning) for live preview."""
-    workingComp = sketch.parentComponent
+                       beltWidth: float,
+                       profile_areas: list = None):
+    """Extrude only the belt shell (no tooth patterning) for live preview.
 
-    maxArea = 0
-    minArea = 9999999
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if a > maxArea:
-            maxArea = a
-        if a < minArea:
-            minArea = a
+    `profile_areas` is _profile_areas(sketch) when the caller already has it (it must be
+    current -- drawing the tooth profile afterwards changes the profiles)."""
+    workingComp = sketch.parentComponent
+    if profile_areas is None:
+        profile_areas = _profile_areas(sketch)
 
     beltLoop = None
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if minArea < a < maxArea:
-            beltLoop = sketch.profiles.item(i)
-            break
+    if len(profile_areas) >= 3:
+        # Neither the smallest (the tooth) nor the largest (inside the belt) area
+        areas   = [a for _, a in profile_areas]
+        maxArea = max(areas)
+        minArea = min(areas)
+        beltLoop = next((p for p, a in profile_areas if minArea < a < maxArea), None)
+    else:
+        # No tooth profile yet (the teeth-on preview): the belt shell is the ring between
+        # the two offset loops -- the only profile with two loops.
+        beltLoop = next((p for p, _ in profile_areas if p.profileLoops.count == 2), None)
 
     if beltLoop is None:
         return
@@ -903,20 +913,14 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     """Extrude the belt shell and then path-pattern the tooth profile."""
     workingComp = sketch.parentComponent
 
-    maxArea = 0
-    minArea = 9999999
-    for i in range(sketch.profiles.count):
-        a = sketch.profiles.item(i).areaProperties().area
-        if a > maxArea:
-            maxArea = a
-        if a < minArea:
-            minArea = a
+    profile_areas = _profile_areas(sketch)
+    areas   = [a for _, a in profile_areas]
+    maxArea = max(areas, default=0)
+    minArea = min(areas, default=9999999)
 
     beltLoop    = None
     profileLoop = None
-    for i in range(sketch.profiles.count):
-        profile = sketch.profiles.item(i)
-        a = profile.areaProperties().area
+    for profile, a in profile_areas:
         if minArea < a < maxArea:
             beltLoop = profile
         elif a < maxArea:
@@ -937,8 +941,12 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     patternCol    = adsk.core.ObjectCollection.create()
     patternCol.add(extrudeToothFeat)
 
-    futil.print_SketchObjectCollection(path)
-    patternPath   = adsk.fusion.Path.create(path, adsk.fusion.ChainedCurveOptions.noChainedCurves)
+    if config.DEBUG:    # the dumper makes its API calls even when log() drops the output
+        futil.print_SketchObjectCollection(path)
+    # Not Path.create: the belt sketch's curves are native to the belt sub-component, and
+    # Path.create resolves them from the root and throws InternalValidationError
+    # (Utils::getObjectPath). The component's own createPath takes them as they are.
+    patternPath   = workingComp.features.createPath(path, False)   # False = no chaining
     toothPatInput = pathPatterns.createInput(
         patternCol, patternPath, toothCountVI, beltPitch,
         adsk.fusion.PatternDistanceType.SpacingPatternDistanceType,
@@ -1042,7 +1050,8 @@ def findToothAnchor(insideLoop: adsk.fusion.ProfileLoop):
 
     for i in range(insideLoop.profileCurves.count):
         curve = insideLoop.profileCurves.item(i).sketchEntity
-        futil.print_SketchCurve(curve)
+        if config.DEBUG:
+            futil.print_SketchCurve(curve)
         if curve.objectType == adsk.fusion.SketchLine.classType():
             curve: adsk.fusion.SketchLine = curve
             insideNormal = futil.sketchLineNormal(curve, centroid)

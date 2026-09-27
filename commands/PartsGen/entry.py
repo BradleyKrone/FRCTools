@@ -35,6 +35,7 @@ _edit_ref_entities     = None   # (ref_point, face2) recovered from the edited s
                                 # called from commandCreated.
 _edit_belt_entities    = None   # (C-C circle 1, C-C circle 2, offset face) for a belt, same idea
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
+_belt_live_preview     = True   # the Timing Belt's "Live Preview" checkbox, kept between dialogs
 
 # ---------------------------------------------------------------------------
 # Reference-face highlight (Shaft/Tube preview) -- see command_preview /
@@ -330,17 +331,26 @@ def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
                      bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
                      bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
                      adapters=(False, False),
-                     offset_expr: str = '0 in',
-                     offset_flange: str = OFFSET_FLANGE_BOTTOM):
+                     offset_expr: str = '0.251 in',
+                     offset_flange: str = OFFSET_FLANGE_BOTTOM,
+                     live_preview: bool = None):
     """Add the Timing Belt's "Belt", "Pulleys", "Pulley 1" and "Pulley 2" groups (shared
     by the create and edit dialogs). The one Width dropdown sizes both the belt and its
     generated pulleys, and the pulley options mirror the Timing Pulley part's, with Bore
     and 3D Print Adapter chosen per pulley. command_input_changed shows the groups only
-    for Timing Belt, and the pulley options only with Generate Pulleys on."""
+    for Timing Belt, and the pulley options only with Generate Pulleys on.
+    `live_preview` adds the Live Preview checkbox (None = no checkbox: the edit dialog
+    has no preview)."""
     beltGroup = inputs.addGroupCommandInput('belt_group', 'Belt')
     beltGroup.isExpanded = True
     beltGroup.isVisible  = visible
     beltInputs = beltGroup.children
+
+    if live_preview is not None:
+        livePreviewInp = beltInputs.addBoolValueInput('tb_live_preview', 'Live Preview', True,
+                                                      '', live_preview)
+        livePreviewInp.tooltip = ('Off: nothing is built while you edit -- the belt and its '
+                                  'pulleys are built once on OK. Faster in big assemblies.')
 
     tbCirclesInp = beltInputs.addSelectionInput(
         'tb_pitch_circles', 'End Circles', 'Select a C-C Line or two pitch circles'
@@ -631,7 +641,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     _add_pulley_bore_inputs(partInputs, BORE_HALF_HEX, f'{BORE_OFFSET_DEFAULT_IN} in', False)
 
     # --- Timing Belt ("Belt" and "Pulleys" groups) ----------------------------
-    _add_belt_groups(inputs, False)
+    _add_belt_groups(inputs, False, live_preview=_belt_live_preview)
 
     # --- Chain Sprocket group ------------------------------------------------
     sprocketToothCountInp = partInputs.addValueInput(
@@ -930,6 +940,11 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             and refPointSel.selectionCount >= 1):
         face2Sel.hasFocus = True
 
+    # Remember the belt's Live Preview choice for the next time the dialog opens
+    if args.input.id == 'tb_live_preview':
+        global _belt_live_preview
+        _belt_live_preview = args.input.value
+
     # CCLine detection for Timing Belt circles
     if args.input.id == 'tb_pitch_circles':
         handle_belt_selection_changed(inputs)
@@ -989,6 +1004,11 @@ def command_preview(args: adsk.core.CommandEventArgs):
     partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
     part_type = partTypeInp.selectedItem.name
     if part_type == PART_BELT:
+        # Live Preview off: build nothing. isValidResult stays False, so OK runs the full build.
+        livePreviewInp = inputs.itemById('tb_live_preview')
+        if livePreviewInp is not None and not livePreviewInp.value:
+            _clear_ref_face_highlight()
+            return
         _create_belt(inputs, is_preview=True)
         # A toothless-belt preview is the full result -- unless its pulleys need 3D print
         # adapters, which the preview skips (a cloud insert per tick).

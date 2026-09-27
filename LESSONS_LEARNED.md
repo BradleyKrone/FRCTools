@@ -23,6 +23,27 @@ session.
 
 ## Lessons
 
+### `Path.create` fails on a sub-component's native sketch curves -- use `comp.features.createPath`
+Belt teeth pattern: `adsk.fusion.Path.create(curves, noChainedCurves)` on the belt sketch's curves (native to the new
+belt component, no assembly context) threw `InternalValidationError : Utils::getObjectPath`, so no toothed belt was
+ever built. **Fix:** `workingComp.features.createPath(curves, False)` (the component that owns the feature), or proxies
+via `curve.createForAssemblyContext(occ)`. `root.features.createPath` fails the same way.
+`commands/PartsGen/belt_gen.py` (`extrudeBelt`)
+
+### `futil.print_*` dumpers make their API calls even with `DEBUG` off
+They build their f-strings (geometry, `isFullyConstrained`, ...) before `log()` drops them -- dozens of COM calls
+per preview tick. **Fix:** guard them with `if config.DEBUG:` on preview paths. For a generator too heavy to rebuild on
+every click, add an opt-out "Live Preview" checkbox (off = preview returns early and `isValidResult` stays False), not a
+preview that quietly hides detail (see the tube-holes entry). Belt teeth-on preview: ~360 -> ~210 ms.
+`commands/PartsGen/belt_gen.py`, `commands/PartsGen/entry.py` (`command_preview`, `tb_live_preview`)
+
+### Test scripts: use the `__main__...FRCTools_py` modules, and have results written to a file
+`sys.modules` holds stale copies of the add-in from past test sessions (`frcj.`, `frctest.`, `frcbelt.` ...), and
+the MCP `script` tool can return an old traceback instead of this run's output. **Fix:** pick the key that starts
+with `__main__` and ends with the module name; exec the file on disk into a new module to compare against the
+old one; write results to a scratchpad file and read that. Don't `doc.close()` from a script -- one such close
+timed out and Fusion crashed right after; leave scratch docs open for the user to close.
+
 ### `JointGeometry.primaryAxisVector` is component-native even 1 level deep -- check a joint's result, not its frames
 Belt pulleys' C-C joints: for a C-C sketch in a component turned upside down, both geometries reported +Z (world was
 -Z), so an offset sign taken from them sent the belt 4.45 cm the wrong way. **Fix:** add the joint, then measure the
