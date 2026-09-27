@@ -23,6 +23,21 @@ session.
 
 ## Lessons
 
+### `JointGeometry.primaryAxisVector` is component-native even 1 level deep -- check a joint's result, not its frames
+Belt pulleys' C-C joints: for a C-C sketch in a component turned upside down, both geometries reported +Z (world was
+-Z), so an offset sign taken from them sent the belt 4.45 cm the wrong way. **Fix:** add the joint, then measure the
+moved part (orientation kept? displacement along its normal = +offset?); if the offset went the wrong way,
+`joint.offset.value = -joint.offset.value` works right after `add()` (unlike `isFlipped`). Redundant joints
+(revolute + belt-internal revolutes + cylindrical on the other pulley) solve healthy.
+`commands/PartsGen/belt_gen.py` (`_add_cc_joint`)
+
+### A `commandTerminated` sync hook fires for every dimension edit *inside* a sketch -- skip it while a sketch is open
+Editing a pulley's diameter in a C-C sketch hung Fusion: each in-sketch dimension edit ended a command, and the belt
+hook rebuilt the belt and `rollTo`'d the timeline for each pulley with the sketch still open (the doc showed 30T *and*
+36T label groups from one session). **Fix:** return early while `Sketch.cast(design.activeEditObject)` is set (the
+sync then runs once, on Finish Sketch), on cancelled commands, and on re-entry (module flag in `try/finally`).
+`commands/PartsGen/belt_gen.py` (`should_run_part_sync`), `commands/PartsGen/chain_gen.py`
+
 ### Regenerating a part by delete + rebuild kills every joint the user made to it -- edit its features in place
 Edit C-C's tooth-count change deleted the belt pulley's group and rebuilt it; the user's joints to its flange faces
 went with it. **Fix:** keep the occurrences and features and edit them. The traps, all hit live:

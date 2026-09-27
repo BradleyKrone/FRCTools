@@ -64,6 +64,16 @@ def _belt_width_mm(beltWidthInp: adsk.core.DropDownCommandInput) -> int:
         return PULLEY_BELT_WIDTHS_MM[0]
     return PULLEY_BELT_WIDTHS_MM[beltWidthInp.selectedItem.index]
 
+
+# Axial length of the toothed section for each belt width -- a little longer than the
+# belt so it has room to track.
+PULLEY_TOOTH_LENGTH_CM = {9: 0.405 * 2.54, 15: 0.75 * 2.54}
+
+
+def _tooth_length_cm(width_mm: int) -> float:
+    """Toothed-section length in cm for a belt width in mm (falls back to the belt width)."""
+    return PULLEY_TOOTH_LENGTH_CM.get(width_mm, width_mm / 10.0)
+
 # ---------------------------------------------------------------------------
 # Flange dimensions (Fusion 360 uses centimetres internally)
 # ---------------------------------------------------------------------------
@@ -149,12 +159,12 @@ def _offset_xy_plane(comp: adsk.fusion.Component, z_cm: float) -> adsk.fusion.Co
     return comp.constructionPlanes.add(plane_input)
 
 
-def _add_flanges(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm: float):
+def _add_flanges(comp: adsk.fusion.Component, tooth_len_cm: float, tooth_od_cm: float):
     """Extrude a flange disk on each side of the pulley body.
 
     Flange OD = tooth_od_cm + FLANGE_OD_OFFSET_CM (0.196 in larger than tooth OD).
     Bottom flange: from Z=0 downward by FLANGE_THICKNESS_CM.
-    Top flange:    from Z=belt_width_cm upward by FLANGE_THICKNESS_CM.
+    Top flange:    from Z=tooth_len_cm upward by FLANGE_THICKNESS_CM.
     Both come from one fully-constrained circle on the XY plane (the top one with an
     offset start) and are joined to the pulley body only.
     """
@@ -168,7 +178,7 @@ def _add_flanges(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm:
 
     for start_cm, direction in (
             (0.0,           adsk.fusion.ExtentDirections.NegativeExtentDirection),
-            (belt_width_cm, adsk.fusion.ExtentDirections.PositiveExtentDirection)):
+            (tooth_len_cm, adsk.fusion.ExtentDirections.PositiveExtentDirection)):
         ext_in = extrudes.createInput(profile, adsk.fusion.FeatureOperations.JoinFeatureOperation)
         ext_in.setOneSideExtent(thickness, direction)
         if start_cm:
@@ -180,7 +190,7 @@ def _add_flanges(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm:
 
 def _add_pulley_body(comp: adsk.fusion.Component, sketch: adsk.fusion.Sketch,
                      belt_pitch_mm: int, n_teeth: int, show_teeth: bool,
-                     belt_width_cm: float, is_preview: bool = False):
+                     tooth_len_cm: float, is_preview: bool = False):
     """Draw the tooth profile (or, without teeth, a smooth circle at the tooth OD) in
     `sketch` and extrude it into the pulley's body.
 
@@ -203,7 +213,7 @@ def _add_pulley_body(comp: adsk.fusion.Component, sketch: adsk.fusion.Sketch,
         tooth_od_cm = _outer_diameter_cm(belt_pitch_mm, n_teeth)
         joint_curve = _draw_circle(sketch, adsk.core.Point3D.create(0, 0, 0), tooth_od_cm)
     comp.features.extrudeFeatures.addSimple(
-        sketch.profiles.item(0), adsk.core.ValueInput.createByReal(belt_width_cm),
+        sketch.profiles.item(0), adsk.core.ValueInput.createByReal(tooth_len_cm),
         adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
     return tooth_od_cm, joint_curve
 
@@ -324,7 +334,7 @@ def _draw_splinexs_bore(sk: adsk.fusion.Sketch, offset_cm: float):
         sk.isComputeDeferred = False
 
 
-def _add_bore(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm: float,
+def _add_bore(comp: adsk.fusion.Component, tooth_len_cm: float, tooth_od_cm: float,
               bore_type: str = BORE_HALF_HEX,
               offset_cm: float = BORE_OFFSET_DEFAULT_IN * 2.54, is_preview: bool = False):
     """Cut the centre bore (1/2in hex or WCP SplineXS, grown by `offset_cm` on every side)
@@ -352,7 +362,7 @@ def _add_bore(comp: adsk.fusion.Component, belt_width_cm: float, tooth_od_cm: fl
     # Cut through bottom flange + belt body + top flange
     # participantBodies: a cut otherwise also goes through any other body it overlaps —
     # e.g. a shaft or another pulley sitting at the origin while this one is built.
-    total_cm = 2 * FLANGE_THICKNESS_CM + belt_width_cm
+    total_cm = 2 * FLANGE_THICKNESS_CM + tooth_len_cm
     extrudes = comp.features.extrudeFeatures
     ext_in   = extrudes.createInput(sk.profiles.item(0),
                                     adsk.fusion.FeatureOperations.CutFeatureOperation)
@@ -441,7 +451,7 @@ def _engrave_label_face(comp: adsk.fusion.Component, label: str,
               f'engraved on the {face} face.', is_preview)
 
 
-def _add_label(comp: adsk.fusion.Component, belt_width_cm: float, n_teeth: int,
+def _add_label(comp: adsk.fusion.Component, tooth_len_cm: float, n_teeth: int,
                tooth_od_cm: float, bore_radius_cm: float,
                bottom_plane: adsk.fusion.ConstructionPlane = None, is_preview: bool = False):
     """Engrave tooth count on both flange faces (e.g. \"18T\"), out near the flange edge.
@@ -468,7 +478,7 @@ def _add_label(comp: adsk.fusion.Component, belt_width_cm: float, n_teeth: int,
             bottom_plane = _offset_xy_plane(comp, -FLANGE_THICKNESS_CM)
         _engrave_label_face(
             comp, label,
-            plane         = _offset_xy_plane(comp, belt_width_cm + FLANGE_THICKNESS_CM),
+            plane         = _offset_xy_plane(comp, tooth_len_cm + FLANGE_THICKNESS_CM),
             cut_direction = adsk.fusion.ExtentDirections.NegativeExtentDirection,
             mirror        = False,
             y_bot         = y_bot,
@@ -696,7 +706,7 @@ def update_pulley_teeth(pulley_occ: adsk.fusion.Occurrence, n_teeth: int,
 
     belt_pitch_mm  = 5 if '5mm' in _attr(ATTR_PULLEY_BELT_TYPE, BELT_HTD) else 3
     width_mm       = int(_attr(ATTR_PULLEY_BELT_WIDTH, '9 mm').split()[0])
-    belt_width_cm  = width_mm / 10.0
+    tooth_len_cm   = _tooth_length_cm(width_mm)
     show_teeth     = _attr(ATTR_PULLEY_SHOW_TEETH, 'False').lower() == 'true'
     bore_type      = _attr(ATTR_PULLEY_BORE_TYPE, BORE_HALF_HEX)
     offset_expr    = _attr(ATTR_PULLEY_BORE_OFFSET)
@@ -830,7 +840,7 @@ def update_pulley_teeth(pulley_occ: adsk.fusion.Occurrence, n_teeth: int,
         # The new label lands at the end of the timeline (the other edits stay inside
         # the pulley's own group), so group just those items.
         label_start = timeline.markerPosition
-        _add_label(comp, belt_width_cm, n_teeth, tooth_od_cm, label_floor_cm, bot_plane)
+        _add_label(comp, tooth_len_cm, n_teeth, tooth_od_cm, label_floor_cm, bot_plane)
         _log_unconstrained(comp)
         # A first build hides each sketch as a feature consumes it; the swapped-in tooth
         # sketch and the re-engraved label's sketches stay visible, so hide them all.
@@ -860,7 +870,9 @@ def update_pulley_teeth(pulley_occ: adsk.fusion.Occurrence, n_teeth: int,
             # with the same base name, so their joints are "X_revolute" and "X_revolute (1)".
             for owner in owners:
                 for joint in owner.joints:
-                    suffix = next((s for s in ('_revolute', '_adapter')
+                    # Longest first: '_cc_revolute' also contains '_revolute'.
+                    suffix = next((s for s in ('_cc_revolute', '_cc_cylindrical',
+                                               '_revolute', '_adapter')
                                    if s in joint.name), None)
                     occs = (joint.occurrenceOne, joint.occurrenceTwo)
                     if suffix and any(o is not None and o.component == comp for o in occs):
@@ -890,7 +902,7 @@ def _create_pulley(inputs: adsk.core.CommandInputs, is_preview: bool = False):
     showTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
 
     width_mm       = _belt_width_mm(beltWidth)
-    belt_width_cm  = width_mm / 10.0
+    tooth_len_cm   = _tooth_length_cm(width_mm)
 
     show_teeth = showTeethInp.value if showTeethInp is not None else False
 
@@ -965,20 +977,20 @@ def _create_pulley(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
         sketch = workingComp.sketches.add(rootComp.xYConstructionPlane, workingOcc)
         body = _add_pulley_body(workingComp, sketch, belt_pitch, n_teeth, show_teeth,
-                                belt_width_cm, is_preview)
+                                tooth_len_cm, is_preview)
         if body is None:
             outerOcc.deleteMe()
             return False
         outer_diameter_cm = body[0]
 
-        _add_flanges(workingComp, belt_width_cm, outer_diameter_cm)
-        bot_plane = _add_bore(workingComp, belt_width_cm, outer_diameter_cm, bore_type,
+        _add_flanges(workingComp, tooth_len_cm, outer_diameter_cm)
+        bot_plane = _add_bore(workingComp, tooth_len_cm, outer_diameter_cm, bore_type,
                               bore_offset_cm, is_preview)
         # Keep the label's fallback spot (just above the bore) clear of the adapter.
         label_floor_cm = _bore_radius_cm(bore_type, bore_offset_cm)
         if groupOcc is not None:
             label_floor_cm = max(label_floor_cm, adapter_part['radius_cm'])
-        _add_label(workingComp, belt_width_cm, n_teeth, outer_diameter_cm, label_floor_cm,
+        _add_label(workingComp, tooth_len_cm, n_teeth, outer_diameter_cm, label_floor_cm,
                    bot_plane, is_preview)
         _log_unconstrained(workingComp)
 
@@ -1037,6 +1049,9 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
 
     With `use_adapter` (skipped in preview, like _create_pulley) the pulley and its
     3D print adapter are built inside a "<pulley>_Group" component in `parent_comp`.
+
+    Returns (pulley occurrence as seen from `parent`, its joint circle) so the caller can
+    add more joints to it, or None if the pulley wasn't built.
     """
     design    = adsk.fusion.Design.cast(app.activeProduct)
     rootComp  = design.rootComponent
@@ -1075,7 +1090,8 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
         workingOcc = parent.occurrences.addNewComponent(trans)
     workingComp = workingOcc.component
 
-    width_mm = int(round(belt_width_cm * 10))   # cm → mm
+    width_mm     = int(round(belt_width_cm * 10))   # cm → mm
+    tooth_len_cm = _tooth_length_cm(width_mm)
 
     if belt_pitch_mm == 5:
         comp_name      = f'Pulley_HTD_5mm-{n_teeth}Tx{width_mm}mm'
@@ -1091,19 +1107,19 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
         # is transformed to the pitch-circle centre via the occurrence transform above.
         sketch = workingComp.sketches.add(workingComp.xYConstructionPlane)
         body = _add_pulley_body(workingComp, sketch, belt_pitch_mm, n_teeth, show_teeth,
-                                belt_width_cm, is_preview)
+                                tooth_len_cm, is_preview)
         if body is None:
             (groupOcc or workingOcc).deleteMe()
             return
         outer_diameter_cm, joint_circle = body
 
-        _add_flanges(workingComp, belt_width_cm, outer_diameter_cm)
-        bot_plane = _add_bore(workingComp, belt_width_cm, outer_diameter_cm, bore_type,
+        _add_flanges(workingComp, tooth_len_cm, outer_diameter_cm)
+        bot_plane = _add_bore(workingComp, tooth_len_cm, outer_diameter_cm, bore_type,
                               bore_offset_cm, is_preview)
         label_floor_cm = _bore_radius_cm(bore_type, bore_offset_cm)
         if adapter_part is not None:
             label_floor_cm = max(label_floor_cm, adapter_part['radius_cm'])
-        _add_label(workingComp, belt_width_cm, n_teeth, outer_diameter_cm, label_floor_cm,
+        _add_label(workingComp, tooth_len_cm, n_teeth, outer_diameter_cm, label_floor_cm,
                    bot_plane, is_preview)
         _log_unconstrained(workingComp)
     except Exception:
@@ -1162,10 +1178,12 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
                 adsk.fusion.JointDirections.ZAxisJointDirection)
             joint = parent.joints.add(joint_input)
             joint.name = f'{comp_name}_revolute'
+            _hide_joint(joint)
         except Exception:
             futil.handle_error(f'PartsGen: joint for {comp_name}', show_message_box=not is_preview)
 
     futil.group_timeline_features(design, start_marker, comp_name)
+    return joint_occ, joint_circle
 
 
 # ---------------------------------------------------------------------------

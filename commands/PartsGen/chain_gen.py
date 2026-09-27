@@ -16,7 +16,7 @@ import adsk.fusion
 import math
 from ...lib import fusionAddInUtils as futil
 from ..CCDistance.CCLine import getCCLineFromEntity
-from .belt_gen import createPitchLoopFromSketchCircles
+from .belt_gen import createPitchLoopFromSketchCircles, should_run_part_sync
 from .sprocket_gen import (
     create_sprocket_for_chain,
     ATTR_SPROCKET_CHAIN_COMP_TOKEN,
@@ -119,14 +119,23 @@ def unregister_chain_name_sync():
     _chain_sync_registered = False
 
 
+_chain_sync_running = False
+
+
 def _on_command_terminated(args: adsk.core.ApplicationCommandEventArgs):
+    global _chain_sync_running
+    if _chain_sync_running:
+        return  # a command fired by the sync's own edits
     try:
         design = adsk.fusion.Design.cast(app.activeProduct)
-        if design is None:
+        if not should_run_part_sync(args, design):
             return
+        _chain_sync_running = True
         _scan_and_update_chain_names(design)
     except Exception:
         pass
+    finally:
+        _chain_sync_running = False
 
 
 def _find_comp_by_token(design: adsk.fusion.Design, token: str):

@@ -9,7 +9,8 @@ from .tube_gen import _create_tube
 from .pulley_gen import (_create_pulley, BORE_HALF_HEX, BORE_TYPES, BORE_OFFSET_DEFAULT_IN,
                          ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
                          PULLEY_BELT_WIDTH_ITEMS, pulley_outer_occurrence)
-from .belt_gen import _create_belt, handle_belt_selection_changed, register_belt_name_sync, unregister_belt_name_sync
+from .belt_gen import (_create_belt, handle_belt_selection_changed, register_belt_name_sync,
+                       unregister_belt_name_sync, OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP)
 from .sprocket_gen import _create_sprocket
 from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
 
@@ -32,6 +33,7 @@ _edit_ref_entities     = None   # (ref_point, face2) recovered from the edited s
                                 # entity tokens, re-selected in edit_command_activate --
                                 # SelectionCommandInput.addSelection() doesn't stick when it is
                                 # called from commandCreated.
+_edit_belt_entities    = None   # (C-C circle 1, C-C circle 2, offset face) for a belt, same idea
 _selected_partsgen_occ = None   # currently-selected PartsGen occ; tracked by ui_selection_changed
 
 # ---------------------------------------------------------------------------
@@ -147,6 +149,10 @@ ATTR_BELT_PULLEY_TEETH = 'belt_pulley_teeth'
 ATTR_BELT_BORE_TYPE    = 'belt_pulley_bore_type'
 ATTR_BELT_BORE_OFFSET  = 'belt_pulley_bore_offset'
 ATTR_BELT_ADAPTER      = 'belt_pulley_adapter'
+ATTR_BELT_OFFSET_EXPR  = 'belt_offset_expr'
+ATTR_BELT_OFFSET_FACE  = 'belt_offset_face_token'
+ATTR_BELT_CC_CIRCLE    = 'belt_cc_circle_token'
+ATTR_BELT_OFFSET_FLANGE = 'belt_offset_flange'
 
 ATTR_SPROCKET_TOOTH_COUNT = 'sprocket_tooth_count'
 ATTR_SPROCKET_WIDTH       = 'sprocket_width_expr'
@@ -323,7 +329,9 @@ def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
                      gen_pulleys: bool = True, pulley_teeth: bool = False,
                      bore_offset_expr: str = f'{BORE_OFFSET_DEFAULT_IN} in',
                      bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
-                     adapters=(False, False)):
+                     adapters=(False, False),
+                     offset_expr: str = '0 in',
+                     offset_flange: str = OFFSET_FLANGE_BOTTOM):
     """Add the Timing Belt's "Belt", "Pulleys", "Pulley 1" and "Pulley 2" groups (shared
     by the create and edit dialogs). The one Width dropdown sizes both the belt and its
     generated pulleys, and the pulley options mirror the Timing Pulley part's, with Bore
@@ -402,6 +410,33 @@ def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
         adapterInp.tooltip = ('Press a 3D-printed hub adapter into the bottom of this pulley: '
                               'WCP-1121 for 1/2" Hex, WCP-1021 for SplineXS. The pulley is '
                               'pocketed to fit it, and both are placed in their own group.')
+
+        if i == 1:
+            # Pulley 1's joint to its C-C circle carries the belt's height; Pulley 2's
+            # follows it.
+            offsetFaceInp = children.addSelectionInput(
+                'tb_offset_face', 'Offset From',
+                'Optional: a face to measure the Z Offset from')
+            offsetFaceInp.addSelectionFilter('PlanarFaces')
+            offsetFaceInp.setSelectionLimits(0, 1)
+            offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is '
+                                     'measured from. Leave empty to offset from the C-C sketch '
+                                     'plane.')
+            offsetDistInp = children.addValueInput(
+                'tb_offset_dist', 'Z Offset', 'in',
+                adsk.core.ValueInput.createByString(offset_expr))
+            offsetDistInp.tooltip = ('Gap from the Offset From face to the Measured To flange '
+                                     'of this pulley, along the pulley axis. The belt and the '
+                                     'other pulley move with it. With no face picked, how far '
+                                     'the belt is moved off the C-C sketch plane.')
+            offsetFlangeInp = children.addDropDownCommandInput(
+                'tb_offset_flange', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+            for name in (OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP):
+                offsetFlangeInp.listItems.add(name, name == offset_flange, '')
+            if offsetFlangeInp.selectedItem is None:
+                offsetFlangeInp.listItems.item(0).isSelected = True
+            offsetFlangeInp.tooltip = ('Which of this pulley\'s flanges (its outer face) the Z '
+                                       'Offset is measured to. Only used with an Offset From face.')
 
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
@@ -1467,7 +1502,7 @@ def _resolve_entity_token(token: str, label: str):
 
 
 def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
-    global _edit_target_occ, _edit_ref_entities
+    global _edit_target_occ, _edit_ref_entities, _edit_belt_entities
 
     inputs = args.command.commandInputs
 
@@ -1484,7 +1519,9 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_BELT_TYPE, ATTR_BELT_WIDTH, ATTR_BELT_SUPPRESS,
                     ATTR_BELT_GEN_PULLEYS, ATTR_BELT_PULLEY_TEETH, ATTR_BELT_BORE_TYPE,
                     ATTR_BELT_BORE_OFFSET, ATTR_BELT_ADAPTER,
-                    *(f'{k}_{i}' for k in (ATTR_BELT_BORE_TYPE, ATTR_BELT_ADAPTER) for i in (1, 2)),
+                    *(f'{k}_{i}' for k in (ATTR_BELT_BORE_TYPE, ATTR_BELT_ADAPTER,
+                                           ATTR_BELT_CC_CIRCLE) for i in (1, 2)),
+                    ATTR_BELT_OFFSET_EXPR, ATTR_BELT_OFFSET_FACE, ATTR_BELT_OFFSET_FLANGE,
                     ATTR_SPROCKET_TOOTH_COUNT, ATTR_SPROCKET_WIDTH, ATTR_SPROCKET_SHOW_TEETH,
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
@@ -1580,6 +1617,15 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     keep_faces     = is_shaft and edit_ref_point is not None and edit_face2 is not None
     keep_ref_point = is_shaft and edit_ref_point is not None
     _edit_ref_entities = (edit_ref_point, edit_face2) if keep_ref_point else None
+    # A belt's End Circles and Offset From face, re-selected the same way (belts saved
+    # before these were stored come back empty, and the user re-picks as before).
+    _edit_belt_entities = (tuple(_resolve_entity_token(_s(key, ''), label) for key, label in (
+                               (f'{ATTR_BELT_CC_CIRCLE}_1', 'End Circle 1'),
+                               (f'{ATTR_BELT_CC_CIRCLE}_2', 'End Circle 2'),
+                               (ATTR_BELT_OFFSET_FACE,      'Offset From face')))
+                           if is_belt else None)
+    belt_offset_expr   = _s(ATTR_BELT_OFFSET_EXPR,   '0 in')
+    belt_offset_flange = _s(ATTR_BELT_OFFSET_FLANGE, OFFSET_FLANGE_BOTTOM)
 
     # Same three groups as the create dialog (see command_created).
     has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
@@ -1694,11 +1740,11 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     _add_pulley_bore_inputs(partInputs, pulley_bore_type, pulley_bore_off, is_pulley,
                             pulley_adapter)
 
-    # --- Timing Belt groups — circles must be re-selected; other values pre-filled ---
+    # --- Timing Belt groups — End Circles and Offset From re-selected in activate ---
     # Belt type is always enabled in edit mode (no CCLine auto-lock).
     _add_belt_groups(inputs, is_belt, belt_type_val, belt_width_name, belt_suppress, True,
                      belt_gen_pulleys, belt_pulley_teeth, belt_bore_off, belt_bore_types,
-                     belt_adapters)
+                     belt_adapters, belt_offset_expr, belt_offset_flange)
 
     # --- Chain Sprocket group ---
     sprocketToothCountInp = partInputs.addValueInput(
@@ -1881,7 +1927,21 @@ def edit_command_activate(args: adsk.core.CommandEventArgs):
     `SelectionCommandInput.addSelection()` silently does nothing when the command's inputs
     are still being built. If a selection doesn't take, leave the input empty rather than
     dropping back to Custom Length -- the user can re-pick and still keep the placement.
+    A belt's End Circles and Offset From face are re-selected here too.
     """
+    if _edit_belt_entities:
+        inputs = args.command.commandInputs
+        circle1, circle2, offset_face = _edit_belt_entities
+        circlesSel = inputs.itemById('tb_pitch_circles')
+        faceSel    = inputs.itemById('tb_offset_face')
+        try:
+            if circlesSel is not None and circle1 is not None and circle2 is not None:
+                circlesSel.addSelection(circle1)
+                circlesSel.addSelection(circle2)
+            if faceSel is not None and offset_face is not None:
+                faceSel.addSelection(offset_face)
+        except Exception:
+            futil.log(f'{CMD_NAME} edit: could not re-select the belt\'s stored geometry')
     if not _edit_ref_entities:
         return
     ref_point, face2 = _edit_ref_entities
@@ -1905,7 +1965,8 @@ def edit_command_preview(args: adsk.core.CommandEventArgs):
 
 
 def edit_command_destroy(args: adsk.core.CommandEventArgs):
-    global edit_local_handlers, _edit_target_occ, _edit_ref_entities
+    global edit_local_handlers, _edit_target_occ, _edit_ref_entities, _edit_belt_entities
     edit_local_handlers = []
     _edit_target_occ    = None
     _edit_ref_entities  = None
+    _edit_belt_entities = None
