@@ -23,6 +23,13 @@ session.
 
 ## Lessons
 
+### Text on a side face (e.g. a belt's back): sketch on the face, `setAsAlongPath` on a fixed construction line
+A multi-line text box is axis-aligned to the face sketch's arbitrary x axis. **Fix:** `sketches.add(face)`, draw a
+construction line along the face (`modelToSketchSpace`), fix both ends (sketch is then fully constrained), and
+`setAsAlongPath(line, True, Center, 0)` -- text sits *above* the path, so drop the line half a text height; point it
+along `up x outwardNormal` to read upright from outside. The face sketch's normal is outward, so cut Negative.
+`commands/PartsGen/belt_gen.py` (`_add_belt_label`)
+
 ### `Path.create` fails on a sub-component's native sketch curves -- use `comp.features.createPath`
 Belt teeth pattern: `adsk.fusion.Path.create(curves, noChainedCurves)` on the belt sketch's curves (native to the new
 belt component, no assembly context) threw `InternalValidationError : Utils::getObjectPath`, so no toothed belt was

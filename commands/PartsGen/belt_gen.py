@@ -17,7 +17,8 @@ from .pulley_gen import (create_pulley_for_belt, pulley_outer_occurrence, update
                           ATTR_PULLEY_PITCH_CIRCLE_IDX, ATTR_PULLEY_TOOTH_COUNT,
                           ATTR_PULLEY_BELT_WIDTH, ATTR_PULLEY_SHOW_TEETH,
                           ATTR_PULLEY_BORE_TYPE, ATTR_PULLEY_BORE_OFFSET, ATTR_PULLEY_ADAPTER,
-                          BORE_HALF_HEX, BORE_OFFSET_DEFAULT_IN, FLANGE_THICKNESS_CM)
+                          BORE_HALF_HEX, BORE_OFFSET_DEFAULT_IN, FLANGE_THICKNESS_CM,
+                          LABEL_TEXT_HEIGHT_CM)
 from .shaft_gen import _world_plane, _hide_joint
 
 app = adsk.core.Application.get()
@@ -46,6 +47,10 @@ ATTR_BELT_OFFSET_FLANGE = 'belt_offset_flange'      # which flange the Z Offset 
 # "Measured To" choices for Pulley 1's Z Offset
 OFFSET_FLANGE_BOTTOM = 'Bottom Flange'
 OFFSET_FLANGE_TOP    = 'Top Flange'
+
+# Tooth-count label engraved on the belt's back
+BELT_LABEL_SKETCH     = 'BeltLabel'
+BELT_LABEL_ENGRAVE_CM = 0.01 * 2.54   # shallower than the pulley's: GT2 backing is ~0.6 mm
 
 # ---------------------------------------------------------------------------
 # Belt-name-sync (commandTerminated hook)
@@ -459,6 +464,8 @@ def _rebuild_belt_3d(comp: adsk.fusion.Component, belt_pitch_mm: int,
             extrudeBeltPreview(sk, path_curves, belt_width_cm)
         else:
             extrudeBelt(sk, path_curves, belt_width_cm, tooth_count, belt_pitch_mm)
+        # Its old cut went with the extrudes above; redraw it with the new tooth count.
+        _add_belt_label(comp, sk, tooth_count, belt_width_cm)
 
         futil.log(f'PartsGen: _rebuild_belt_3d — done, bodies={comp.bRepBodies.count}')
 
@@ -788,6 +795,8 @@ def _create_belt(inputs: adsk.core.CommandInputs, is_preview: bool = False):
             extrudeBeltPreview(sketch, pathCurves, belt_width_cm)
         else:
             extrudeBelt(sketch, pathCurves, belt_width_cm, toothCount, beltPitchLength)
+        if not is_preview:
+            _add_belt_label(workingComp, sketch, toothCount, belt_width_cm)
 
         # Save attributes so the right-click Edit command can restore the dialog
         try:
@@ -954,6 +963,97 @@ def extrudeBelt(sketch: adsk.fusion.Sketch,
     toothPatInput.isOrientationAlongPath  = True
     toothPatInput.patternComputeOption    = adsk.fusion.PatternComputeOptions.IdenticalPatternCompute
     pathPatterns.add(toothPatInput)
+
+
+def _scaled(v: adsk.core.Vector3D, s: float) -> adsk.core.Vector3D:
+    out = v.copy()
+    out.scaleBy(s)
+    return out
+
+
+def _add_belt_label(comp: adsk.fusion.Component, belt_sketch: adsk.fusion.Sketch,
+                    tooth_count: int, belt_width_cm: float, is_preview: bool = False):
+    """Engrave the tooth count (e.g. "120T") on the belt's back, along both straight spans.
+
+    The outer face of a span is the belt's only large flat face -- the inside is broken
+    up by teeth and the edges are ~1.5 mm tall. Each label reads upright from outside the
+    belt, with the belt sketch's normal (the way the pulleys extend) as "up"."""
+    try:
+        for i in range(comp.sketches.count - 1, -1, -1):
+            if comp.sketches.item(i).name.startswith(BELT_LABEL_SKETCH):
+                comp.sketches.item(i).deleteMe()
+        if comp.bRepBodies.count == 0:
+            return
+        body = comp.bRepBodies.item(0)
+        up   = belt_sketch.xDirection.crossProduct(belt_sketch.yDirection)
+        up.normalize()
+
+        # The two largest planar faces parallel to the belt normal that face away from its
+        # middle -- the backs of the two spans.
+        mid   = futil.BBCentroid(body.boundingBox)
+        faces = []
+        for f in body.faces:
+            if adsk.core.Plane.cast(f.geometry) is None:
+                continue
+            _, n = f.evaluator.getNormalAtPoint(f.pointOnFace)
+            if abs(n.dotProduct(up)) > 1e-6 or mid.vectorTo(f.pointOnFace).dotProduct(n) <= 0:
+                continue
+            faces.append((f, n))
+        faces = sorted(faces, key=lambda fn: fn[0].area, reverse=True)[:2]
+        if not faces:
+            futil.log('PartsGen: no flat outer face on the belt for its label')
+            return
+
+        # Sketch every label before cutting any: a cut remakes the body's faces.
+        height = min(LABEL_TEXT_HEIGHT_CM, 0.6 * belt_width_cm)
+        labels = []
+        for idx, (face, face_n) in enumerate(faces):
+            # Path line down the face's length, dropped half a text height below its middle
+            # so the text (drawn above the path) ends up centred across the belt. Pointing
+            # it along up x normal keeps the text reading left-to-right from outside.
+            span = max(face.edges, key=lambda e: e.length)
+            along = span.startVertex.geometry.vectorTo(span.endVertex.geometry)
+            along.normalize()
+            if up.crossProduct(face_n).dotProduct(along) < 0:
+                along.scaleBy(-1)
+            center = futil.BBCentroid(face.boundingBox)
+            center.translateBy(_scaled(up, -height / 2))
+            half = span.length * 0.4
+            p1 = center.copy()
+            p1.translateBy(_scaled(along, -half))
+            p2 = center.copy()
+            p2.translateBy(_scaled(along, half))
+
+            sk = comp.sketches.add(face)
+            sk.name = f'{BELT_LABEL_SKETCH}_{idx + 1}'
+            path = sk.sketchCurves.sketchLines.addByTwoPoints(sk.modelToSketchSpace(p1),
+                                                              sk.modelToSketchSpace(p2))
+            path.isConstruction = True
+            # Pinning the path fully constrains the sketch -- the text stays whole (no explode).
+            path.startSketchPoint.isFixed = True
+            path.endSketchPoint.isFixed   = True
+            text_input = sk.sketchTexts.createInput2(f'{tooth_count}T', height)
+            text_input.setAsAlongPath(path, True,
+                                      adsk.core.HorizontalAlignments.CenterHorizontalAlignment, 0)
+            labels.append((sk, sk.sketchTexts.add(text_input)))
+
+        # The face sketch's normal points out of the belt, so Negative cuts into it.
+        extrudes = comp.features.extrudeFeatures
+        for sk, text in labels:
+            ext_in = extrudes.createInput(text, adsk.fusion.FeatureOperations.CutFeatureOperation)
+            ext_in.setOneSideExtent(
+                adsk.fusion.DistanceExtentDefinition.create(
+                    adsk.core.ValueInput.createByReal(BELT_LABEL_ENGRAVE_CM)),
+                adsk.fusion.ExtentDirections.NegativeExtentDirection)
+            ext_in.participantBodies = [comp.bRepBodies.item(0)]
+            feature = extrudes.add(ext_in)
+            if feature.healthState != adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState:
+                futil.log(f'PartsGen: belt label cut unhealthy ({feature.errorOrWarningMessage}), '
+                          'removing it')
+                feature.deleteMe()
+                sk.deleteMe()
+    except Exception:
+        futil.handle_error('PartsGen _add_belt_label', show_message_box=not is_preview)
 
 
 # ---------------------------------------------------------------------------
