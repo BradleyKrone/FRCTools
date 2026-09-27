@@ -23,6 +23,14 @@ session.
 
 ## Lessons
 
+### `importlib.reload()` of a PartsGen module silently kills its commandTerminated sync hook
+Editing a chain's C-C distance/tooth counts left the sprockets (and chain name) stale. The code was fine: `chain_gen`
+and `belt_gen` had been reloaded from an MCP test script, which re-runs `_chain_sync_registered = False` /
+`_chain_sync_handlers = []`, dropping the only reference to the live handler (garbage-collected, no error). `gear_gen`,
+not reloaded, still synced. **Diagnose:** read `mod._chain_sync_registered` / `len(mod._chain_sync_handlers)` via
+`sys.modules`. **Fix:** Stop -> Run the add-in (or call `register_*_sync()` again after any reload of `belt_gen`,
+`chain_gen` or `gear_gen`). `commands/PartsGen/chain_gen.py` (`register_chain_name_sync`)
+
 ### `Sketch.referencePlane` raises for a sketch on a BRepFace unless the timeline is rolled back
 Deleting a label cut + its sketch (`ConstructionPlane.cast(sk.referencePlane)`) threw "referencePlane is a BRefFace -
 need to roll timeline back", which sent the sprocket's in-place update to its delete-and-rebuild fallback (user joints
