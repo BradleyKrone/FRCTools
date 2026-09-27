@@ -23,6 +23,38 @@ session.
 
 ## Lessons
 
+### A commandTerminated sync that refuses an update must say so -- it fails silently otherwise
+Switching a C-C gear to a motor pinion (drawn at 12T) left the 40T gear unchanged: `update_gear` refused
+because 1/2in hex needs 17T or more, and only logged it, again after every command. **Fix:** fall back to a bore that
+fits (SplineXS, 12T or more) and popup once per (gear, count). When testing a sync live via MCP, stub out
+`futil.popup_error` or the modal box blocks the script. `commands/PartsGen/gear_gen.py` (`_sync_bore_type`)
+
+### Jointing a part nested in a group component to a root sketch -- pass proxies, reset the native transform
+Gear pairs live in a `Gears_...` group component, but the C-C circle is in root, so the joint must be a
+root joint. **Fix:** `gear_occ.createForAssemblyContext(group_occ)` for the joint geometry; for the
+flip-retry reset, set `proxy.nativeObject.transform2` (group at identity = world). Verified live; the
+C-C sync via `root.allOccurrences` proxies still works. Also: never define a top-level `run` in an MCP
+script -- the harness calls it and reports a bogus `TypeError` (and may roll the script back).
+`commands/PartsGen/gear_gen.py` (`_create_gear_pair`, `_add_gear_cc_joint`)
+
+### An exception in `command_created` leaves a dead dialog -- and `CommandInput.name` is read-only
+Setting `dropDown.name = ...` threw in a helper called before the `futil.add_handler(...)` lines, so the
+dialog still opened but no handler was wired: changing Part Type did nothing. **Fix:** labels are fixed
+at `add*Input`; check the Text Command window for a `CommandCreatedEventHandler` traceback.
+`commands/PartsGen/gear_gen.py` (`update_gear_dialog`)
+
+### The MCP script tool closes a document the script created -- the *next* script runs on the user's doc
+A test script did `app.documents.add(...)`; when it returned, the harness closed that doc and reactivated
+another open doc ("Untitled (~recovered)"), so a follow-up "hide everything but the gears" script hid a
+real doc's parts (undone). **Fix:** do every check *and* the picture (`viewport.saveAsImageFile`, then Read
+the PNG) inside the script that made the doc; `assert app.activeDocument == doc` before any edit.
+
+### An in-place resize needs no `rollTo` when no profile has to change -- drive the dimension parameters
+Gear C-C sync: `SketchDiameterDimension.parameter.value` on the OD/pitch/hub circles, then delete and
+re-add only the label/bore cuts at the end of the timeline. Faces survive; a user rigid joint to the
+gear face stayed healthy through 18T->24T. (Pulleys with teeth still need the rollTo + profile swap.)
+`commands/PartsGen/gear_gen.py` (`update_gear`)
+
 ### Text on a side face (e.g. a belt's back): sketch on the face, `setAsAlongPath` on a fixed construction line
 A multi-line text box is axis-aligned to the face sketch's arbitrary x axis. **Fix:** `sketches.add(face)`, draw a
 construction line along the face (`modelToSketchSpace`), fix both ends (sketch is then fully constrained), and

@@ -374,7 +374,8 @@ def _add_bore(comp: adsk.fusion.Component, tooth_len_cm: float, tooth_od_cm: flo
 
 def _engrave_label_face(comp: adsk.fusion.Component, label: str,
                         plane: adsk.fusion.ConstructionPlane, cut_direction, mirror: bool,
-                        y_bot: float, y_top: float, is_preview: bool = False):
+                        y_bot: float, y_top: float, is_preview: bool = False,
+                        text_height_cm: float = LABEL_TEXT_HEIGHT_CM):
     """Engrave *label* on one flange face, in the band y_bot..y_top above the centre.
 
     Args:
@@ -384,13 +385,14 @@ def _engrave_label_face(comp: adsk.fusion.Component, label: str,
         mirror:        When True the text is flipped horizontally so the label
                        reads correctly when viewed from the outside of the bottom
                        flange (i.e. from the -Z direction).
+        text_height_cm: Font height (gear_gen shrinks it to fit a small gear).
     """
     sk = comp.sketches.add(plane)
 
     corner1 = adsk.core.Point3D.create(-1.5, y_bot, 0)
     corner2 = adsk.core.Point3D.create( 1.5, y_top, 0)
 
-    text_input = sk.sketchTexts.createInput2(label, LABEL_TEXT_HEIGHT_CM)
+    text_input = sk.sketchTexts.createInput2(label, text_height_cm)
     text_input.setAsMultiLine(
         corner1, corner2,
         adsk.core.HorizontalAlignments.CenterHorizontalAlignment,
@@ -432,7 +434,7 @@ def _engrave_label_face(comp: adsk.fusion.Component, label: str,
     n_profiles = sk.profiles.count
     if n_profiles == 0:
         _warn(f'PartsGen label: sketch text "{label}" generated 0 profiles — '
-              f'cannot engrave. (text height = {LABEL_TEXT_HEIGHT_CM:.3f} cm)', is_preview)
+              f'cannot engrave. (text height = {text_height_cm:.3f} cm)', is_preview)
         return
     engraved = 0
     for i in range(n_profiles):

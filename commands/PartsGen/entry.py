@@ -13,6 +13,12 @@ from .belt_gen import (_create_belt, handle_belt_selection_changed, register_bel
                        unregister_belt_name_sync, OFFSET_FLANGE_BOTTOM, OFFSET_FLANGE_TOP)
 from .sprocket_gen import _create_sprocket
 from .chain_gen import _create_chain, handle_chain_selection_changed, register_chain_name_sync, unregister_chain_name_sync
+from .gear_gen import (PART_GEAR, create_gears, _create_gear, handle_gear_selection_changed,
+                       update_gear_dialog, update_gear_from_dialog, selected_pitch_circles,
+                       is_cc_gear, register_gear_sync, unregister_gear_sync,
+                       OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP,
+                       ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
+                       ATTR_GEAR_CC_CIRCLE)
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -61,6 +67,7 @@ PART_PULLEY  = 'Timing Pulley'
 PART_BELT    = 'Timing Belt'
 PART_SPROCKET = 'Sprocket'
 PART_CHAIN   = 'Chain'
+# PART_GEAR ('Gear') comes from gear_gen.py, which stores it on the component.
 
 # ---------------------------------------------------------------------------
 # Shaft types
@@ -207,6 +214,7 @@ def start():
 
     register_belt_name_sync()
     register_chain_name_sync()
+    register_gear_sync()
 
 
 def stop():
@@ -225,6 +233,7 @@ def stop():
 
     unregister_belt_name_sync()
     unregister_chain_name_sync()
+    unregister_gear_sync()
 
     global ui_handlers
     ui_handlers = []
@@ -449,6 +458,78 @@ def _add_belt_groups(inputs: adsk.core.CommandInputs, visible: bool,
                                        'Offset is measured to. Only used with an Offset From face.')
 
 
+def _add_gear_group(inputs: adsk.core.CommandInputs, visible: bool,
+                    tooth_expr: str = '60', bore_types=(BORE_HALF_HEX, BORE_HALF_HEX),
+                    joint_offset_expr: str = '0 in', edit_cc_gear: bool = None):
+    """Add the Gear's "Gears" group (shared by the create and edit dialogs).
+
+    Picking a gear C-C line builds both of its gears in one group component, jointed to the
+    pitch circles, with a bore each, and placed by a Z Offset from an optional face to the
+    gears' top or bottom hub; with no pick one standalone gear is built from Tooth Count.
+    The edit dialog (`edit_cc_gear` not None) edits one existing gear, so it has no C-C
+    pick; a C-C gear's tooth count follows its pitch circle, so it's read-only there."""
+    group = inputs.addGroupCommandInput('gear_group', 'Gears')
+    group.isExpanded = True
+    group.isVisible  = visible
+    children = group.children
+    is_edit = edit_cc_gear is not None
+
+    circlesInp = children.addSelectionInput(
+        'gear_pitch_circles', 'C-C Line', 'Optional: select a "Gears 20DP" C-C Line')
+    circlesInp.addSelectionFilter('SketchCurves')
+    circlesInp.setSelectionLimits(0, 2)
+    circlesInp.tooltip = ('Pick a Gears 20DP C-C Line to build both of its gears, jointed to '
+                          'its pitch circles and kept in step when the C-C changes. Leave '
+                          'empty to build one gear from Tooth Count.')
+    circlesInp.isVisible = not is_edit
+
+    infoInp = children.addTextBoxCommandInput('gear_cc_info', '', '', 1, True)
+    infoInp.isVisible = not is_edit
+
+    toothInp = children.addValueInput('gear_tooth_count', 'Tooth Count', '',
+                                      adsk.core.ValueInput.createByString(tooth_expr))
+    toothInp.tooltip = '20DP, 14.5 deg pressure angle. OD = (N + 2) / 20 in.'
+    toothInp.isEnabled = not edit_cc_gear
+
+    # CommandInput.name is read-only, so the label can't follow pair vs standalone.
+    for i in (1, 2):
+        boreTypeInp = children.addDropDownCommandInput(
+            f'gear_bore_type_{i}', 'Bore' if is_edit else f'Gear {i} Bore',
+            adsk.core.DropDownStyles.TextListDropDownStyle)
+        for name in BORE_TYPES:
+            boreTypeInp.listItems.add(name, name == bore_types[i - 1], '')
+        if boreTypeInp.selectedItem is None:
+            boreTypeInp.listItems.item(0).isSelected = True
+        boreTypeInp.isVisible = not (is_edit and i == 2)
+
+    offsetFaceInp = children.addSelectionInput(
+        'gear_offset_face', 'Offset From', 'Optional: a face to measure the Z Offset from')
+    offsetFaceInp.addSelectionFilter('PlanarFaces')
+    offsetFaceInp.setSelectionLimits(0, 1)
+    offsetFaceInp.tooltip = ('Face (parallel to the C-C sketch) that the Z Offset is measured '
+                             'from. Leave empty to offset from the C-C sketch plane.')
+    offsetFaceInp.isVisible = not is_edit
+
+    jointOffInp = children.addValueInput(
+        'gear_joint_offset', 'Z Offset', 'in',
+        adsk.core.ValueInput.createByString(joint_offset_expr))
+    jointOffInp.tooltip = ('Gap from the Offset From face to the Measured To hub face of both '
+                           'gears, out from the face. With no face picked, measured from the '
+                           'C-C sketch plane along its normal.')
+    jointOffInp.isVisible = not is_edit
+
+    offsetSideInp = children.addDropDownCommandInput(
+        'gear_offset_side', 'Measured To', adsk.core.DropDownStyles.TextListDropDownStyle)
+    for name in (OFFSET_SIDE_BOTTOM, OFFSET_SIDE_TOP):
+        offsetSideInp.listItems.add(name, name == OFFSET_SIDE_BOTTOM, '')
+    offsetSideInp.tooltip = ('Which side of the gears the Z Offset is measured to: the outer '
+                             'face of the bottom or the top hub.')
+    offsetSideInp.isVisible = not is_edit
+
+    if not is_edit:
+        update_gear_dialog(inputs)
+
+
 def command_created(args: adsk.core.CommandCreatedEventArgs):
     inputs = args.command.commandInputs
     partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
@@ -463,6 +544,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    False, '')
     partTypeInp.listItems.add(PART_SPROCKET, False, '')
     partTypeInp.listItems.add(PART_CHAIN,   False, '')
+    partTypeInp.listItems.add(PART_GEAR,    False, '')
 
     # --- Component name (optional override; blank = auto-generated name) -----
     customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', '')
@@ -688,6 +770,10 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     chainSprocketTeethInp = partInputs.addBoolValueInput(
         'chain_sprocket_teeth', 'Sprocket Teeth', True, '', False)
     chainSprocketTeethInp.isVisible = False
+
+    # --- Gear ("Gears" group) -------------------------------------------------
+    _add_gear_group(inputs, False)
+
     futil.add_handler(args.command.execute,        command_execute,        local_handlers=local_handlers)
     futil.add_handler(args.command.inputChanged,   command_input_changed,  local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview,        local_handlers=local_handlers)
@@ -738,6 +824,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     part_is_belt     = (part_type == PART_BELT)
     part_is_sprocket = (part_type == PART_SPROCKET)
     part_is_chain    = (part_type == PART_CHAIN)
+    part_is_gear     = (part_type == PART_GEAR)
     is_custom_shaft  = (shaftTypeInp.selectedItem.name == SHAFT_CUSTOM)
     is_spacer_shaft  = (shaftTypeInp.selectedItem.name in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
     is_custom_thick  = (tubeThickInp.selectedItem.name == THICK_CUSTOM)
@@ -754,7 +841,8 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             lenTypeInp.listItems.item(0).isSelected = True  # Between Two Faces
 
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
-    hide_length      = part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
+    hide_length      = (part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
+                        or part_is_gear)
 
     # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
     # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
@@ -831,6 +919,17 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     if chainSprocketTeethInp is not None:
         chainSprocketTeethInp.isVisible = (
             part_is_chain and chainGenSprocketsInp is not None and chainGenSprocketsInp.value)
+
+    # Gear group
+    gearGroup = inputs.itemById('gear_group')
+    if gearGroup is not None:
+        gearGroup.isVisible = part_is_gear
+    gearCirclesInp = inputs.itemById('gear_pitch_circles')
+    if part_is_gear and gearCirclesInp is not None and gearCirclesInp.isVisible \
+            and args.input.id == 'part_type':
+        gearCirclesInp.hasFocus = True
+    if args.input.id == 'gear_pitch_circles':
+        handle_gear_selection_changed(inputs)
 
     # Length inputs — hidden when Pulley or Belt is selected. Face 1 (a planar face) is
     # only for Tube; Shaft uses Reference Point instead (a point/edge/face pick --
@@ -987,6 +1086,10 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
             _create_sprocket(inputs)
         elif part_type == PART_CHAIN:
             _create_chain(inputs)
+        elif part_type == PART_GEAR:
+            # Reports its own errors (quietly in preview) and returns False.
+            if not create_gears(inputs, is_preview=is_preview):
+                return False, None
         else:
             _create_belt(inputs)
         return True, ref_face
@@ -1111,6 +1214,20 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         # Same per-side bore offset range as the Timing Pulley.
         tbBoreOffsetInp = inputs.itemById('tb_bore_offset')
         if tbBoreOffsetInp is not None and abs(tbBoreOffsetInp.value) > 0.05 * 2.54:
+            args.areInputsValid = False
+            return
+        args.areInputsValid = True
+        return
+
+    # --- Gear validation ----------------------------------------------------
+    if part_type == PART_GEAR:
+        gearCirclesInp = inputs.itemById('gear_pitch_circles')
+        pair = gearCirclesInp is not None and gearCirclesInp.selectionCount > 0
+        if pair and gearCirclesInp.selectionCount != 2:
+            args.areInputsValid = False
+            return
+        toothInp = inputs.itemById('gear_tooth_count')
+        if not pair and toothInp is not None and toothInp.isEnabled and toothInp.value < 8:
             args.areInputsValid = False
             return
         args.areInputsValid = True
@@ -1546,6 +1663,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
                     ATTR_SPROCKET_CHAIN_TYPE,
                     ATTR_CHAIN_TYPE, ATTR_CHAIN_SPROCKET_WIDTH,
                     ATTR_CHAIN_GEN_SPROCKETS, ATTR_CHAIN_SPROCKET_TEETH,
+                    ATTR_GEAR_TOOTH_COUNT, ATTR_GEAR_LABEL_TEETH, ATTR_GEAR_BORE_TYPE,
+                    ATTR_GEAR_CC_CIRCLE,
                     ATTR_CUSTOM_NAME, ATTR_CREATE_JOINT, ATTR_JOINT_TYPE, ATTR_JOINT_FLIP,
                     ATTR_REVERSE_DIR, ATTR_REF_POINT_TOKEN, ATTR_FACE2_TOKEN,
                     ATTR_BEARING_ENDS):
@@ -1568,6 +1687,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     is_belt         = (part_type == PART_BELT)
     is_sprocket     = (part_type == PART_SPROCKET)
     is_chain        = (part_type == PART_CHAIN)
+    is_gear         = (part_type == PART_GEAR)
     is_custom_shaft = (shaft_type == SHAFT_CUSTOM)
     is_spacer_shaft = (shaft_type in (SHAFT_HALF_HEX_SPACER, SHAFT_THREE_EIGHTH_SPACER))
 
@@ -1648,7 +1768,7 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     belt_offset_flange = _s(ATTR_BELT_OFFSET_FLANGE, OFFSET_FLANGE_BOTTOM)
 
     # Same three groups as the create dialog (see command_created).
-    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain
+    has_len = not is_pulley and not is_belt and not is_sprocket and not is_chain and not is_gear
     partInputs, placeInputs, displayInputs = _add_dialog_groups(inputs)
     inputs.itemById('placement_group').isVisible = has_len
     inputs.itemById('display_group').isVisible = has_len
@@ -1663,6 +1783,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_BELT,    is_belt,     '')
     partTypeInp.listItems.add(PART_SPROCKET, is_sprocket, '')
     partTypeInp.listItems.add(PART_CHAIN,   is_chain,    '')
+    partTypeInp.listItems.add(PART_GEAR,    is_gear,     '')
+    # An existing C-C gear is edited in place (its joints are kept), so it stays a gear.
+    edit_cc_gear = is_gear and _edit_target_occ is not None and is_cc_gear(_edit_target_occ.component)
+    partTypeInp.isEnabled = not edit_cc_gear
 
     # --- Component name (optional override; blank = auto-generated name) -----
     customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', custom_name_val)
@@ -1812,6 +1936,12 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
         'chain_sprocket_teeth', 'Sprocket Teeth', True, '', chain_spr_teeth_val)
     chainSprocketTeethInpEdit.isVisible = is_chain and chain_gen_spr_val
 
+    # --- Gear group ---
+    _add_gear_group(inputs, is_gear,
+                    tooth_expr=_s(ATTR_GEAR_LABEL_TEETH, _s(ATTR_GEAR_TOOTH_COUNT, '60')),
+                    bore_types=(_s(ATTR_GEAR_BORE_TYPE, BORE_HALF_HEX), BORE_HALF_HEX),
+                    edit_cc_gear=edit_cc_gear)
+
     # --- Length ---------------------------------------------------------------
     # Between-Two-Faces survives an edit whenever both stored picks still resolve, so the
     # shaft rebuilds where it stands with its joint intact. Otherwise fall back to editing
@@ -1906,6 +2036,13 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 def edit_command_execute(args: adsk.core.CommandEventArgs):
     global _edit_target_occ, _edit_ref_entities
 
+    # A C-C gear is edited in place: deleting and rebuilding it would drop the joints the
+    # user made to it (the C-C sync keeps its size; here only bore and name change).
+    if _edit_target_occ and is_cc_gear(_edit_target_occ.component):
+        update_gear_from_dialog(_edit_target_occ, args.command.commandInputs)
+        _edit_target_occ = None
+        return
+
     if _edit_target_occ:
         # A shaft built with bearings lives in a "<shaft>_Group" with them, so delete the
         # whole group. Older shafts have their bearings as separate root occurrences --
@@ -1936,6 +2073,8 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
         _create_sprocket(inputs)
     elif part_type == PART_CHAIN:
         _create_chain(inputs)
+    elif part_type == PART_GEAR:
+        _create_gear(inputs)
     else:
         _create_belt(inputs)
 
