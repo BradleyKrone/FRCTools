@@ -23,6 +23,28 @@ session.
 
 ## Lessons
 
+### Apply's pre-empted dialog still owns cleanup of the part it committed
+After a C-C gear pair was committed with Apply, the next dialog's (pulley) Offset From couldn't pick the gear: its
+bodies were still `isSelectable = False` from the preview ghosting. `command_destroy` bailed out early for the
+pre-empted dialog (so it wouldn't clobber the new dialog's handlers) and skipped `_restore_preview_selectable`.
+**Fix:** in that early-return branch, skip only the per-dialog state (handlers, highlight) -- still undo design-level
+side effects left on the committed result.
+`commands/PartsGen/entry.py` (`command_destroy`)
+
+### Don't park picks in a hidden `SelectionCommandInput` -- they get dropped
+C-C Auto Gen filled the (hidden) belt End Circles input: `addSelection()` returned True, yet the count was 0 right
+after, and focus stayed on the hidden input so the user's next clicks vanished. An entity also can't sit in two
+selection inputs at once. **Fix:** keep the input that holds the picks visible, and clear the source pick before
+handing the same entity to another input.
+`commands/PartsGen/entry.py` (`_handle_cc_auto_pick`)
+
+### An MCP script can't open a command dialog -- `CommandDefinition.execute()` and `fireCustomEvent` are both swallowed
+From a `fusion_mcp_execute` script, neither `execute()` nor firing Parts Gen's Apply custom event opened the dialog
+(`activeCommand` stayed `SelectCommand`). **Fix:** don't try; test the logic a dialog calls (e.g. `getCCLineFromEntity`
+on the real C-C lines) from a script, and leave the click-through to a manual check. Reload one command with
+`mod.stop(); importlib.reload(mod); mod.start()`.
+`commands/PartsGen/entry.py` (`_handle_cc_auto_pick`)
+
 ### Anything you set on preview geometry survives into the result when `isValidResult = True`
 Click-through preview bodies (`isSelectable = False`) of a gear pair stayed unpickable after OK, so a belt's Offset
 From couldn't select the 60T gear. **Fix:** tag each changed body with an attribute and undo the change for every
