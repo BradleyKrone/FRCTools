@@ -23,6 +23,16 @@ session.
 
 ## Lessons
 
+### "Click anywhere on the sketch" in a command: `command.mouseClick` + a ray onto the sketch plane
+A `SelectionCommandInput` can't pick empty space. **Fix:** handle `Command.mouseClick` and use
+`futil.viewClickToSketchPoint` (ray from the camera onto the sketch plane; ~1e-3 cm ortho, ~0.02 cm perspective, checked
+live). Gotcha: a *native* sketch in a moved sub-component reports `sketchToModelSpace`/`origin` in its component's frame,
+not world, so the helper swaps in the occurrence proxy first. Let a click on the current pick keep it
+(`futil.sketchEntityViewDistance` <= 10 px), since whether mouseClick or the selection fires first isn't documented.
+The click also sets a read-only StringValueInput, meant to re-trigger validate/preview (not yet confirmed in the live dialog). In a script, the camera you just
+set reads stale until a few `adsk.doEvents()` calls.
+`lib/fusionAddInUtils/geom_utils.py`, `commands/BoltPattern/entry.py`, `commands/CCDistance/create_cmd.py`
+
 ### Apply's pre-empted dialog still owns cleanup of the part it committed
 After a C-C gear pair was committed with Apply, the next dialog's (pulley) Offset From couldn't pick the gear: its
 bodies were still `isSelectable = False` from the preview ghosting. `command_destroy` bailed out early for the

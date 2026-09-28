@@ -24,6 +24,14 @@ ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resource
 # they are not released and garbage collected.
 local_handlers = []
 
+# Sketch that was active when the dialog opened, and the sketch-space point the user
+# clicked in empty space (None until they click). Used when no point/circle is selected.
+_active_sketch: adsk.fusion.Sketch = None
+_click_pt: adsk.core.Point3D = None
+
+# How close (in pixels) a click must be to the selected center to count as re-picking it.
+CLICK_PICK_TOLERANCE_PX = 10
+
 # Bolt Pattern struct
 class BoltPattern(typing.NamedTuple) :
     name: str = ""
@@ -93,11 +101,21 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     # https://help.autodesk.com/view/fusion360/ENU/?contextId=CommandInputs
     inputs = args.command.commandInputs
 
-    # Create a selection input.
-    centerSelection = inputs.addSelectionInput('center_selection', 'Center', 'Select the center of the bolt pattern')
+    global _active_sketch, _click_pt
+    _active_sketch = adsk.fusion.Sketch.cast( app.activeProduct.activeEditObject )
+    _click_pt = None
+
+    # Create a selection input. Selecting is optional: clicking empty space in the
+    # active sketch places a new (free) center point there instead.
+    centerSelection = inputs.addSelectionInput('center_selection', 'Center', 'Click a location, or select a point/circle')
     centerSelection.addSelectionFilter( "SketchPoints" )
     centerSelection.addSelectionFilter( "SketchCircles" )
-    centerSelection.setSelectionLimits( 1, 1 )
+    centerSelection.setSelectionLimits( 0, 1 )
+
+    # Read-only readout of the clicked location. Changing its value from the mouse
+    # click handler is also what makes Fusion re-validate and re-run the preview.
+    clickLocation = inputs.addStringValueInput('click_location', 'Location', '')
+    clickLocation.isReadOnly = True
 
     # Bolt Patterns
     boltPattern = inputs.addDropDownCommandInput('bolt_pattern', 'Bolt Pattern', adsk.core.DropDownStyles.TextListDropDownStyle)
@@ -121,7 +139,55 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.inputChanged, command_input_changed, local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview, local_handlers=local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
+    futil.add_handler(args.command.mouseClick, command_mouse_click, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
+
+
+# Returns the center SketchPoint to build the pattern on: the selected point/circle if
+# there is one, otherwise a new point at the clicked location (left free for the user
+# to dimension). Returns None if neither is available.
+def _resolve_center(inputs: adsk.core.CommandInputs) -> adsk.fusion.SketchPoint:
+    centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
+    if centerSelection.selectionCount > 0:
+        selectedEntity = centerSelection.selection(0).entity
+        if selectedEntity.objectType == adsk.fusion.SketchCircle.classType() :
+            return selectedEntity.centerSketchPoint
+        elif selectedEntity.objectType == adsk.fusion.SketchPoint.classType() :
+            return selectedEntity
+        futil.popup_error( f'  Cannot handle object type = {selectedEntity.objectType}')
+        return None
+
+    if _click_pt is not None and _active_sketch is not None and _active_sketch.isValid:
+        return _active_sketch.sketchPoints.add( _click_pt )
+    return None
+
+
+# Called when the user clicks in the graphics window while the dialog is open.
+def command_mouse_click(args: adsk.core.MouseEventArgs):
+    global _click_pt
+    if _active_sketch is None or not _active_sketch.isValid:
+        return
+
+    inputs = args.firingEvent.sender.commandInputs
+    centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
+    viewport = args.viewport
+    viewPt = args.viewportPosition
+
+    # A click on the already-selected point/circle is the selection itself,
+    # not a request to place a new point.
+    if centerSelection.selectionCount > 0:
+        entity = centerSelection.selection(0).entity
+        if futil.sketchEntityViewDistance( entity, viewport, viewPt ) <= CLICK_PICK_TOLERANCE_PX:
+            return
+
+    sketchPt = futil.viewClickToSketchPoint( _active_sketch, viewport, viewPt )
+    if sketchPt is None:
+        return
+
+    _click_pt = sketchPt
+    centerSelection.clearSelection()
+    clickLocation: adsk.core.StringValueCommandInput = inputs.itemById('click_location')
+    clickLocation.value = f'{sketchPt.x / 2.54:.3f}, {sketchPt.y / 2.54:.3f} in'
 
 
 # This event handler is called when the user clicks the OK button in the command dialog or 
@@ -132,20 +198,13 @@ def command_execute(args: adsk.core.CommandEventArgs):
 
     inputs = args.command.commandInputs
     boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
-    centerSelection: adsk.core.SelectionCommandInput = inputs.itemById('center_selection')
     suppressCenterHoleInp: adsk.core.BoolValueCommandInput = inputs.itemById('suppress_center_hole')
     centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
 
-    centerPt: adsk.fusion.SketchPoint = None
-    selectedEntity = centerSelection.selection(0).entity
-    if selectedEntity.objectType == adsk.fusion.SketchCircle.classType() :
-        centerPt = selectedEntity.centerSketchPoint
-    elif selectedEntity.objectType == adsk.fusion.SketchPoint.classType() :
-        centerPt = selectedEntity
-    else :
-        futil.popup_error( f'  Cannot handle object type = {selectedEntity.objectType}')
+    centerPt = _resolve_center( inputs )
+    if centerPt is None:
         return
-    
+
     boltPattern = bolt_patterns[ boltPatternInp.selectedItem.index ]
     sketch = centerPt.parentSketch
 
@@ -159,19 +218,22 @@ def command_execute(args: adsk.core.CommandEventArgs):
         centerDim.value = centerHoleDia
 
     # Create the bolt pattern bolt circle
-    boltCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, boltPattern.patternDia * 2.54 / 2 )
+    patternDiaCm = boltPattern.patternDia * 2.54
+    holeSizeCm = boltPattern.holeSize * 2.54
+    boltCircle = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, patternDiaCm / 2 )
     boltCircle.isConstruction = True
-    textPt = futil.offsetPoint3D( boltCircle.centerSketchPoint.geometry, -boltPattern.patternDia/4, boltPattern.patternDia/4, 0 )
+    textPt = futil.offsetPoint3D( boltCircle.centerSketchPoint.geometry, -patternDiaCm/4, patternDiaCm/4, 0 )
     boltCirDim = sketch.sketchDimensions.addDiameterDimension( boltCircle, textPt )
-    boltCirDim.value = boltPattern.patternDia * 2.54
+    boltCirDim.value = patternDiaCm
 
-    # Create a single bolt hole
-    boltCenter = adsk.core.Point3D.create( boltPattern.patternDia * 2.54 / 2, boltPattern.patternDia/4, 0 )
-    boltHole = sketch.sketchCurves.sketchCircles.addByCenterRadius( boltCenter, boltPattern.holeSize * 2.54 / 2 )
+    # Create a single bolt hole, drawn already on the bolt circle so the solver
+    # doesn't drag a free (clicked) center point toward it.
+    boltCenter = futil.offsetPoint3D( centerPt.geometry, patternDiaCm / 2, 0, 0 )
+    boltHole = sketch.sketchCurves.sketchCircles.addByCenterRadius( boltCenter, holeSizeCm / 2 )
     sketch.geometricConstraints.addCoincident( boltHole.centerSketchPoint, boltCircle )
-    textPt = futil.offsetPoint3D( boltHole.centerSketchPoint.geometry, boltPattern.holeSize/4, boltPattern.holeSize/4, 0 )
+    textPt = futil.offsetPoint3D( boltHole.centerSketchPoint.geometry, holeSizeCm/4, holeSizeCm/4, 0 )
     boltDim = sketch.sketchDimensions.addDiameterDimension( boltHole, textPt )
-    boltDim.value = boltPattern.holeSize * 2.54
+    boltDim.value = holeSizeCm
 
     # Create the hole pattern
     cirPattern = sketch.geometricConstraints.createCircularPatternInput( [boltHole], centerPt )
@@ -200,12 +262,21 @@ def command_preview(args: adsk.core.CommandEventArgs):
 # This event handler is called when the user changes anything in the command dialog
 # allowing you to modify values of other inputs based on that change.
 def command_input_changed(args: adsk.core.InputChangedEventArgs):
+    global _click_pt
     changed_input = args.input
     inputs = args.inputs
 
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Input Changed Event fired from a change to {changed_input.id}')
     
+    # Selecting an existing point/circle takes over from a clicked location.
+    if changed_input.id == 'center_selection':
+        centerSelection: adsk.core.SelectionCommandInput = changed_input
+        if centerSelection.selectionCount > 0 and _click_pt is not None:
+            _click_pt = None
+            clickLocation: adsk.core.StringValueCommandInput = changed_input.parentCommand.commandInputs.itemById('click_location')
+            clickLocation.value = ''
+
     # If the bolt pattern selection changed, update the center hole size default
     if changed_input.id == 'bolt_pattern':
         boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
@@ -229,7 +300,8 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
     
     # Validate inputs
-    if centerSelection.selectionCount > 0 and centerHoleSizeInp.value > 0:
+    hasCenter = centerSelection.selectionCount > 0 or _click_pt is not None
+    if hasCenter and centerHoleSizeInp.value > 0:
         args.areInputsValid = True
     else:
         args.areInputsValid = False
@@ -239,5 +311,7 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Command Destroy Event')
 
-    global local_handlers
+    global local_handlers, _active_sketch, _click_pt
     local_handlers = []
+    _active_sketch = None
+    _click_pt = None

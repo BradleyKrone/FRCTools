@@ -84,3 +84,81 @@ def sketchLineNormal( line: adsk.fusion.SketchLine, towardPt: adsk.core.Point3D 
 def BBCentroid( bb: adsk.core.BoundingBox3D ) :
     sum = addPoint3D( bb.maxPoint, bb.minPoint )
     return adsk.core.Point3D.create( sum.x / 2, sum.y / 2, sum.z / 2 )
+
+def _sketchInWorldContext( sketch: adsk.fusion.Sketch ) -> adsk.fusion.Sketch :
+    # A native sketch in a non-root component reports its component's frame from
+    # sketchToModelSpace/modelToSketchSpace; the viewport works in world space, so
+    # swap in the proxy through the occurrence (the active one if it owns the sketch).
+    if sketch.assemblyContext is not None:
+        return sketch
+    comp = sketch.parentComponent
+    design = adsk.fusion.Design.cast( comp.parentDesign )
+    if comp == design.rootComponent:
+        return sketch
+    occ = design.activeOccurrence
+    if occ is None or occ.component != comp:
+        occs = design.rootComponent.allOccurrencesByComponent( comp )
+        if occs.count == 0:
+            return sketch
+        occ = occs.item( 0 )
+    return sketch.createForAssemblyContext( occ )
+
+def viewClickToSketchPoint( sketch: adsk.fusion.Sketch, viewport: adsk.core.Viewport,
+                            viewPt: adsk.core.Point2D ) -> adsk.core.Point3D :
+    """Projects a viewport click (e.g. MouseEventArgs.viewportPosition) onto the sketch
+    plane and returns it in sketch space (z = 0), or None if the view is edge-on."""
+    sketch = _sketchInWorldContext( sketch )
+    modelPt = viewport.viewToModelSpace( viewPt )
+    cam = viewport.camera
+    if cam.cameraType == adsk.core.CameraTypes.OrthographicCameraType:
+        rayDir = cam.eye.vectorTo( cam.target )
+    else:
+        rayDir = cam.eye.vectorTo( modelPt )
+    if rayDir.length < 1e-9:
+        return None
+
+    origin = sketch.sketchToModelSpace( adsk.core.Point3D.create( 0, 0, 0 ) )
+    xDir = origin.vectorTo( sketch.sketchToModelSpace( adsk.core.Point3D.create( 1, 0, 0 ) ) )
+    yDir = origin.vectorTo( sketch.sketchToModelSpace( adsk.core.Point3D.create( 0, 1, 0 ) ) )
+    plane = adsk.core.Plane.create( origin, xDir.crossProduct( yDir ) )
+    hit = plane.intersectWithLine( adsk.core.InfiniteLine3D.create( modelPt, rayDir ) )
+    if hit is None:
+        return None
+
+    sketchPt = sketch.modelToSketchSpace( hit )
+    return adsk.core.Point3D.create( sketchPt.x, sketchPt.y, 0 )
+
+def sketchEntityViewDistance( entity, viewport: adsk.core.Viewport, viewPt: adsk.core.Point2D ) -> float :
+    """Distance in pixels from a viewport click to a SketchPoint, SketchCircle (edge or
+    center) or SketchLine. Returns math.inf for other entity types."""
+    sketch = _sketchInWorldContext( entity.parentSketch )
+    clickPt = viewClickToSketchPoint( sketch, viewport, viewPt )
+    if clickPt is None:
+        return math.inf
+
+    candidates = []
+    if entity.objectType == adsk.fusion.SketchPoint.classType():
+        candidates.append( entity.geometry )
+    elif entity.objectType == adsk.fusion.SketchCircle.classType():
+        center = entity.centerSketchPoint.geometry
+        candidates.append( center )
+        v = center.vectorTo( clickPt )
+        if v.length > 1e-9:
+            v.normalize()
+            v.scaleBy( entity.radius )
+            candidates.append( offsetPoint3D( center, v.x, v.y, v.z ) )
+    elif entity.objectType == adsk.fusion.SketchLine.classType():
+        s = entity.startSketchPoint.geometry
+        seg = s.vectorTo( entity.endSketchPoint.geometry )
+        lenSq = seg.dotProduct( seg )
+        t = 0.0 if lenSq < 1e-18 else max( 0.0, min( 1.0, s.vectorTo( clickPt ).dotProduct( seg ) / lenSq ) )
+        candidates.append( offsetPoint3D( s, seg.x * t, seg.y * t, seg.z * t ) )
+    else:
+        return math.inf
+
+    best = math.inf
+    for q in candidates:
+        vq = viewport.modelToViewSpace( sketch.sketchToModelSpace( q ) )
+        if vq is not None:
+            best = min( best, vq.distanceTo( viewPt ) )
+    return best

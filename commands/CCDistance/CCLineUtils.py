@@ -102,7 +102,8 @@ def ChainOuterDiameterIN( NT: int, pitchIN: float, rollerDiamIN: float ) -> floa
 
 def createCCLine( 
     startpt: adsk.fusion.SketchPoint, 
-    endpt: adsk.fusion.SketchPoint ) -> adsk.fusion.SketchLine :
+    endpt: adsk.fusion.SketchPoint,
+    lengthCM: float = 2 * 2.54 ) -> adsk.fusion.SketchLine :
 
     if startpt == None:
         design = adsk.fusion.Design.cast(app.activeProduct)
@@ -112,7 +113,7 @@ def createCCLine(
     sketch = startpt.parentSketch
 
     if endpt == None:
-        endpt3D = futil.offsetPoint3D( startpt.geometry, 2 * 2.54, 0, 0 )
+        endpt3D = futil.offsetPoint3D( startpt.geometry, lengthCM, 0, 0 )
         endpt = sketch.sketchPoints.add( endpt3D )
 
     # futil.log( f' createCCLine() points = {futil.format_Point3D(startpt.geometry)} -- {futil.format_Point3D(endpt.geometry)}')

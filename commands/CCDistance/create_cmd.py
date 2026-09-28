@@ -13,6 +13,14 @@ ui = app.userInterface
 # they are not released and garbage collected.
 local_handlers = []
 
+# Sketch that was active when the dialog opened, and the sketch-space point the user
+# clicked in empty space (None until they click). Used when nothing is selected.
+_active_sketch: adsk.fusion.Sketch = None
+_click_pt: adsk.core.Point3D = None
+
+# How close (in pixels) a click must be to the selected entity to count as re-picking it.
+CLICK_PICK_TOLERANCE_PX = 10
+
 
 # ===========
 # ===========   Create Command ROUTINES
@@ -34,12 +42,22 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         motionType.listItems.add( mtype, True, '')
     motionType.listItems.item( motionTypesDefault ).isSelected = True
 
-    # Create a selection input.
-    curveSelection = inputs.addSelectionInput('curve_selection', 'Selection', 'Select a circle, or a center point')
+    global _active_sketch, _click_pt
+    _active_sketch = adsk.fusion.Sketch.cast( app.activeProduct.activeEditObject )
+    _click_pt = None
+
+    # Create a selection input. Selecting is optional: clicking empty space in the
+    # active sketch starts the C-C line at a new (free) point there instead.
+    curveSelection = inputs.addSelectionInput('curve_selection', 'Selection', 'Click a location, or select a circle/center point')
     curveSelection.addSelectionFilter( "SketchCircles" )
     curveSelection.addSelectionFilter( "SketchLines" )
     curveSelection.addSelectionFilter( "SketchPoints" )
-    curveSelection.setSelectionLimits( 1, 1 )
+    curveSelection.setSelectionLimits( 0, 1 )
+
+    # Read-only readout of the clicked location. Changing its value from the mouse
+    # click handler is also what makes Fusion re-validate and re-run the preview.
+    clickLocation = inputs.addStringValueInput('click_location', 'Location', '')
+    clickLocation.isReadOnly = True
 
     inputs.addBoolValueInput( "require_selection", "Require Selection", True, "", True )
 
@@ -107,7 +125,36 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.inputChanged, command_input_changed, local_handlers=local_handlers)
     futil.add_handler(args.command.executePreview, command_preview, local_handlers=local_handlers)
     futil.add_handler(args.command.validateInputs, command_validate_input, local_handlers=local_handlers)
+    futil.add_handler(args.command.mouseClick, command_mouse_click, local_handlers=local_handlers)
     futil.add_handler(args.command.destroy, command_destroy, local_handlers=local_handlers)
+
+
+# Called when the user clicks in the graphics window while the dialog is open.
+def command_mouse_click(args: adsk.core.MouseEventArgs):
+    global _click_pt
+    if _active_sketch is None or not _active_sketch.isValid:
+        return
+
+    inputs = args.firingEvent.sender.commandInputs
+    curveSelection: adsk.core.SelectionCommandInput = inputs.itemById('curve_selection')
+    viewport = args.viewport
+    viewPt = args.viewportPosition
+
+    # A click on the already-selected entity is the selection itself,
+    # not a request to place a new point.
+    if curveSelection.selectionCount > 0:
+        entity = curveSelection.selection(0).entity
+        if futil.sketchEntityViewDistance( entity, viewport, viewPt ) <= CLICK_PICK_TOLERANCE_PX:
+            return
+
+    sketchPt = futil.viewClickToSketchPoint( _active_sketch, viewport, viewPt )
+    if sketchPt is None:
+        return
+
+    _click_pt = sketchPt
+    curveSelection.clearSelection()
+    clickLocation: adsk.core.StringValueCommandInput = inputs.itemById('click_location')
+    clickLocation.value = f'{sketchPt.x / 2.54:.3f}, {sketchPt.y / 2.54:.3f} in'
 
 
 # This event handler is called when the user clicks the OK button in the command dialog or 
@@ -155,9 +202,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
         else :
             startSketchPt = selEntity
 
-    if ccLine.line == None:
-        ccLine.line = ccutil.createCCLine( startSketchPt, endSketchPt )
-    elif CCLine.isCCLine( ccLine.line ):
+    if ccLine.line != None and CCLine.isCCLine( ccLine.line ):
         ccLine = CCLine.getCCLineFromEntity( ccLine.line )
 
     ccLine.data.ExtraCenterIN = extraCenterInp.value / 2.54
@@ -192,6 +237,13 @@ def command_execute(args: adsk.core.CommandEventArgs):
     ccutil.calcCCLineData( ccLine.data )
     if ccLine.data.ccDistIN < 0.001:
         return
+
+    if ccLine.line == None:
+        # Nothing picked: start at the clicked location (left free for the user to dimension).
+        if startSketchPt == None and _click_pt is not None and _active_sketch is not None and _active_sketch.isValid:
+            startSketchPt = _active_sketch.sketchPoints.add( _click_pt )
+        # Draw the line at its final length so the dimension doesn't drag a free start point.
+        ccLine.line = ccutil.createCCLine( startSketchPt, endSketchPt, (ccLine.data.ccDistIN + ccLine.data.ExtraCenterIN) * 2.54 )
 
     if not ccutil.isCCLine( ccLine.line ):
         # ccutil.calcCCLineData( ccLine.data )
@@ -271,6 +323,7 @@ def command_preview(args: adsk.core.CommandEventArgs):
 # This event handler is called when the user changes anything in the command dialog
 # allowing you to modify values of other inputs based on that change.
 def command_input_changed(args: adsk.core.InputChangedEventArgs):
+    global _click_pt
     changed_input = args.input
     # inputs = args.inputs
     inputs = args.input.parentCommand.commandInputs
@@ -332,11 +385,15 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     if changed_input.id == 'require_selection':
         if requireSelectionInp.value:
             curveSelection.isVisible = True
-            curveSelection.setSelectionLimits( 1, 2 )
         else:
             curveSelection.isVisible = False
             curveSelection.clearSelection()
-            curveSelection.setSelectionLimits( 0, 2 )
+
+    # Selecting an existing entity takes over from a clicked location.
+    if changed_input.id == 'curve_selection':
+        if curveSelection.selectionCount > 0 and _click_pt is not None:
+            _click_pt = None
+            inputs.itemById('click_location').value = ''
 
     if changed_input.id == 'use_pinion_cog1':
         if cog1Group.isEnabledCheckBoxChecked:
@@ -378,6 +435,13 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     # futil.log(f'{args.firingEvent.name} Command Validate Event, Motion={motionType.selectedItem.index}, N1={cog1Teeth.value}, N2={cog2Teeth.value}, T={beltTeeth.value}')
     args.areInputsValid = True        
 
+    requireSelection = inputs.itemById( "require_selection" ).value
+    curveSelection: adsk.core.SelectionCommandInput = inputs.itemById('curve_selection')
+    if requireSelection and curveSelection.selectionCount == 0 and _click_pt is None:
+        status.formattedText = '<div align="center">Click a location, or select a circle/center point</div>'
+        args.areInputsValid = False
+        return
+
     if not (cog1Teeth.value >= 6 and cog1Teeth.value < 100 and cog2Teeth.value >= 6 and cog2Teeth.value < 100 ):
         status.formattedText = '<div align="center"><font color="red">Invalid Number of cog teeth! [6-100]</font></div>'
         args.areInputsValid = False
@@ -407,7 +471,9 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 # This event handler is called when the create or edit commands terminate.
 def command_destroy(args: adsk.core.CommandEventArgs):
-    global local_handlers
+    global local_handlers, _active_sketch, _click_pt
+    _active_sketch = None
+    _click_pt = None
 
     # General logging for debug.
     # futil.log(f'{args.command.parentCommandDefinition.name} Command Destroy Event')
