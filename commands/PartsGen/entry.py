@@ -28,6 +28,10 @@ from .hardware_gen import (PART_HARDWARE, add_hardware_group, create_hardware,
                            handle_hardware_input_changed, handle_hardware_html,
                            selected_spacer_type, create_spacers, SPACER_BY_SHAFT_TYPE,
                            _hardware_folder, _hardware_parent)
+from .gear_gen import MOTION_GEARS_20DP
+from .chain_gen import MOTION_CHAIN_25, MOTION_CHAIN_35
+from ..CCDistance.CCLine import getCCLineFromEntity
+from ..CCDistance.entry import motionTypes as CC_MOTION_NAMES
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -89,6 +93,23 @@ PART_BELT    = 'Timing Belt'
 PART_SPROCKET = 'Sprocket'
 PART_CHAIN   = 'Chain'
 # PART_GEAR ('Gear') comes from gear_gen.py, which stores it on the component.
+
+# C-C Auto Gen is the create dialog's one entry for Timing Belt, Chain and Gear: picking a
+# C-C line reads its motion type, and the dialog then behaves as that part type (see
+# _part_type), its line's two pitch circles in that part's own End Circles input. A C-C
+# line of another kind picked there switches the type again. The edit dialog still lists
+# the three types by name.
+PART_CC_AUTO = 'C-C Auto Gen'
+CC_AUTO_PICK_IDS = ('tb_pitch_circles', 'chain_pitch_circles', 'gear_pitch_circles')
+MOTION_BELT_HTD_5MM = 1
+MOTION_BELT_GT2_3MM = 2
+CC_AUTO_TARGETS = {
+    MOTION_GEARS_20DP:   (PART_GEAR,  'gear_pitch_circles'),
+    MOTION_BELT_HTD_5MM: (PART_BELT,  'tb_pitch_circles'),
+    MOTION_BELT_GT2_3MM: (PART_BELT,  'tb_pitch_circles'),
+    MOTION_CHAIN_25:     (PART_CHAIN, 'chain_pitch_circles'),
+    MOTION_CHAIN_35:     (PART_CHAIN, 'chain_pitch_circles'),
+}
 
 # ---------------------------------------------------------------------------
 # Shaft types
@@ -642,11 +663,26 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     partTypeInp.listItems.add(PART_SHAFT,    True,  '')
     partTypeInp.listItems.add(PART_TUBE,    False, '')
     partTypeInp.listItems.add(PART_PULLEY,  False, '')
-    partTypeInp.listItems.add(PART_BELT,    False, '')
     partTypeInp.listItems.add(PART_SPROCKET, False, '')
-    partTypeInp.listItems.add(PART_CHAIN,   False, '')
-    partTypeInp.listItems.add(PART_GEAR,    False, '')
+    partTypeInp.listItems.add(PART_CC_AUTO, False, '')   # Timing Belt / Chain / Gear
     partTypeInp.listItems.add(PART_HARDWARE, False, '')
+
+    # --- C-C Auto Gen (one C-C line pick; see _handle_cc_auto_pick) -----------
+    ccAutoInp = partInputs.addSelectionInput(
+        'cc_auto_line', 'C-C Line', 'Select a C-C Line made with the C-C Distance tool')
+    ccAutoInp.addSelectionFilter('SketchCurves')
+    ccAutoInp.setSelectionLimits(0, 1)
+    ccAutoInp.tooltip = ('Pick a C-C Line (or one of its circles). Parts Gen builds the '
+                         'Timing Belt, Chain or Gear pair it was made for.')
+    ccAutoInp.isVisible = False
+
+    ccAutoInfoInp = partInputs.addTextBoxCommandInput('cc_auto_info', 'Type', 'Pick a C-C Line',
+                                                      1, True)
+    ccAutoInfoInp.isVisible = False
+
+    # The picked line's part type (PART_BELT / PART_CHAIN / PART_GEAR, '' = none yet).
+    ccAutoKindInp = partInputs.addStringValueInput('cc_auto_kind', 'C-C Kind', '')
+    ccAutoKindInp.isVisible = False
 
     # --- Component name (optional override; blank = auto-generated name) -----
     customNameInp = partInputs.addStringValueInput('custom_name', 'Component Name', '')
@@ -914,7 +950,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
 
 # Not carried over by Apply: the button itself and the name override (it named the part
 # just made). Picks aren't saved either -- they belong to the part just made.
-_APPLY_SKIP_IDS = ('apply_btn', 'custom_name')
+_APPLY_SKIP_IDS = ('apply_btn', 'custom_name', 'cc_auto_kind')
 
 
 def _walk_inputs(inputs: adsk.core.CommandInputs):
@@ -978,8 +1014,7 @@ def _restore_apply_state(inputs: adsk.core.CommandInputs, state):
     # Visibility follows the restored checkboxes (tube holes, joint options, ...). The
     # id is one _refresh_inputs has no special case for, so nothing else is reset.
     _refresh_inputs(inputs.itemById('custom_length'))
-    for sel_id in ('ref_point_selection', 'face1_selection', 'hw_holes', 'tb_pitch_circles',
-                   'chain_pitch_circles', 'gear_pitch_circles'):
+    for sel_id in ('ref_point_selection', 'face1_selection', 'hw_holes', 'cc_auto_line'):
         sel = inputs.itemById(sel_id)
         if sel is not None and sel.isVisible:
             sel.hasFocus = True
@@ -1011,8 +1046,12 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
     # Not args.inputs -- that's only the changed input's own group (see _add_dialog_groups).
     inputs = changed_input.parentCommand.commandInputs
 
+    if changed_input.id == 'cc_auto_line' or _cc_auto_other_kind_picked(inputs, changed_input):
+        _handle_cc_auto_pick(inputs, changed_input)
+        return
+
     partTypeInp:    adsk.core.DropDownCommandInput   = inputs.itemById('part_type')
-    shaftTypeInp:   adsk.core.DropDownCommandInput   = inputs.itemById('shaft_type')
+    shaftTypeInp:  adsk.core.DropDownCommandInput   = inputs.itemById('shaft_type')
     customOD:       adsk.core.ValueCommandInput      = inputs.itemById('custom_od')
     customID:       adsk.core.ValueCommandInput      = inputs.itemById('custom_id')
     tubeWidthInp:   adsk.core.ValueCommandInput      = inputs.itemById('tube_width')
@@ -1039,7 +1078,9 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
     tbGenPulleysInp:     adsk.core.BoolValueCommandInput = inputs.itemById('tb_gen_pulleys')
     pulleyShowTeethInp:  adsk.core.BoolValueCommandInput = inputs.itemById('pulley_show_teeth')
 
-    part_type        = partTypeInp.selectedItem.name
+    # C-C Auto Gen acts as the Belt / Chain / Gear its picked line is for (none yet = '').
+    part_is_cc_auto  = (partTypeInp.selectedItem.name == PART_CC_AUTO)
+    part_type        = _part_type(inputs)
     part_is_shaft    = (part_type == PART_SHAFT)
     part_is_tube     = (part_type == PART_TUBE)
     part_is_pulley   = (part_type == PART_PULLEY)
@@ -1074,7 +1115,8 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
 
     is_between_faces = (lenTypeInp.selectedItem.name   == LEN_FACES)
     hide_length      = (part_is_pulley or part_is_belt or part_is_sprocket or part_is_chain
-                        or part_is_gear or (part_is_hardware and not part_is_spacer))
+                        or part_is_gear or part_is_cc_auto
+                        or (part_is_hardware and not part_is_spacer))
 
     # "Create Joint" defaults on, but in Custom Length it needs a Reference Point that
     # command_validate_input insists on -- so with nothing picked (e.g. an empty design) the
@@ -1158,11 +1200,26 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
     if gearGroup is not None:
         gearGroup.isVisible = part_is_gear
     gearCirclesInp = inputs.itemById('gear_pitch_circles')
+    gearToothInp = inputs.itemById('gear_tooth_count')
+    if part_is_cc_auto and gearToothInp is not None:
+        gearToothInp.isVisible = False  # always a C-C pair here, never a standalone gear
     if part_is_gear and gearCirclesInp is not None and gearCirclesInp.isVisible \
             and changed_input.id == 'part_type':
         gearCirclesInp.hasFocus = True
     if changed_input.id == 'gear_pitch_circles':
         handle_gear_selection_changed(inputs)
+
+    # C-C Auto Gen
+    ccAutoInp = inputs.itemById('cc_auto_line')
+    if ccAutoInp is not None:
+        ccAutoInp.isVisible = part_is_cc_auto
+        # Optional: it's emptied once read (_handle_cc_auto_pick); "Type" shows the pick.
+        ccAutoInp.setSelectionLimits(0, 1)
+        if part_is_cc_auto and changed_input.id == 'part_type':
+            ccAutoInp.hasFocus = True
+    ccAutoInfoInp = inputs.itemById('cc_auto_info')
+    if ccAutoInfoInp is not None:
+        ccAutoInfoInp.isVisible = part_is_cc_auto
 
     # Hardware group
     hardwareGroup = inputs.itemById('hardware_group')
@@ -1259,10 +1316,12 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
         else:
             chainCirclesInp.setSelectionLimits(0, 2)
 
-    if part_is_belt and tbCirclesInp is not None and changed_input.id == 'part_type':
+    if (part_is_belt and not part_is_cc_auto and tbCirclesInp is not None
+            and changed_input.id == 'part_type'):
         tbCirclesInp.hasFocus = True
 
-    if part_is_chain and chainCirclesInp is not None and changed_input.id == 'part_type':
+    if (part_is_chain and not part_is_cc_auto and chainCirclesInp is not None
+            and changed_input.id == 'part_type'):
         chainCirclesInp.hasFocus = True
 
     # Outer Diameter is shared between Custom (Round Tube) and the two Hex Spacer shaft
@@ -1312,6 +1371,94 @@ def _refresh_inputs(changed_input: adsk.core.CommandInput):
             offsetFaceInp.hasFocus = True
 
 
+def _part_type(inputs: adsk.core.CommandInputs) -> str:
+    """The part type the dialog builds: the Part Type dropdown's, except that C-C Auto Gen
+    stands for the Timing Belt / Chain / Gear its picked C-C line is for ('' until one is)."""
+    partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
+    if partTypeInp is None or partTypeInp.selectedItem is None:
+        return ''
+    if partTypeInp.selectedItem.name != PART_CC_AUTO:
+        return partTypeInp.selectedItem.name
+    kindInp = inputs.itemById('cc_auto_kind')
+    return kindInp.value if kindInp is not None else ''
+
+
+def _cc_auto_target(pickInp: adsk.core.SelectionCommandInput):
+    """(C-C line, (part type, End Circles input id)) for the latest pick in `pickInp`, or
+    (None, None) when it isn't part of a C-C line Parts Gen knows."""
+    count = pickInp.selectionCount
+    if count < 1:
+        return None, None
+    try:
+        entity = pickInp.selection(count - 1).entity
+    except RuntimeError:
+        return None, None   # the count can run ahead of the indexer mid-click (LESSONS_LEARNED.md)
+    cc = getCCLineFromEntity(entity)
+    if cc is None or cc.data is None or cc.line is None:
+        return None, None
+    target = CC_AUTO_TARGETS.get(cc.data.motion)
+    return (cc, target) if target is not None else (None, None)
+
+
+def _cc_auto_other_kind_picked(inputs: adsk.core.CommandInputs,
+                               changed_input: adsk.core.CommandInput) -> bool:
+    """True when, in C-C Auto Gen, a C-C line of another kind (e.g. a chain line while it's
+    a belt) was picked in the shown End Circles input -- that switches the part type."""
+    if changed_input.id not in CC_AUTO_PICK_IDS:
+        return False
+    partTypeInp = inputs.itemById('part_type')
+    if partTypeInp is None or partTypeInp.selectedItem.name != PART_CC_AUTO:
+        return False
+    pickInp = adsk.core.SelectionCommandInput.cast(changed_input)
+    if pickInp is None or pickInp.selectionCount not in (1, 3):
+        return False
+    _, target = _cc_auto_target(pickInp)
+    return target is not None and target[0] != _part_type(inputs)
+
+
+def _handle_cc_auto_pick(inputs: adsk.core.CommandInputs,
+                         pickInp: adsk.core.SelectionCommandInput):
+    """C-C Auto Gen: read the C-C line just picked in `pickInp` (the C-C Line input, or the
+    shown End Circles input), make the dialog act as the Timing Belt / Chain / Gear it was
+    made for, and hand the line to that part's End Circles input. Its own selection handler
+    then picks both pitch circles and sets the belt type / chain sprocket width / gear bores,
+    just as if the user had picked it there."""
+    kindInp: adsk.core.StringValueCommandInput = inputs.itemById('cc_auto_kind')
+    infoInp: adsk.core.TextBoxCommandInput     = inputs.itemById('cc_auto_info')
+    partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
+    # The pick is cleared once read (below), which can fire this again with nothing picked:
+    # keep the current part type then -- only a new C-C line changes it.
+    if kindInp is None or pickInp.selectionCount < 1:
+        return
+    try:
+        cc, target = _cc_auto_target(pickInp)
+        # An entity can only be in one SelectionCommandInput at a time, so free the picked
+        # line/circle before it's handed to the part's own End Circles input.
+        pickInp.clearSelection()
+        if target is None:
+            futil.popup_error('Parts Gen: please select a C-C Line made with the C-C '
+                              'Distance tool (Gears 20DP, HTD / GT2 belt, or #25 / #35 chain).')
+            return
+
+        # Drop the previous line's circles, then show the new part type's settings.
+        for pick_id in CC_AUTO_PICK_IDS:
+            otherInp = inputs.itemById(pick_id)
+            if otherInp is not None:
+                otherInp.clearSelection()
+        kindInp.value = target[0]
+        if infoInp is not None:
+            infoInp.text = CC_MOTION_NAMES[cc.data.motion]
+        _refresh_inputs(partTypeInp)    # as a Part Type change: shows its End Circles input
+
+        # Hand the line over exactly like a user pick there. The input must stay shown:
+        # Fusion drops a SelectionCommandInput's picks while it is hidden.
+        targetInp: adsk.core.SelectionCommandInput = inputs.itemById(target[1])
+        targetInp.addSelection(cc.line)
+        _refresh_inputs(targetInp)      # runs its handler, then focuses Offset From
+    except Exception:
+        futil.handle_error('PartsGen C-C Auto Gen', show_message_box=False)
+
+
 # ===========================================================================
 # execute / preview
 # ===========================================================================
@@ -1329,10 +1476,11 @@ def _run_part_creation(inputs: adsk.core.CommandInputs, show_message_box: bool,
     `is_preview` lets a generator skip work that only matters on the committed
     result; the shaft and tube use it to skip their (slow) sketch constraining.
     """
-    partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
-    part_type = partTypeInp.selectedItem.name
+    part_type = _part_type(inputs)
     try:
         ref_face = None
+        if not part_type:
+            return False, None     # C-C Auto Gen with no C-C line picked yet
         if part_type == PART_SHAFT:
             ref_face = _create_shaft(inputs, constrain=not is_preview)
         elif part_type == PART_TUBE:
@@ -1380,8 +1528,7 @@ _OFFSET_PICK_OPACITY = 0.3
 
 def _offset_face_input(inputs: adsk.core.CommandInputs):
     """The shown Offset From input of the Timing Belt / Chain / Gear pair, or None."""
-    partTypeInp = inputs.itemById('part_type')
-    part_type = partTypeInp.selectedItem.name if partTypeInp.selectedItem is not None else ''
+    part_type = _part_type(inputs)
     if part_type == PART_BELT:
         # It lives in Pulley 1's group, which is hidden when pulleys aren't generated.
         group = inputs.itemById('belt_pulley1_group')
@@ -1476,8 +1623,7 @@ def command_preview(args: adsk.core.CommandEventArgs):
 
 def _command_preview(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
-    partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
-    part_type = partTypeInp.selectedItem.name
+    part_type = _part_type(inputs)
     if part_type == PART_BELT:
         # Live Preview off: build nothing. isValidResult stays False, so OK runs the full build.
         livePreviewInp = inputs.itemById('tb_live_preview')
@@ -1545,10 +1691,15 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
     refPointSel:    adsk.core.SelectionCommandInput = inputs.itemById('ref_point_selection')
     customLenInp:   adsk.core.ValueCommandInput     = inputs.itemById('custom_length')
 
-    part_type = partTypeInp.selectedItem.name
+    part_type = _part_type(inputs)
     # A Hardware > Spacer validates as a Shaft (it is built as one).
     spacer_type = selected_spacer_type(inputs)
     shaft_like  = part_type == PART_SHAFT or spacer_type is not None
+
+    # --- C-C Auto Gen: nothing to build until a C-C line is picked
+    if not part_type:
+        args.areInputsValid = False
+        return
 
     # --- Timing Pulley validation -------------------------------------------
     if part_type == PART_PULLEY:
@@ -1707,8 +1858,11 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 def command_destroy(args: adsk.core.CommandEventArgs, handlers: list):
     global local_handlers
     # An Apply's pre-empted dialog is destroyed after the next one opened -- leave the
-    # newer dialog's handlers and reference-face highlight alone.
+    # newer dialog's handlers and reference-face highlight alone. Its committed part (a
+    # gear/chain preview kept as the result) must still be made pickable again, or the next
+    # dialog's Offset From can't select it.
     if handlers is not local_handlers:
+        _restore_preview_selectable()
         return
     local_handlers = []
     _clear_ref_face_highlight()
