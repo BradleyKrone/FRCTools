@@ -40,18 +40,35 @@ class BoltPattern(typing.NamedTuple) :
     holeSize: float = 0.0
     numberOfHoles: int = 0
     suppression: list[int] = []
+    outline: str = ''           # '' (none), 'kraken', 'maxplanetary' or 'circle'
+    outlineDims: tuple = ()     # outline-specific sizes, in inches
 
 # Selection of Bolt Patterns
+# Kraken: the missing 12th hole is at index 6 (opposite the first hole) so the wire bump of the
+# outline sits straight across from it -- same 11 holes as the real motor, just clocked.
+# Kraken outlineDims = (body diameter, overall height to the bump's flat), from WCP-0940 / WCP-0941.
 bolt_patterns: list[BoltPattern] = [
-    # Name, center hole radius, pattern radius, hole size, # of holes, suppression
-    BoltPattern('Kraken X60', 0.75, 2.0, 0.196, 12, [0,0,0,0,0,0,0,0,0,0,0,1]),
-    BoltPattern('Kraken X44', 0.75, 1.375, 0.196, 12, [0,0,0,0,0,0,0,0,0,0,0,1]),
+    # Name, center hole radius, pattern radius, hole size, # of holes, suppression, outline, outline dims
+    BoltPattern('Kraken X60', 0.75, 2.0, 0.196, 12, [0,0,0,0,0,0,1,0,0,0,0,0], 'kraken', (2.367, 2.498)),
+    BoltPattern('Kraken X44', 0.75, 1.375, 0.196, 12, [0,0,0,0,0,0,1,0,0,0,0,0], 'kraken', (1.732, 1.866)),
     # BoltPattern('NEO Vortex', 0.75, 2.0, 0.196, 8, [0,0,0,1,0,0,0,1]),
     # BoltPattern('NEO 550', 0.5118, 0.9843, 0.125, 4, []),
-    BoltPattern('REV MAXPlanetary', 1.125, 2.0, 0.196, 8, [0,0,1,1,0,0,1,1]),
+    BoltPattern('REV MAXPlanetary', 1.125, 2.0, 0.196, 8, [0,0,1,1,0,0,1,1], 'maxplanetary'),
+    # Thrifty Cycloidal (TTB-0300): 12x 8-32 tapped on each face; inner = output, outer = housing.
+    # The 'circle' outline is the plate's outer edge (real geometry, not construction).
+    BoltPattern('Thrifty Cycloidal (Inner)', 1.126, 1.5, 0.177, 12, [], 'circle', (2.0,)),
+    BoltPattern('Thrifty Cycloidal (Outer)', 2.14, 2.5, 0.177, 12, [], 'circle', (3.0,)),
     # BoltPattern('2" MultiMotor', 0.75, 2.0, 0.196, 24, [0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1, 0,1,0,0,0,1]),
     BoltPattern('Hex Bearing Retention', 1.125, 1.422, 0.159, 6, [0,0,0,0,0,0]),
 ]
+
+# REV MAXPlanetary outer profile (inches), from REV-21-2100 / REV-21-2101: a 2.000" square with its
+# sides parallel to the 0/180 deg face holes, two opposite corners chamfered 45 deg, and a half-round
+# mounting ear on each of the other two corners (flush with the face, 2.44" across the ears).
+MAXP_HALF_SIDE = 1.0
+MAXP_CHAMFER = 0.34
+MAXP_EAR_RADIUS = 0.155
+MAXP_EAR_OVERHANG = 0.065     # ear arc center beyond the side face
 
 # Executed when add-in is run.
 def start():
@@ -122,6 +139,10 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     for bp in bolt_patterns:
         boltPattern.listItems.add( bp.name, True, '')
     boltPattern.listItems.item( 0 ).isSelected = True
+
+    # Construction outline of the motor/gearbox housing, for patterns that have one
+    showOutline = inputs.addBoolValueInput('show_outline', 'Show Outer Profile', True, '', True)
+    showOutline.isVisible = bolt_patterns[0].outline != ''
 
     # Center hole options
     centerHoleGroup = inputs.addGroupCommandInput('center_hole_group', 'Center Hole Options')
@@ -196,14 +217,21 @@ def command_execute(args: adsk.core.CommandEventArgs):
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Command Execute Event')
 
-    inputs = args.command.commandInputs
+    _build_pattern( args.command.commandInputs, constrain=True )
+
+
+# Draws the selected bolt pattern (and its outer profile, if enabled). `constrain=False`
+# skips constraining the outline -- too slow for preview; execute rebuilds it constrained.
+# Returns True if an outline was drawn.
+def _build_pattern(inputs: adsk.core.CommandInputs, constrain: bool) -> bool:
     boltPatternInp: adsk.core.DropDownCommandInput = inputs.itemById('bolt_pattern')
     suppressCenterHoleInp: adsk.core.BoolValueCommandInput = inputs.itemById('suppress_center_hole')
     centerHoleSizeInp: adsk.core.ValueCommandInput = inputs.itemById('center_hole_size')
+    showOutlineInp: adsk.core.BoolValueCommandInput = inputs.itemById('show_outline')
 
     centerPt = _resolve_center( inputs )
     if centerPt is None:
-        return
+        return False
 
     boltPattern = bolt_patterns[ boltPatternInp.selectedItem.index ]
     sketch = centerPt.parentSketch
@@ -250,13 +278,182 @@ def command_execute(args: adsk.core.CommandEventArgs):
 
     sketch.geometricConstraints.addCircularPattern( cirPattern )
 
+    if boltPattern.outline == '' or not showOutlineInp.value:
+        return False
+
+    # Plain round plate edge: cheap to constrain, so the preview can stand as the result.
+    if boltPattern.outline == 'circle':
+        _draw_circle_outline( sketch, centerPt, boltPattern.outlineDims[0] )
+        return False
+
+    # Clocking line from the center to the first bolt hole: the outline is oriented off it,
+    # so the outline turns with the pattern.
+    clockLine = sketch.sketchCurves.sketchLines.addByTwoPoints( centerPt.geometry, boltHole.centerSketchPoint.geometry )
+    clockLine.isConstruction = True
+    sketch.geometricConstraints.addCoincident( clockLine.startSketchPoint, centerPt )
+    sketch.geometricConstraints.addCoincident( clockLine.endSketchPoint, boltHole.centerSketchPoint )
+
+    if boltPattern.outline == 'kraken':
+        _draw_kraken_outline( sketch, centerPt, clockLine, boltPattern.outlineDims[0], boltPattern.outlineDims[1], constrain )
+    elif boltPattern.outline == 'maxplanetary':
+        _draw_maxplanetary_outline( sketch, centerPt, clockLine, constrain )
+    return True
+
+
+# Round plate outer edge (e.g. Thrifty Cycloidal plates), as real geometry so the plate can be
+# extruded straight from the sketch.
+def _draw_circle_outline(sketch: adsk.fusion.Sketch, centerPt: adsk.fusion.SketchPoint, diaIn: float):
+    diaCm = diaIn * 2.54
+    circle = sketch.sketchCurves.sketchCircles.addByCenterRadius( centerPt, diaCm / 2 )
+    if circle.centerSketchPoint != centerPt:
+        sketch.geometricConstraints.addCoincident( circle.centerSketchPoint, centerPt )
+    textPt = futil.offsetPoint3D( centerPt.geometry, diaCm / 3, -diaCm / 3, 0 )
+    sketch.sketchDimensions.addDiameterDimension( circle, textPt ).value = diaCm
+
+
+# Kraken X60/X44 face outline:the round body plus the wire-routing bump, as construction.
+# The bump points away from the first bolt hole (the gap in the 12-hole pattern). WCP's
+# drawing gives only the body diameter and the overall height to the bump's flat; the bump's
+# sides are taken as tangent to the body at 45 deg (90 deg apart), which matches the drawing.
+def _draw_kraken_outline(sketch: adsk.fusion.Sketch, centerPt: adsk.fusion.SketchPoint,
+                         clockLine: adsk.fusion.SketchLine, bodyDiaIn: float, overallIn: float,
+                         constrain: bool):
+    R = bodyDiaIn * 2.54 / 2
+    h = overallIn * 2.54 - R                 # center to the bump's flat
+    flatHalf = math.sqrt(2) * R - h
+
+    # Local frame: +u toward the first bolt hole, bump toward -u
+    c = centerPt.geometry
+    d = clockLine.startSketchPoint.geometry.vectorTo( clockLine.endSketchPoint.geometry )
+    d.normalize()
+    def _pt(u, v):
+        return adsk.core.Point3D.create( c.x + u * d.x - v * d.y, c.y + u * d.y + v * d.x, 0 )
+    def _polar(deg):
+        a = math.radians(deg)
+        return _pt( R * math.cos(a), R * math.sin(a) )
+
+    lines = sketch.sketchCurves.sketchLines
+    arc = sketch.sketchCurves.sketchArcs.addByCenterStartSweep( centerPt, _polar(225), math.radians(270) )
+    sideUp = lines.addByTwoPoints( _polar(135), _pt(-h, flatHalf) )
+    flat = lines.addByTwoPoints( _pt(-h, flatHalf), _pt(-h, -flatHalf) )
+    sideDown = lines.addByTwoPoints( _pt(-h, -flatHalf), _polar(225) )
+    for curve in (arc, sideUp, flat, sideDown):
+        curve.isConstruction = True
+
+    if not constrain:
+        return
+
+    gc = sketch.geometricConstraints
+    sd = sketch.sketchDimensions
+    # Passing centerPt as the arc's center does not share the point -- stitch it explicitly
+    if arc.centerSketchPoint != centerPt:
+        gc.addCoincident( arc.centerSketchPoint, centerPt )
+    gc.addCoincident( arc.endSketchPoint, sideUp.startSketchPoint )
+    gc.addCoincident( sideUp.endSketchPoint, flat.startSketchPoint )
+    gc.addCoincident( flat.endSketchPoint, sideDown.startSketchPoint )
+    gc.addCoincident( sideDown.endSketchPoint, arc.startSketchPoint )
+    gc.addTangent( arc, sideUp )
+    gc.addTangent( arc, sideDown )
+    gc.addPerpendicular( sideUp, sideDown )
+    gc.addSymmetry( flat.startSketchPoint, flat.endSketchPoint, clockLine )
+    sd.addDiameterDimension( arc, _pt(0.7 * R, 0.7 * R) )
+    sd.addOffsetDimension( flat, centerPt, _pt(-h / 2, -0.5 * R) )
+
+
+# REV MAXPlanetary outline (see the MAXP_* constants), as construction. The square's sides are
+# parallel to the clocking line. The loop is REV's drawing mirrored in v: the pattern here runs
+# CCW, so its face holes sit at 0/45/180/225 deg where the drawing's are at 0/135/180/315.
+def _draw_maxplanetary_outline(sketch: adsk.fusion.Sketch, centerPt: adsk.fusion.SketchPoint,
+                               clockLine: adsk.fusion.SketchLine, constrain: bool):
+    a = MAXP_HALF_SIDE * 2.54
+    ch = MAXP_CHAMFER * 2.54
+    r = MAXP_EAR_RADIUS * 2.54
+    e = MAXP_EAR_OVERHANG * 2.54
+
+    c = centerPt.geometry
+    d = clockLine.startSketchPoint.geometry.vectorTo( clockLine.endSketchPoint.geometry )
+    d.normalize()
+    def _pt(u, v):
+        return adsk.core.Point3D.create( c.x + u * d.x - v * d.y, c.y + u * d.y + v * d.x, 0 )
+
+    # Corners going clockwise (CCW in REV's unmirrored view). Ears: lower-right (flush with
+    # the bottom face) and upper-left (flush with the top); chamfers: upper-right, lower-left.
+    lines = sketch.sketchCurves.sketchLines
+    arcs = sketch.sketchCurves.sketchArcs
+    top = lines.addByTwoPoints( _pt(-(a + e), a), _pt(a - ch, a) )
+    chamferTR = lines.addByTwoPoints( _pt(a - ch, a), _pt(a, a - ch) )
+    right = lines.addByTwoPoints( _pt(a, a - ch), _pt(a, -a + 2 * r) )
+    returnBR = lines.addByTwoPoints( _pt(a, -a + 2 * r), _pt(a + e, -a + 2 * r) )
+    # Arcs always run CCW: this one from the bottom face up to the return line, bulging outward
+    earBR = arcs.addByCenterStartSweep( _pt(a + e, -a + r), _pt(a + e, -a), math.pi )
+    bottom = lines.addByTwoPoints( _pt(a + e, -a), _pt(-(a - ch), -a) )
+    chamferBL = lines.addByTwoPoints( _pt(-(a - ch), -a), _pt(-a, -(a - ch)) )
+    left = lines.addByTwoPoints( _pt(-a, -(a - ch)), _pt(-a, a - 2 * r) )
+    returnTL = lines.addByTwoPoints( _pt(-a, a - 2 * r), _pt(-(a + e), a - 2 * r) )
+    earTL = arcs.addByCenterStartSweep( _pt(-(a + e), a - r), _pt(-(a + e), a), math.pi )
+    curves = (top, chamferTR, right, returnBR, earBR, bottom, chamferBL, left, returnTL, earTL)
+    for curve in curves:
+        curve.isConstruction = True
+
+    if not constrain:
+        return
+
+    gc = sketch.geometricConstraints
+    sd = sketch.sketchDimensions
+
+    # Stitch the loop (-20 dof). earBR runs bottom -> return line; earTL top -> return line.
+    gc.addCoincident( top.endSketchPoint, chamferTR.startSketchPoint )
+    gc.addCoincident( chamferTR.endSketchPoint, right.startSketchPoint )
+    gc.addCoincident( right.endSketchPoint, returnBR.startSketchPoint )
+    gc.addCoincident( returnBR.endSketchPoint, earBR.endSketchPoint )
+    gc.addCoincident( earBR.startSketchPoint, bottom.startSketchPoint )
+    gc.addCoincident( bottom.endSketchPoint, chamferBL.startSketchPoint )
+    gc.addCoincident( chamferBL.endSketchPoint, left.startSketchPoint )
+    gc.addCoincident( left.endSketchPoint, returnTL.startSketchPoint )
+    gc.addCoincident( returnTL.endSketchPoint, earTL.endSketchPoint )
+    gc.addCoincident( earTL.startSketchPoint, top.startSketchPoint )
+
+    # Directions (-6 dof)
+    gc.addParallel( bottom, clockLine )
+    gc.addPerpendicular( right, bottom )
+    gc.addParallel( top, bottom )
+    # Not parallel(left, right): with that, Fusion rejects the left offset dimension below
+    # as over-constrained even though the left side is still free.
+    gc.addPerpendicular( left, bottom )
+    gc.addParallel( returnBR, bottom )
+    gc.addParallel( returnTL, top )
+
+    # Ears (-4 dof)
+    gc.addTangent( earBR, bottom )
+    gc.addTangent( earBR, returnBR )
+    gc.addTangent( earTL, top )
+    gc.addTangent( earTL, returnTL )
+
+    # Dimensions (-12 dof)
+    sd.addOffsetDimension( top, centerPt, _pt(-0.3 * a, 0.5 * a) )
+    sd.addOffsetDimension( bottom, centerPt, _pt(0.3 * a, -0.5 * a) )
+    sd.addOffsetDimension( right, centerPt, _pt(0.5 * a, 0.3 * a) )
+    sd.addOffsetDimension( left, centerPt, _pt(-0.5 * a, -0.3 * a) )
+    sd.addDiameterDimension( earBR, _pt(a + e + 2 * r, -a - r) )
+    sd.addDiameterDimension( earTL, _pt(-(a + e + 2 * r), a + r) )
+    sd.addDistanceDimension( returnBR.startSketchPoint, returnBR.endSketchPoint,
+                             adsk.fusion.DimensionOrientations.AlignedDimensionOrientation, _pt(a + e / 2, -a + 3 * r) )
+    sd.addDistanceDimension( returnTL.startSketchPoint, returnTL.endSketchPoint,
+                             adsk.fusion.DimensionOrientations.AlignedDimensionOrientation, _pt(-(a + e / 2), a - 3 * r) )
+    sd.addOffsetDimension( right, chamferTR.startSketchPoint, _pt(a - ch / 2, a + r) )
+    sd.addOffsetDimension( top, chamferTR.endSketchPoint, _pt(a + r, a - ch / 2) )
+    sd.addOffsetDimension( left, chamferBL.startSketchPoint, _pt(-(a - ch / 2), -a - r) )
+    sd.addOffsetDimension( bottom, chamferBL.endSketchPoint, _pt(-a - r, -(a - ch / 2)) )
+
+
 # This event handler is called when the command needs to compute a new preview in the graphics window.
 def command_preview(args: adsk.core.CommandEventArgs):
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Command Preview Event')
 
-    command_execute( args )
-    args.isValidResult = True
+    # An outline is drawn unconstrained in preview, so let execute rebuild the real result.
+    drewOutline = _build_pattern( args.command.commandInputs, constrain=False )
+    args.isValidResult = not drewOutline
 
 
 # This event handler is called when the user changes anything in the command dialog
@@ -284,6 +481,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
         
         selected_pattern = bolt_patterns[boltPatternInp.selectedItem.index]
         centerHoleSizeInp.expression = f'{selected_pattern.centerDia} in'
+        inputs.itemById('show_outline').isVisible = selected_pattern.outline != ''
 
 
 

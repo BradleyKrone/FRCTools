@@ -23,6 +23,21 @@ session.
 
 ## Lessons
 
+### Passing a SketchPoint as an arc's center doesn't share it -- the arc gets its own free center
+`addByCenterStartSweep(centerPt, ...)` left `arc.centerSketchPoint != centerPt`, so the whole outline could slide (found
+by a probe dimension being *accepted*). **Fix:** `addCoincident(arc.centerSketchPoint, centerPt)` when they differ.
+Also: after `parallel(top, bottom)` + `perpendicular(right, bottom)`, `parallel(left, right)` made a later
+`addOffsetDimension(left, centerPt)` throw OVER_CONSTRAINTS while `left` was still free -- `perpendicular(left, bottom)` works.
+`commands/BoltPattern/entry.py` (`_draw_kraken_outline`, `_draw_maxplanetary_outline`)
+
+### Motor/gearbox outline dimensions (Kraken X60/X44, MAXPlanetary) -- from the vendor drawings
+Kraken (WCP-0940/0941): body Ø2.367/Ø1.732", 2.498/1.866" overall to the wire bump's flat, bump on the missing-hole side;
+bump sides aren't dimensioned -- taken as tangent at 45° (matches the drawing). MAXPlanetary (REV-21-2100/2101): 2.000"
+square, sides parallel to the 0/180° face holes, 0.34" 45° chamfers on two corners, R0.155" ears flush with the face
+on the other two (2.44" across). A sketch circular pattern runs CCW (checked live), so the code's MAXPlanetary holes
+land at 0/45/180/225° = REV's view mirrored; the outline is mirrored to match.
+`commands/BoltPattern/entry.py`
+
 ### "Click anywhere on the sketch" in a command: `command.mouseClick` + a ray onto the sketch plane
 A `SelectionCommandInput` can't pick empty space. **Fix:** handle `Command.mouseClick` and use
 `futil.viewClickToSketchPoint` (ray from the camera onto the sketch plane; ~1e-3 cm ortho, ~0.02 cm perspective, checked
