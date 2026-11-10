@@ -23,6 +23,82 @@ session.
 
 ## Lessons
 
+### A/B test CamSetup feeds without editing files: swap `cam_data.FEEDS[...]` in one MCP script
+Reload `cam_data` + `cam_builder` (by `sys.modules` key), set `FEEDS['shapeoko'][mat]` to the old dict, `build_all` on a
+scratch plate in a new doc, sum `cam.getMachiningTime(setup, 1, rapid, 0)`, `doc.close(False)`, repeat with the new
+dict. SRPP 6x8 test plate: 473 s -> 146 s at 200 IPM. Through cut-outs (adaptive clears the whole slug) are ~65% of it.
+`commands/CamSetup/cam_data.py`
+
+### Placing inserted parts by `transform2`: add the snapshot *before* any as-built joint, or they snap back
+Set `transform2` on 7 new inserts, then added rigid as-built joints in the same script: every part returned to its
+insert position (identity) and the joints locked that in. **Fix:** set transforms -> `design.snapshots.add()` (check
+`hasPendingSnapshot`) -> verify `occ.boundingBox` in a new script -> then add joints. Also: an 80-20 bearing pivot
+(`bearing_gusset` + `1/2 Thunder Hex Bearing`) sticks the bearing 0.115" past the 1/8" plate, so a 1" arm can't sit
+between gussets on a 1" post; and `Thunder Hex 0.5` is 36" stock -- insert it unlinked and set its `AlongDistance`
+params to cut it to length. (Catapult arm pivot in Argos CAD.)
+
+### As-built joints between proxies land in the lowest common component, not where you called `add`
+`root.asBuiltJoints.add()` on two occurrences from the same sub-assembly stores the joint in *that* sub-assembly, so
+`root.asBuiltJoints.count` undercounts. **Fix:** count across `design.allComponents`. Rigid as-built joints need
+`geometry=None`. For a revolute joint, use `JointGeometry.createByCurve(circularEdge, CenterKeyPoint)` with
+`ZAxisJointDirection` (the circle normal).
+
+### Assembling library parts: `addExistingComponent(xrefComp, M)` lands at `M` only if the template was inserted at identity
+A referenced component remembers its first `addByInsert` transform, and copies made with `addExistingComponent` came out
+offset by it, even after the first copy was deleted. Components taken from *inside* another xref (e.g. bolts in
+`80_20_Standard_Config`) ignored `M` entirely, and that config also pinned older versions of shared parts (1x1_1ft,
+L_gusset) whose geometry was rotated. **Fix:** insert each part file directly with `addByInsert(df, identity)`, clone
+it with `addExistingComponent`, then delete the template. If copies are already wrong, set
+`occ.createForAssemblyContext(parentOcc).transform2 = M` and add a snapshot. Verify with `occ.boundingBox` in a
+*separate* script, because it reads 0 in the same run that created the occurrence.
+(Built the `catapult` design in Argos CAD this way.)
+
+### CAM: 2D Contour's default lead-out arcs into uncut stock on an outside profile
+The 90 deg lead-out arc swings away from the part into fresh sheet -- a full-width cut that loads the bit.
+**Fix:** `doLeadOut` = `false`; the tool retracts straight up inside its own slot.
+`commands/CamSetup/cam_builder.py` (`add_profile`)
+
+### CAM: Bore ignores `threadPitch` -- `useAngle` (Use Ramp Angle, 2 deg) defaults on and overrides it
+Changing the pitch from 0.01 to 1 in left the toolpath identical (`threadPitch.isEnabled` is False). **Fix:** set
+`useAngle` = `false` before `threadPitch`. Also `nullPass` is "Repeat Passes" and doubles the bore time.
+`commands/CamSetup/cam_builder.py` (`add_bore`)
+
+### CAM: API-made 2D Contours default `maximumRampZStepdown` to `maximumStepdown` -- the ramp spirals at plunge feed
+A 4-part profile took 135 min, 121 of it at the 10 ipm ramp feed: every layer ramped from the ramp clearance height
+(above stock top) dropping only one stepdown per lap. UI-made ops default it to `tool_fluteLength`. **Fix:** set
+`maximumRampZStepdown` to `tool_fluteLength`. To find time sinks, post each op and bucket G-code distance by `F`.
+`commands/CamSetup/cam_builder.py` (`add_profile`)
+
+### CAM: the Carbide 3D post rejects `tool_coolant='air'` ("Unsupported 'air' coolant")
+It only maps flood (M7) and off. **Fix:** write `'flood'` or `'disabled'` for Shapeoko jobs.
+`commands/CamSetup/cam_data.py` (`COOLANT`)
+
+### CAM: the CAM product doesn't exist until Manufacture is opened -- and `itemByProductType` raises, not None
+A fresh doc threw "failed to find product" from `doc.products.itemByProductType('CAMProductType')`. **Fix:** catch
+`RuntimeError`, `ui.workspaces.itemById('CAMEnvironment').activate()`, then fetch it again.
+`commands/CamSetup/cam_builder.py` (`get_cam`)
+
+### CAM: `Setup.workCoordinateSystem` is in MILLIMETRES, and the stock box corners number 1=-X-Y 2=+X-Y 3=-X+Y 4=+X+Y
+Unlike every other API length (cm), the WCS matrix origin came back 10x too big. Box-point corners (`wcs_origin_boxPoint`
+= `'top 1'`..`'bottom 4'`) were verified live in the setup's own X/Y. Parameter choices are listed by
+`param.value.getChoices()`; write CAM params by expression with units (`"0.25 in"`, `"27 in/min"`, `"18000 rpm"`,
+`"'adaptive2d'"` with quotes for choices) -- all accepted. `commands/CamSetup/cam_data.py` (`PLATE_WCS_POINT`)
+
+### CAM: an API `ChainSelection` cuts on the LEFT of its first edge -- even a closed loop in `adaptive2d`
+No auto side detection via the API: a bearing hole whose circle edge ran clockwise got cleared *outside* (whole sheet).
+Edge direction differs part to part (CW in one design, CCW in another). **Fix:** step 0.2mm left (`up x tangent`) of
+the first edge and test it against the loop polygon built by chaining the edges' strokes; set `isReverted` when that's
+material. Don't test with `face.evaluator` -- on bodies inside moved components it said "off face" every time.
+Profiles: `createNewSilhouetteSelection`, but its default `loopType` is AllLoops -- every hole got a profile pass too;
+set `loopType = LoopTypes.OnlyOutsideLoops`, `sideType = SideTypes.AlwaysOutsideSideType`. Round holes: `bore` `circularFaces` / `drill` `holeFaces`.
+Proxy for "which side got cut": `cam.getMachiningTime(op, 1, rapid, 0)` -- outside clearing is ~20x longer.
+`commands/CamSetup/feature_finder.py` (`material_on_left`), `commands/CamSetup/cam_builder.py` (`add_adaptive`)
+
+### CAM: set curve selections on the *added* op; parameter names worth knowing
+`pv = CadContours2dParameterValue.cast(op.parameters.itemByName('pockets').value)`, `sels = pv.getCurveSelections()`,
+add, `pv.applyCurveSelections(sels)`. Dump `OperationInput.parameters` to find names: tabs `group_tabs`, spring pass
+`nullPass`, bore pitch `threadPitch`. `commands/CamSetup/cam_builder.py`
+
 ### Passing a SketchPoint as an arc's center doesn't share it -- the arc gets its own free center
 `addByCenterStartSweep(centerPt, ...)` left `arc.centerSketchPoint != centerPt`, so the whole outline could slide (found
 by a probe dimension being *accepted*). **Fix:** `addCoincident(arc.centerSketchPoint, centerPt)` when they differ.

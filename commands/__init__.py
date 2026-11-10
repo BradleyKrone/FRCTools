@@ -10,6 +10,7 @@ from .QuickCircle import entry as QuickCircle
 from .PartsGen import entry as PartsGen
 from .AutoHole import entry as AutoHole
 from .JointInspector import entry as JointInspector
+from .CamSetup import entry as CamSetup
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
@@ -20,7 +21,8 @@ commands = [
     QuickCircle,
     PartsGen,
     AutoHole,
-    JointInspector
+    JointInspector,
+    CamSetup
 ]
 
 

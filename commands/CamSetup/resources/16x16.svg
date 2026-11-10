@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 32 32">
+  <!-- end mill -->
+  <rect x="13" y="1" width="6" height="9" rx="1" fill="#7a7a7a"/>
+  <rect x="14" y="10" width="4" height="9" fill="#b0b0b0"/>
+  <path d="M14 12 L18 14 M14 15 L18 17" stroke="#555" stroke-width="1"/>
+  <!-- plate with toolpath -->
+  <path d="M2 24 L16 19 L30 24 L16 30 Z" fill="#c9b99a" stroke="#6b5b3e" stroke-width="1"/>
+  <path d="M8 24 L16 21.2 L24 24 L16 27.4 Z" fill="none" stroke="#e8c100" stroke-width="1.6"/>
+  <circle cx="16" cy="20" r="1.4" fill="#d22"/>
+</svg>

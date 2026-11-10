@@ -27,6 +27,16 @@ def run(context):
                 config.FRC_PANEL_BEFORE
             )
 
+        # Same again for the FRC panel in the Manufacture workspace's MILLING tab.
+        milling_tab = config.get_milling_tab()
+        if milling_tab and not milling_tab.toolbarPanels.itemById( config.FRC_CAM_PANEL_ID ):
+            milling_tab.toolbarPanels.add(
+                config.FRC_CAM_PANEL_ID,
+                config.FRC_PANEL_NAME,
+                config.FRC_CAM_PANEL_POSITION,
+                config.FRC_CAM_PANEL_BEFORE
+            )
+
         # Get the panels the FRCTools dropdowns will be created in.
         sketch_create_panel = workspace.toolbarPanels.itemById( config.SKETCH_CREATE_ID )
         sketch_modify_panel = workspace.toolbarPanels.itemById( config.SKETCH_MODIFY_ID )
@@ -70,6 +80,10 @@ def stop(context):
         frc_panel = config.get_frc_panel()
         if frc_panel:
             frc_panel.deleteMe()
+
+        frc_cam_panel = config.get_frc_cam_panel()
+        if frc_cam_panel:
+            frc_cam_panel.deleteMe()
 
     except:
         futil.handle_error('stop')

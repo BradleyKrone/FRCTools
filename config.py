@@ -38,6 +38,13 @@ FRC_PANEL_NAME = 'FRC'
 FRC_PANEL_POSITION = 'SolidModifyPanel'   # the panel we get inserted next to
 FRC_PANEL_BEFORE = False                  # False = after FRC_PANEL_POSITION
 
+# Our "FRC" panel in the Manufacture workspace's MILLING tab, next to Setup.
+CAM_WORKSPACE_ID = 'CAMEnvironment'
+CAM_TAB_ID = 'MillingTab'
+FRC_CAM_PANEL_ID = f'{COMPANY_NAME}_{ADDIN_NAME}_CamPanel'
+FRC_CAM_PANEL_POSITION = 'CAMJobPanel'   # the Setup panel
+FRC_CAM_PANEL_BEFORE = False
+
 def _get_frc_submenu( panel_id: str ) -> adsk.core.ToolbarControl:
     # Find the FRCTools submenu in the given panel of the workspace.
     workspace = ui.workspaces.itemById( WORKSPACE_ID )
@@ -57,3 +64,11 @@ def get_solid_tab() -> adsk.core.ToolbarTab:
 def get_frc_panel() -> adsk.core.ToolbarPanel:
     # The FRC panel itself; solid commands hang their buttons directly off this.
     return get_solid_tab().toolbarPanels.itemById( FRC_PANEL_ID )
+
+def get_milling_tab() -> adsk.core.ToolbarTab:
+    # The MILLING tab of the Manufacture workspace, which owns the FRC CAM panel.
+    return ui.workspaces.itemById( CAM_WORKSPACE_ID ).toolbarTabs.itemById( CAM_TAB_ID )
+
+def get_frc_cam_panel() -> adsk.core.ToolbarPanel:
+    # The FRC panel in Manufacture; CAM commands hang their buttons off this.
+    return get_milling_tab().toolbarPanels.itemById( FRC_CAM_PANEL_ID )

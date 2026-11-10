@@ -45,6 +45,10 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 - **`commands/PartsGen/`** — a multi-tool command whose `entry.py` dispatches to per-part
   generators: `tube_gen.py`, `belt_gen.py`, `chain_gen.py`, `pulley_gen.py`, `sprocket_gen.py`,
   `shaft_gen.py`.
+- **`commands/CamSetup/`** — the only Manufacture-workspace command (button in the FRC panel of the
+  MILLING tab, `config.get_frc_cam_panel()`). `feature_finder.py` classifies a plate's / box tube's
+  holes, cut-outs, pockets and profile; `cam_builder.py` makes the setups, tools and operations and
+  generates them; `cam_data.py` holds the machines, bits and feeds & speeds (from the Shapeoko notes).
 - **`lib/fusionAddInUtils/`** — shared helpers, imported everywhere as
   `from ...lib import fusionAddInUtils as futil`:
   - `general_utils.py` — `log()`, `handle_error()`, `popup_error()`, a family of `print_*` /
