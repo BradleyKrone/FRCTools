@@ -23,6 +23,50 @@ session.
 
 ## Lessons
 
+### Right-clicking a timeline GROUP gives `markingMenuDisplaying` an entity of `None` -- you can't tell which group
+`args.selectedEntities` / `ui.activeSelections` hold `None` for a right-clicked group (seen live; reading `.objectType`
+on it threw), and `TimelineObject` has no selected flag. **Fix:** treat a `None` entity as "maybe a group": show the
+Edit item when the design has any tagged run, and let the edit dialog pick the run from a dropdown (newest first).
+Right-clicking a plate or a feature inside an expanded group still identifies it directly (attributes).
+`commands/TabSlot/entry.py` (`ui_marking_menu`, `_switch_run`)
+
+### Rebuilding a grouped run in place: `TimelineGroup.deleteMe(True/False)` raises -- delete the items instead
+Tab & Slot's Edit rolls back to its run and rebuilds it there. `group.deleteMe(True)` and `deleteMe(False)` both threw
+`InternalValidationError : res` (live). **Fix:** `group.isCollapsed = False` (collapsed items have no index), note the
+first item's index, `entity.deleteMe()` each item newest-first (features before sketches -- the empty group goes with
+them), `timeline.markerPosition = start`, re-resolve the bodies by token, build, regroup, `timeline.moveToEnd()`.
+Find a run's items by tagging every sketch/feature with one id attribute; a `TimelineGroup` has no `attributes`, so
+read them off `group.item(k).entity`. A group's own `healthState` reads 5 (unknown) -- check its items, not the group.
+`commands/TabSlot/tab_slot_gen.py` (`tag_run`, `read_run`, `rebuild_run`)
+
+### Rounding the cusps a dogbone leaves: fillet the cut's cylinder edges that run along the cut axis
+Where a dogbone circle crosses a straight side (or two overlapping dogbones meet) the material is a sharp convex
+point. **Fix:** a feature fillet on the straight edges of `cutFeature.faces` cylinders parallel to the cut direction
+-- every such edge is a cusp, narrow overlapping slots included. Far easier than sketch fillets on circles. Gotcha:
+reading `FilletFeature.edgeSets.item(0).edges` afterwards raises "Didn't roll editing feature back"; use `feat.faces`.
+`commands/TabSlot/tab_slot_gen.py` (`_round_cusps`)
+
+### `inputChanged` sees the previous preview's geometry -- don't measure picked bodies there
+Tab & Slot re-detected its joint on every input change and got 1.141 in for a 10 in joint (a shoulder piece between
+the preview's tabs); the layout check then failed, validation blocked, and the preview never came back to fix it.
+**Fix:** measure in `executePreview` (old preview already rolled back) and cache it per pick pair; `inputChanged`
+reuses the cache. Don't let a possibly-stale measurement disable OK. Also: an exception in `commandCreated` (here,
+indexing an empty list left over from the last run) leaves a dialog with only the inputs made before it.
+`commands/TabSlot/entry.py` (`_joint_for`, `_refresh`, `command_preview`)
+
+### API `addThreePointRectangle` adds NO constraints, `line.isFixed` leaves its endpoints free, `project()` of another sketch's line returns nothing
+Found while making the Tab & Slot sketches fully constrained (checked live, curve-by-curve `isFullyConstrained` dump).
+**Fix:** add `parallel(top, bottom)` + `perpendicular(each side, bottom)` yourself; fix an anchor axis by setting
+`startSketchPoint.isFixed`/`endSketchPoint.isFixed`; instead of projecting, give each sketch its own fixed axis and
+put corner points on it (`addCoincident(pt, axis)` + aligned distance from the axis start).
+`commands/TabSlot/tab_slot_gen.py` (`_rect_on_axis`, `_Sk.axis`, `build`)
+
+### Dogbone relief: circle of radius r centred r from the corner along the open quadrant's bisector
+It passes through the sharp corner, so the bit (radius <= r) reaches it. Slots: bisector points into the slot. Tab
+roots: away from the tab and towards the mating plate. Check the bit fits the slot width too (1/4" bit vs 1/8" plate
+slot fails). Sketch each plate on its own face and cut/join through its thickness: that matches what the CNC cuts.
+`commands/TabSlot/tab_slot_gen.py`
+
 ### A/B test CamSetup feeds without editing files: swap `cam_data.FEEDS[...]` in one MCP script
 Reload `cam_data` + `cam_builder` (by `sys.modules` key), set `FEEDS['shapeoko'][mat]` to the old dict, `build_all` on a
 scratch plate in a new doc, sum `cam.getMachiningTime(setup, 1, rapid, 0)`, `doc.close(False)`, repeat with the new

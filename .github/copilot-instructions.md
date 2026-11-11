@@ -49,6 +49,12 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
   MILLING tab, `config.get_frc_cam_panel()`). `feature_finder.py` classifies a plate's / box tube's
   holes, cut-outs, pockets and profile; `cam_builder.py` makes the setups, tools and operations and
   generates them; `cam_data.py` holds the machines, bits and feeds & speeds (from the Shapeoko notes).
+- **`commands/TabSlot/`** — Tab & Slot: the user picks a tab plate whose edge butts a slot plate's
+  face; it adds evenly spaced tabs, cuts dogboned slots and tab-root dogbones sized to the router bit
+  (bit list from `cam_data.TOOLS`). `tab_slot_gen.py` holds the geometry (`find_joint`, `layout_tabs`,
+  `build`) with no dialog code, so MCP scripts can drive it directly. Every run is tagged
+  (`FRCTools_TabSlot` attributes on its sketches/features) so the right-click **Edit Tab & Slot**
+  item can reopen the dialog with its settings and `rebuild_run` it in place in the timeline.
 - **`lib/fusionAddInUtils/`** — shared helpers, imported everywhere as
   `from ...lib import fusionAddInUtils as futil`:
   - `general_utils.py` — `log()`, `handle_error()`, `popup_error()`, a family of `print_*` /

@@ -12,6 +12,7 @@ from .PartsGen import entry as PartsGen
 from .AutoHole import entry as AutoHole
 from .JointInspector import entry as JointInspector
 from .CamSetup import entry as CamSetup
+from .TabSlot import entry as TabSlot
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
@@ -23,7 +24,8 @@ commands = [
     PartsGen,
     AutoHole,
     JointInspector,
-    CamSetup
+    CamSetup,
+    TabSlot
 ]
 
 
