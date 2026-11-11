@@ -67,8 +67,12 @@ def get_frc_panel() -> adsk.core.ToolbarPanel:
 
 def get_milling_tab() -> adsk.core.ToolbarTab:
     # The MILLING tab of the Manufacture workspace, which owns the FRC CAM panel.
-    return ui.workspaces.itemById( CAM_WORKSPACE_ID ).toolbarTabs.itemById( CAM_TAB_ID )
+    # None when this Fusion install has no Manufacture workspace / MILLING tab.
+    workspace = ui.workspaces.itemById( CAM_WORKSPACE_ID )
+    return workspace.toolbarTabs.itemById( CAM_TAB_ID ) if workspace else None
 
 def get_frc_cam_panel() -> adsk.core.ToolbarPanel:
     # The FRC panel in Manufacture; CAM commands hang their buttons off this.
-    return get_milling_tab().toolbarPanels.itemById( FRC_CAM_PANEL_ID )
+    # None when there is no MILLING tab (callers check for that).
+    tab = get_milling_tab()
+    return tab.toolbarPanels.itemById( FRC_CAM_PANEL_ID ) if tab else None

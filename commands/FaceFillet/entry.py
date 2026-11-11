@@ -262,10 +262,21 @@ def _apply_fillet(inputs: adsk.core.CommandInputs,
     if is_preview:
         return False, 0
 
-    # Execute mode — fillet each edge individually, skip failures
+    # Execute mode — fillet each edge individually, skip failures.
+    # Every fillet that succeeds rebuilds the body, which can invalidate the
+    # edge objects collected above, so take their tokens now and look each
+    # edge up again right before it is used.
+    design = adsk.fusion.Design.cast(comp.parentDesign)
+    tokens = [e.entityToken for e in edges]
     skipped = 0
     succeeded = 0
-    for edge in edges:
+    for edge, token in zip(edges, tokens):
+        if not edge.isValid:
+            found = design.findEntityByToken(token)
+            edge = adsk.fusion.BRepEdge.cast(found[0]) if len(found) > 0 else None
+            if edge is None:
+                skipped += 1
+                continue
         single = adsk.core.ObjectCollection.create()
         single.add(edge)
         try:

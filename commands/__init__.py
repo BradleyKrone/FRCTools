@@ -2,6 +2,7 @@
 
 # If you want to add an additional command, duplicate one of the existing directories and import it here.
 # You need to use aliases (import "entry" as "my_module") assuming you have the default module named "entry".
+from ..lib import fusionAddInUtils as futil
 from .BoltPattern import entry as BoltPattern
 from .CCDistance import entry as CCDistance
 from .FaceFillet import entry as FaceFillet
@@ -36,5 +37,11 @@ def start():
 # Assumes you defined a "stop" function in each of your modules.
 # The stop function will be run when the add-in is stopped.
 def stop():
+    # One command failing to clean up must not stop the others (or the toolbar
+    # clean-up that follows in FRCTools.stop) -- anything left behind makes the
+    # next run() fail on a duplicate id until Fusion is restarted.
     for command in commands:
-        command.stop()
+        try:
+            command.stop()
+        except Exception:
+            futil.handle_error(f'stop {command.__name__}')

@@ -45,6 +45,12 @@ _suppressed_world_keys = set()
 _last_candidates_world = []
 
 
+# The first skipped / failed step reported through `_dbg` during the current run
+# (None if it ran clean). Reset by `_dbg_reset` at the start of every run.
+_run_problem = None
+_PROBLEM_MARKERS = ('skipping', 'FAILED', 'EXCEPTION', 'nothing to cut')
+
+
 def _world_key(pt: adsk.core.Point3D, ndigits: int = 3) -> tuple:
     return (round(pt.x, ndigits), round(pt.y, ndigits), round(pt.z, ndigits))
 
@@ -318,6 +324,8 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 def _dbg_reset(is_preview: bool):
     """Start a fresh debug_log.txt for this run — overwrites the previous run's
     log so the file always reflects only the most recent _run() call."""
+    global _run_problem
+    _run_problem = None
     try:
         with open(DEBUG_LOG_PATH, 'w', encoding='utf-8') as f:
             f.write(f'=== {CMD_NAME} run {datetime.datetime.now().isoformat(timespec="seconds")} '
@@ -328,7 +336,14 @@ def _dbg_reset(is_preview: bool):
 
 def _dbg(message: str):
     """Log to both Fusion's Text Command window (futil.log) and debug_log.txt,
-    so a full trace of the run is always available on disk to inspect afterward."""
+    so a full trace of the run is always available on disk to inspect afterward.
+
+    The first message that reports a skipped or failed step is also kept in
+    `_run_problem`, so command_execute can tell the user instead of quietly
+    leaving an empty sketch or a partial result behind."""
+    global _run_problem
+    if _run_problem is None and any(marker in message for marker in _PROBLEM_MARKERS):
+        _run_problem = message
     futil.log(message)
     try:
         with open(DEBUG_LOG_PATH, 'a', encoding='utf-8') as f:
@@ -1140,7 +1155,16 @@ def _process_circular_edge(edge: adsk.fusion.BRepEdge,
         center_pt = rim_circle.centerSketchPoint
         center_geo = center_pt.geometry
 
-        pattern_radius_cm = rim_circle.radius - edge_offset_cm
+        # The ring goes on the material side of the edge: inside an outer rim, but
+        # outside the edge of a hole or bore (an inner loop of the face).
+        edge_is_hole = False
+        for loop in target_face.loops:
+            if any(loop_edge == edge for loop_edge in loop.edges):
+                edge_is_hole = not loop.isOuter
+                break
+        offset_sign = 1.0 if edge_is_hole else -1.0
+
+        pattern_radius_cm = rim_circle.radius + offset_sign * edge_offset_cm
         if pattern_radius_cm <= 0:
             _dbg(f'{CMD_NAME}: edge offset is >= the edge radius, skipping')
             return
@@ -1243,7 +1267,8 @@ def _process_circular_edge(edge: adsk.fusion.BRepEdge,
                     # where only a numeric literal was accepted. The chosen spacing is
                     # likewise baked in as a literal rather than a live parameter -- same
                     # as edge_offset_in above.
-                    formula = (f'max(1; floor((2 * 3.14159265358979 * ({radius_param} - {edge_offset_in} in)) '
+                    offset_op = '+' if edge_is_hole else '-'
+                    formula = (f'max(1; floor((2 * 3.14159265358979 * ({radius_param} {offset_op} {edge_offset_in} in)) '
                                f'/ {spacing_in} in))')
                     skPattern.quantity.expression = formula
             except Exception:
@@ -1616,10 +1641,20 @@ def _run(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 # Called when the user clicks OK.
 def command_execute(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Execute Event')
+    global _run_problem
+    _run_problem = None
     try:
         _run(args.command.commandInputs, is_preview=False)
     except Exception:
-        futil.handle_error(f'{CMD_NAME} command_execute', show_message_box=True)
+        futil.handle_error(f'{CMD_NAME} command_execute', show_message_box=False)
+        _run_problem = _run_problem or 'an unexpected error occurred (see the Text Commands window)'
+
+    # Any skipped or failed step fails the whole command, so Fusion rolls it back
+    # (no empty "AutoHole" sketch, no half-cut pattern) and shows why.
+    if _run_problem:
+        reason = _run_problem.replace(f'{CMD_NAME}:', '').strip()
+        args.executeFailed = True
+        args.executeFailedMessage = f'{CMD_NAME} did not cut the holes, and nothing was changed: {reason}'
 
 
 # Called whenever Fusion needs a fresh preview.

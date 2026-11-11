@@ -145,7 +145,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
 # This event handler is called when the user clicks the OK button in the command dialog or 
 # is immediately called after the created event not command inputs were created for the dialog.
-def command_execute(args: adsk.core.CommandEventArgs):
+def command_execute(args: adsk.core.CommandEventArgs, is_preview: bool = False):
+    # Returns True if the pockets were built. The add_handler wrapper only ever
+    # passes `args`; command_preview passes is_preview=True.
     # General logging for debug.
     # futil.log(f'{CMD_NAME} Command Execute Event')
 
@@ -198,9 +200,19 @@ def command_execute(args: adsk.core.CommandEventArgs):
                 filletProfiles( solid, extrudeFeat, cornerRadius.value )
 
     except Exception as e:
-        futil.handle_error( '        ============  Lighten Failed  ============\n\n', True )
+        ui.progressBar.hide()
+        if is_preview:
+            futil.handle_error( '        ============  Lighten Failed  ============\n\n', True )
+        else:
+            # Failing the execute makes Fusion roll back whatever was built
+            # before the error, instead of committing half a Lighten.
+            futil.handle_error( '        ============  Lighten Failed  ============\n\n', False )
+            args.executeFailed = True
+            args.executeFailedMessage = 'Lighten failed and nothing was changed. See the Text Commands window for details.'
+        return False
 
     ui.progressBar.hide()
+    return True
 
 # This event handler is called when the command needs to compute a new preview in the graphics window.
 def command_preview(args: adsk.core.CommandEventArgs):
@@ -208,8 +220,9 @@ def command_preview(args: adsk.core.CommandEventArgs):
     # futil.log(f'{CMD_NAME} Command Preview Event')
 
     if not ControlKeyHeldDown :
-        command_execute( args )
-        args.isValidResult = True
+        # Only a preview that built cleanly may stand in for the real result;
+        # otherwise OK re-runs command_execute, which reports and rolls back.
+        args.isValidResult = bool( command_execute( args, is_preview=True ) )
 
 # This event handler is called when the user changes anything in the command dialog
 # allowing you to modify values of other inputs based on that change.
@@ -373,6 +386,11 @@ def offsetProfile( profile: LightenProfile ) :
     # This was neccesary because a reliable way to determine
     # which way to offset could not be determined.
     failedOffset = False
+    if sketch.profiles.count == 0:
+        # The first offset failed outright -- nothing to measure, and no
+        # temporary sketch should be left behind.
+        sketch.deleteMe()
+        raise RuntimeError( 'Could not offset a selected profile. Try a smaller Offset Distance.' )
     offsetProfile = sketch.profiles.item(0)
     offsetProfArea = offsetProfile.areaProperties().area
     if( offsetProfArea > profile.area ) :

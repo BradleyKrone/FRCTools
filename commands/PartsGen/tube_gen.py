@@ -376,7 +376,9 @@ def _add_face_holes(comp: adsk.fusion.Component,
 
             if custom_len_expr is not None:
                 qty_length = adsk.core.ValueInput.createByString(
-                    f'floor({custom_len_expr} / 1 in)'
+                    # Parenthesised so an expression like "base_len + 2 in" divides as
+                    # a whole, and never below one hole (a length under 1 in).
+                    f'max(1; floor(({custom_len_expr}) / 1 in))'
                 )
             else:
                 qty_length = futil.Value(n_length)

@@ -1621,6 +1621,13 @@ def command_preview(args: adsk.core.CommandEventArgs):
             futil.handle_error('PartsGen preview selectability', show_message_box=False)
 
 
+def _all_occurrence_count() -> int:
+    """How many occurrences the design holds, at every level -- compared before and after
+    a preview build to tell whether the generator left anything behind."""
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    return design.rootComponent.allOccurrences.count if design else 0
+
+
 def _command_preview(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     part_type = _part_type(inputs)
@@ -1630,6 +1637,7 @@ def _command_preview(args: adsk.core.CommandEventArgs):
         if livePreviewInp is not None and not livePreviewInp.value:
             _clear_ref_face_highlight()
             return
+        occ_count_before = _all_occurrence_count()
         _create_belt(inputs, is_preview=True)
         # A toothless-belt preview is the full result -- unless its pulleys need 3D print
         # adapters, which the preview skips (a cloud insert per tick).
@@ -1638,16 +1646,23 @@ def _command_preview(args: adsk.core.CommandEventArgs):
         belt_adapter = (genPulleysInp is not None and genPulleysInp.value
                         and any(inputs.itemById(f'tb_adapter_{i}') is not None
                                 and inputs.itemById(f'tb_adapter_{i}').value for i in (1, 2)))
-        if suppressTeethInp and suppressTeethInp.value and not belt_adapter:
+        # ...and only if a belt was actually built: _create_belt reports nothing, and on a
+        # failed preview it quietly deletes its work, which must not be kept as the result.
+        if (suppressTeethInp and suppressTeethInp.value and not belt_adapter
+                and _all_occurrence_count() > occ_count_before):
             args.isValidResult = True
         _clear_ref_face_highlight()
     elif part_type == PART_HARDWARE and selected_spacer_type(inputs) is None:
         # Nothing to preview (a cloud insert per tick); isValidResult stays False so OK builds.
         _clear_ref_face_highlight()
     elif part_type == PART_CHAIN:
-        # Toothless sprockets make the preview the full result, so OK keeps it.
+        # Toothless sprockets make the preview the full result, so OK keeps it -- but only
+        # when a chain was actually built. A failed preview deletes its work without a
+        # message; leaving isValidResult False then makes OK run the real build, which
+        # does report the problem.
+        occ_count_before = _all_occurrence_count()
         _create_chain(inputs, is_preview=True)
-        args.isValidResult = True
+        args.isValidResult = _all_occurrence_count() > occ_count_before
         _clear_ref_face_highlight()
     else:
         # Quiet: preview can fire with a transient/invalid input state (e.g. mid-typing
@@ -2074,7 +2089,9 @@ def ui_selection_changed(args: adsk.core.ActiveSelectionEventArgs):
     global _selected_partsgen_occ
 
     _selected_partsgen_occ = None
-    if app.activeProduct.objectType != adsk.fusion.Design.classType():
+    # activeProduct is None when no document is open.
+    product = app.activeProduct
+    if product is None or product.objectType != adsk.fusion.Design.classType():
         return
 
     for sel in args.currentSelection:
@@ -2094,7 +2111,8 @@ def ui_command_starting(args: adsk.core.ApplicationCommandEventArgs):
     set _selected_partsgen_occ back to None.  We capture it here first.
     """
     global _edit_target_occ
-    if _selected_partsgen_occ:
+    # isValid: the part may have been undone or its document closed since it was selected.
+    if _selected_partsgen_occ and _selected_partsgen_occ.isValid:
         _edit_target_occ = _selected_partsgen_occ
 
 
@@ -2106,7 +2124,9 @@ def ui_marking_menu(args: adsk.core.MarkingMenuEventArgs):
     """
     global _edit_target_occ
 
-    if app.activeProduct.objectType != adsk.fusion.Design.classType():
+    # activeProduct is None when no document is open.
+    product = app.activeProduct
+    if product is None or product.objectType != adsk.fusion.Design.classType():
         return
 
     controls = args.linearMarkingMenu.controls
@@ -2133,6 +2153,8 @@ def ui_marking_menu(args: adsk.core.MarkingMenuEventArgs):
     #   2. args.selectedEntities  — entities under the cursor when right-clicking
     #   3. ui.activeSelections    — current active selection (left-click state)
     found_occ = _selected_partsgen_occ
+    if found_occ and not found_occ.isValid:
+        found_occ = None      # undone, or from a document that has since closed
 
     if not found_occ:
         for ent in (args.selectedEntities or []):
@@ -2192,6 +2214,10 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     global _edit_target_occ, _edit_ref_entities, _edit_belt_entities, _edit_chain_entities
 
     inputs = args.command.commandInputs
+
+    # A target that was undone (or belongs to a closed document) is no target at all.
+    if _edit_target_occ and not _edit_target_occ.isValid:
+        _edit_target_occ = None
 
     # Read stored attributes from the targeted occurrence's component
     attrs = {}
@@ -2609,29 +2635,43 @@ def edit_command_execute(args: adsk.core.CommandEventArgs):
             futil.log('PartsGen edit: could not delete old occurrence')
         _edit_target_occ = None
 
-    inputs = args.command.commandInputs
-    partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
-    part_type = partTypeInp.selectedItem.name
-    shaft_type = inputs.itemById('shaft_type').selectedItem.name
-    if part_type == PART_SHAFT and shaft_type in SPACER_BY_SHAFT_TYPE:
-        if spacer_parent is None:
-            spacer_parent, _ = _hardware_folder(adsk.fusion.Design.cast(app.activeProduct))
-        _create_shaft(inputs, parent_occ=spacer_parent,
-                      hardware_part=SPACER_BY_SHAFT_TYPE[shaft_type])
-    elif part_type == PART_SHAFT:
-        _create_shaft(inputs)
-    elif part_type == PART_TUBE:
-        _create_tube(inputs)
-    elif part_type == PART_PULLEY:
-        _create_pulley(inputs)
-    elif part_type == PART_SPROCKET:
-        _create_sprocket(inputs)
-    elif part_type == PART_CHAIN:
-        _create_chain(inputs)
-    elif part_type == PART_GEAR:
-        _create_gear(inputs)
-    else:
-        _create_belt(inputs)
+    # The old part is already deleted above, so a rebuild that fails must fail the whole
+    # command: Fusion then rolls the transaction back and the original part comes back,
+    # instead of the edit silently leaving nothing behind. The generators either raise
+    # or (pulley, gear) report their own error and return False.
+    try:
+        inputs = args.command.commandInputs
+        partTypeInp: adsk.core.DropDownCommandInput = inputs.itemById('part_type')
+        part_type = partTypeInp.selectedItem.name
+        shaft_type = inputs.itemById('shaft_type').selectedItem.name
+        if part_type == PART_SHAFT and shaft_type in SPACER_BY_SHAFT_TYPE:
+            if spacer_parent is None:
+                spacer_parent, _ = _hardware_folder(adsk.fusion.Design.cast(app.activeProduct))
+            result = _create_shaft(inputs, parent_occ=spacer_parent,
+                                   hardware_part=SPACER_BY_SHAFT_TYPE[shaft_type])
+        elif part_type == PART_SHAFT:
+            result = _create_shaft(inputs)
+        elif part_type == PART_TUBE:
+            result = _create_tube(inputs)
+        elif part_type == PART_PULLEY:
+            result = _create_pulley(inputs)
+        elif part_type == PART_SPROCKET:
+            result = _create_sprocket(inputs)
+        elif part_type == PART_CHAIN:
+            result = _create_chain(inputs)
+        elif part_type == PART_GEAR:
+            result = _create_gear(inputs)
+        else:
+            result = _create_belt(inputs)
+        rebuilt = result is not False
+    except Exception:
+        futil.handle_error('PartsGen edit_command_execute', show_message_box=False)
+        rebuilt = False
+
+    if not rebuilt:
+        args.executeFailed = True
+        args.executeFailedMessage = ('Parts Gen could not rebuild the part, so the original was '
+                                     'left unchanged. See the Text Commands window for details.')
 
 
 def edit_command_activate(args: adsk.core.CommandEventArgs):

@@ -395,7 +395,19 @@ def _group(items, key_fn):
 # ---------------------------------------------------------------------------
 # Plate / tube builders
 # ---------------------------------------------------------------------------
-def _hole_ops(setup, holes, ctx, tube_wall=False):
+def _wall_bottom(ops, wall, ctx):
+    # Tube walls: an adaptive on a chain has no depth of its own (its bottom
+    # defaults to the selected contour, which sits on the outer face), so cut
+    # from that contour down through the wall.
+    for op in ops:
+        _set(op.parameters, 'bottomHeight_mode', _q('from contour'), ctx.log)
+        _set(op.parameters, 'bottomHeight_offset',
+             _inch(-(wall + cam_data.THROUGH_OVERCUT)), ctx.log)
+    return ops
+
+
+def _hole_ops(setup, holes, ctx, tube_wall=False, wall=0.0):
+    # wall: tube wall thickness (in); only used when tube_wall is True.
     ops = []
     by_kind = _group(holes, lambda h: h.kind)
     for kind in ('drill', 'small', 'bolt'):
@@ -420,16 +432,18 @@ def _hole_ops(setup, holes, ctx, tube_wall=False):
     def nominal(h):
         return min(cam_data.BEARING_ODS, key=lambda od: abs(od - h.diameter))
     for od, group in sorted(_group(by_kind.get('bearing', []), nominal).items()):
-        ops += add_adaptive(setup, f'Bearing {len(group)}x Ø{od:.3f} rough - {_tool_label("1/4")}', '1/4', ctx,
-                            chains=[h.edges for h in group], through=not tube_wall,
-                            stock_to_leave=cam_data.BEARING_ROUGH_STOCK)
+        rough = add_adaptive(setup, f'Bearing {len(group)}x Ø{od:.3f} rough - {_tool_label("1/4")}', '1/4', ctx,
+                             chains=[h.edges for h in group], through=not tube_wall,
+                             stock_to_leave=cam_data.BEARING_ROUGH_STOCK)
+        ops += _wall_bottom(rough, wall, ctx) if tube_wall else rough
         ops += add_bore(setup, group, ctx, f'Bearing {len(group)}x Ø{od:.3f} clean-up - {_tool_label("1/4")}',
                         pitch=cam_data.BEARING_CLEANUP_PITCH, stock_to_leave=cam_data.BEARING_FIT_OFFSET,
                         hole_bottom=tube_wall, clear=False)
     large = by_kind.get('large', [])
     if large:
-        ops += add_adaptive(setup, f'Large holes {len(large)}x - {_tool_label("1/4")}', '1/4', ctx,
-                            chains=[h.edges for h in large], through=not tube_wall)
+        clear = add_adaptive(setup, f'Large holes {len(large)}x - {_tool_label("1/4")}', '1/4', ctx,
+                             chains=[h.edges for h in large], through=not tube_wall)
+        ops += _wall_bottom(clear, wall, ctx) if tube_wall else clear
     return ops
 
 
@@ -474,14 +488,11 @@ def build_tube(cam, feats, ctx, machine, setup_name):
         setup = _new_setup(cam, [feats.body], name, side.face, side.x_edge,
                            cam_data.TUBE_WCS_POINT, 0.0, machine, ctx.log)
         _fix_orientation(setup, side.face, ctx.log)
-        _hole_ops(setup, side.holes, ctx, tube_wall=True)
+        _hole_ops(setup, side.holes, ctx, tube_wall=True, wall=side.wall)
         for key, group in sorted(_group(side.cutouts, lambda c: c.tool).items(), reverse=True):
             ops = add_adaptive(setup, f'Cut-outs {len(group)}x - {_tool_label(key)}', key, ctx,
                                chains=[c.edges for c in group], through=False)
-            for op in ops:
-                _set(op.parameters, 'bottomHeight_mode', _q('from contour'), ctx.log)
-                _set(op.parameters, 'bottomHeight_offset',
-                     _inch(-(side.wall + cam_data.THROUGH_OVERCUT)), ctx.log)
+            _wall_bottom(ops, side.wall, ctx)
         setups.append(setup)
     return setups
 

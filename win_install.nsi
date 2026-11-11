@@ -86,9 +86,19 @@ Section "Uninstall"
 
   ;ADD YOUR OWN FILES HERE...
 
+  ; Remove only what the installer put there. $INSTDIR is whatever folder was
+  ; picked at install time, so a blanket "RMDir /r $INSTDIR" could wipe out a
+  ; folder that holds other things (Documents, the whole AddIns folder, ...).
   Delete "$INSTDIR\Uninstall.exe"
+  Delete "$INSTDIR\FRCTools.py"
+  Delete "$INSTDIR\FRCTools.manifest"
+  Delete "$INSTDIR\config.py"
+  RMDir /r "$INSTDIR\commands"
+  RMDir /r "$INSTDIR\lib"
+  RMDir /r "$INSTDIR\__pycache__"
 
-  RMDir /r "$INSTDIR"
+  ; Without /r this only removes the folder if it is now empty.
+  RMDir "$INSTDIR"
 
   DeleteRegKey HKCU "Software\${APP_REG_ID}"
   DeleteRegKey HKCU ${UNINSTALL_REG_KEY}

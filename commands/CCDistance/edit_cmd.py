@@ -105,7 +105,8 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
 def edit_command_preselect(args: adsk.core.SelectionEventArgs):
 
     ccLine = CCLine.getCCLineFromEntity(args.selection.entity)
-    if ccLine:
+    # A CCLine that has lost a circle can be deleted but not edited.
+    if ccLine and ccLine.ODCircle1 and ccLine.ODCircle2:
         obj = adsk.core.ObjectCollection.create()
         cc_objs = [ ccLine.line, ccLine.ODCircle1, ccLine.ODCircle2 ]
         for cc_obj in cc_objs:
@@ -125,9 +126,9 @@ def edit_command_select(args: adsk.core.SelectionEventArgs):
     futil.log( f'edit_command_select - selected = {args.activeInput.selectionCount}' )
     
     ccLine = CCLine.getCCLineFromEntity(args.selection.entity)
-    if not ccLine:
+    if not ccLine or not ccLine.ODCircle1 or not ccLine.ODCircle2:
         return
- 
+
     args.activeInput.clearSelection()
     cc_objs = [ ccLine.line, ccLine.ODCircle1, ccLine.ODCircle2 ]
     for cc_obj in cc_objs:

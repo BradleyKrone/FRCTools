@@ -143,7 +143,7 @@ def _log_unconstrained(comp: adsk.fusion.Component):
 def _outer_diameter_cm(belt_pitch_mm: int, n_teeth: int) -> float:
     """Return the tooth outer diameter in cm without creating any sketch geometry."""
     if belt_pitch_mm == 5:  # HTD 5mm
-        return (n_teeth * 5.0 / math.pi - 1.74) / 10
+        return (n_teeth * 5.0 / math.pi - 2 * 0.5715) / 10
     else:  # GT2 3mm
         return (n_teeth * 3.0 / math.pi - 2 * 0.381) / 10
 
@@ -334,18 +334,30 @@ def _draw_splinexs_bore(sk: adsk.fusion.Sketch, offset_cm: float):
         sk.isComputeDeferred = False
 
 
+def _bore_fits(bore_radius_cm: float, tooth_od_cm: float, root_depth_cm: float = 0.0) -> bool:
+    """True if the bore leaves at least ADAPTER_MIN_WALL_CM of material inside the pulley
+    body: measured to the bottom of the tooth spaces when the teeth are modelled
+    (`root_depth_cm` > 0), else to the plain cylinder's surface."""
+    if root_depth_cm <= 0:
+        return bore_radius_cm < tooth_od_cm / 2
+    return bore_radius_cm + ADAPTER_MIN_WALL_CM <= tooth_od_cm / 2 - root_depth_cm
+
+
 def _add_bore(comp: adsk.fusion.Component, tooth_len_cm: float, tooth_od_cm: float,
               bore_type: str = BORE_HALF_HEX,
-              offset_cm: float = BORE_OFFSET_DEFAULT_IN * 2.54, is_preview: bool = False):
+              offset_cm: float = BORE_OFFSET_DEFAULT_IN * 2.54, is_preview: bool = False,
+              root_depth_cm: float = 0.0):
     """Cut the centre bore (1/2in hex or WCP SplineXS, grown by `offset_cm` on every side)
     through the entire pulley (flanges + belt body). Returns the bore's sketch plane (on
-    the bottom flange face, which the bottom label reuses), or None if the cut was skipped."""
+    the bottom flange face, which the bottom label reuses), or None if the cut was skipped.
+    `root_depth_cm` is the tooth-space depth when the teeth are modelled (0 for a plain
+    cylinder): the bore has to clear the bottom of the tooth spaces, not just the tips."""
     bore_radius = _bore_radius_cm(bore_type, offset_cm)
 
     # A small tooth count can make the tooth body narrower than the bore, which would
     # otherwise self-intersect the outer profile. Skip the cut rather than risk an
     # invalid/self-intersecting geometry or a Fusion exception.
-    if bore_radius >= tooth_od_cm / 2:
+    if not _bore_fits(bore_radius, tooth_od_cm, root_depth_cm):
         _warn(f'PartsGen: pulley tooth diameter ({tooth_od_cm * 10:.1f} mm) is too small '
               f'for the {bore_type} bore — skipping the bore cut. Choose a larger tooth count.',
               is_preview)
@@ -719,7 +731,8 @@ def update_pulley_teeth(pulley_occ: adsk.fusion.Occurrence, n_teeth: int,
 
     tooth_od_cm = _outer_diameter_cm(belt_pitch_mm, n_teeth)
     bore_radius = _bore_radius_cm(bore_type, bore_offset_cm)
-    if bore_radius >= tooth_od_cm / 2:
+    if not _bore_fits(bore_radius, tooth_od_cm,
+                      TOOTH_ROOT_DEPTH_CM[belt_pitch_mm] if show_teeth else 0.0):
         return False
     if adapter_part is not None and not _adapter_fits(adapter_part, belt_pitch_mm, tooth_od_cm):
         return False
@@ -987,7 +1000,8 @@ def _create_pulley(inputs: adsk.core.CommandInputs, is_preview: bool = False):
 
         _add_flanges(workingComp, tooth_len_cm, outer_diameter_cm)
         bot_plane = _add_bore(workingComp, tooth_len_cm, outer_diameter_cm, bore_type,
-                              bore_offset_cm, is_preview)
+                              bore_offset_cm, is_preview,
+                              TOOTH_ROOT_DEPTH_CM[pitch_mm] if show_teeth else 0.0)
         # Keep the label's fallback spot (just above the bore) clear of the adapter.
         label_floor_cm = _bore_radius_cm(bore_type, bore_offset_cm)
         if groupOcc is not None:
@@ -1120,7 +1134,8 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
 
         _add_flanges(workingComp, tooth_len_cm, outer_diameter_cm)
         bot_plane = _add_bore(workingComp, tooth_len_cm, outer_diameter_cm, bore_type,
-                              bore_offset_cm, is_preview)
+                              bore_offset_cm, is_preview,
+                              TOOTH_ROOT_DEPTH_CM[belt_pitch_mm] if show_teeth else 0.0)
         label_floor_cm = _bore_radius_cm(bore_type, bore_offset_cm)
         if adapter_part is not None:
             label_floor_cm = max(label_floor_cm, adapter_part['radius_cm'])
@@ -1206,9 +1221,11 @@ def create_pulley_for_belt(belt_pitch_mm: int, n_teeth: int, belt_width_cm: floa
 # right half of the tooth is computed; the left half is its mirror image in the Y axis.
 # ---------------------------------------------------------------------------
 
-# HTD 5mm: pitch-line offset (belt thickness), tip fillet, root arc radius, root depth and
-# tooth-space width at the tip fillet.
-HTD_BELT_THICKNESS_MM = 1.74
+# HTD 5mm: pitch-line offset, tip fillet, root arc radius, root depth and tooth-space
+# width at the tip fillet. The pulley OD is the pitch diameter less TWICE the pitch-line
+# offset (0.5715 mm -> 1.143 mm), e.g. 24T = 37.05 mm. This used to subtract 1.74 mm, which
+# is the belt's backing thickness, and made every HTD pulley about 0.6 mm undersized.
+HTD_PITCH_LINE_OFFSET_MM = 0.5715
 HTD_TOP_RADIUS_MM     = 0.43
 HTD_ROOT_RADIUS_MM    = 1.49
 HTD_ROOT_HEIGHT_MM    = 2.06
@@ -1244,7 +1261,7 @@ def _v_unit(a):
 def _htd_tooth_curves(n_teeth: int):
     """Right half of one HTD tooth, as ('arc', centre, start, end) / ('line', start, end)
     tuples in the tooth frame (mm): tip arc, tip fillet, flank line, root arc."""
-    R    = (n_teeth * 5.0 / math.pi - HTD_BELT_THICKNESS_MM) / 2
+    R    = (n_teeth * 5.0 / math.pi - 2 * HTD_PITCH_LINE_OFFSET_MM) / 2
     phi  = math.pi / n_teeth
     rt   = HTD_TOP_RADIUS_MM
     rr   = HTD_ROOT_RADIUS_MM

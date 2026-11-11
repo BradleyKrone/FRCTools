@@ -43,6 +43,16 @@ local_handlers = []
 selected_CCLine = []
 target_CCLine = []
 
+# Everything else that was selected alongside a CCLine when Delete was pressed.
+# The native Delete is cancelled (so the CCLine goes as a whole), which means
+# these have to be deleted by our own delete command too.
+target_others = []
+
+# Fusion's own commands, matched by id so this works in any UI language. The
+# English names are kept as a fallback in case an id changes between releases.
+NATIVE_DELETE_CMD_IDS = ( 'DeleteCommand', 'FusionDeleteCommand', 'FusionDeleteOverrideCommand' )
+NATIVE_EDIT_DIM_CMD_ID = 'SketchEditDimensionCmdDef'
+
 motionTypes = ( 
     'Gears 20DP',
     'HTD 5mm Belt',
@@ -170,7 +180,7 @@ def stop():
 #
 def ui_command_starting(args: adsk.core.ApplicationCommandEventArgs):
 
-    global selected_CCLine, target_CCLine
+    global selected_CCLine, target_CCLine, target_others
     # futil.log(f' Command Starting={args.commandDefinition.name}, selected_CCLine len ={len(selected_CCLine)}')
 
     # If a CCLine is not selected then just return
@@ -183,12 +193,22 @@ def ui_command_starting(args: adsk.core.ApplicationCommandEventArgs):
     # This variable is set to None in the destroy() callback of the commands
     target_CCLine = selected_CCLine
 
+    cmd_id = args.commandDefinition.id
+    cmd_name = args.commandDefinition.name
+
     # Kill the editing of the dimensions within the CCLine
-    if args.commandDefinition.name == 'Edit Sketch Dimension' :
+    if cmd_id == NATIVE_EDIT_DIM_CMD_ID or cmd_name == 'Edit Sketch Dimension' :
         args.isCanceled = True
 
     # Redirect the deleting of the CCLine to the deleteCCLine() command
-    if args.commandDefinition.name == 'Delete' :
+    if cmd_id in NATIVE_DELETE_CMD_IDS or cmd_name == 'Delete' :
+        # Remember whatever else is selected so it still gets deleted.
+        target_others = []
+        selections = ui.activeSelections
+        for i in range( selections.count ):
+            ent = selections.item( i ).entity
+            if not CCLine.getParentLine( ent ):
+                target_others.append( ent )
         args.isCanceled = True
         delete_cmd_def = ui.commandDefinitions.itemById( DELETE_CMD_ID )
         delete_cmd_def.execute()
@@ -277,16 +297,27 @@ def delete_command_created(args: adsk.core.CommandCreatedEventArgs):
     futil.add_handler(args.command.destroy, delete_command_destroy, local_handlers=local_handlers)
 
 def delete_command_execute(args: adsk.core.CommandEventArgs):
-    global target_CCLine
+    global target_CCLine, target_others
 
 #    futil.log(f'Delete Command Executed Event ccLine={target_CCLine}')
     for line in target_CCLine:
         CCLine.deleteCCLine( line )
 
+    # The rest of the selection the cancelled native Delete would have removed.
+    # Deleting a CCLine can take some of these with it (its own dimensions), so
+    # skip anything that is already gone.
+    for ent in target_others:
+        try:
+            if ent.isValid:
+                ent.deleteMe()
+        except Exception as err:
+            futil.log( f'{DELETE_CMD_NAME}: could not delete a selected {ent.objectType}: {err}' )
+
 def delete_command_destroy(args: adsk.core.CommandEventArgs):
-    global target_CCLine
+    global target_CCLine, target_others
 
     target_CCLine = []
+    target_others = []
 
 
 

@@ -452,7 +452,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
         ld.motion = motionType.selectedItem.index
         ld.N1 = cog1Teeth.value
         ld.N2 = cog2Teeth.value
-        if motionType.selectedItem.index == 3:
+        if motionType.selectedItem.index in (3, 4):
             chainLinks: adsk.core.IntegerSpinnerCommandInput = inputs.itemById( "chain_links" )
             ld.Teeth = chainLinks.value
         else:
@@ -461,7 +461,7 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
         if ld.ccDistIN < (ld.OD1 + ld.OD2) / 2.0 :
             # belt/chain is too short
-            if motionType.selectedItem.index == 3:
+            if motionType.selectedItem.index in (3, 4):
                 status.formattedText = '<div align="center"><font color="red">Chain is too short!</font></div>'
             else:
                 status.formattedText = '<div align="center"><font color="red">Belt is too short!</font></div>'

@@ -138,25 +138,9 @@ class _Frame:
 # Loop helpers
 # ---------------------------------------------------------------------------
 def _loop_polygon(edges, frame):
-    # Sample a loop into a 2D polygon (cm). Stroke points of each edge, in order
-    # of the edge list -- good enough for area / point-in-polygon tests.
-    pts = []
-    for e in edges:
-        ok, strokes = e.evaluator.getStrokes(e.evaluator.getParameterExtents()[1],
-                                             e.evaluator.getParameterExtents()[2], 0.01)
-        if ok:
-            pts.extend(frame.to2d(_v(p)) for p in strokes)
-    return _order_polygon(pts)
-
-def _order_polygon(pts):
-    # Strokes from separate edges can run either way; sort by angle around the
-    # centroid. Fine for the star-shaped loops FRC cut-outs nearly always are,
-    # and only used for area / containment estimates.
-    if len(pts) < 3:
-        return pts
-    cx = sum(p[0] for p in pts) / len(pts)
-    cy = sum(p[1] for p in pts) / len(pts)
-    return sorted(pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+    # Sample a loop into a 2D polygon (cm) for area / point-in-polygon tests.
+    # Chained edge by edge, so L- and C-shaped loops come out right too.
+    return _chained_polygon(edges, frame, 0.01)
 
 def _poly_area_perimeter(poly):
     a = 0.0
@@ -205,7 +189,10 @@ def _chained_polygon(edges, frame, tol=0.001):
         ev = e.evaluator
         ok, t0, t1 = ev.getParameterExtents()
         ok, pts = ev.getStrokes(t0, t1, tol)
-        strokes.append([frame.to2d(_v(p)) for p in pts])
+        if ok and len(pts) > 0:
+            strokes.append([frame.to2d(_v(p)) for p in pts])
+    if not strokes:
+        return []
     poly = list(strokes.pop(0))
     while strokes:
         end = poly[-1]

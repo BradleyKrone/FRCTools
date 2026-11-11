@@ -31,13 +31,13 @@ class HoleSize(typing.NamedTuple):
 
 # Common FRC hole sizes
 hole_sizes: list[HoleSize] = [
-    HoleSize('10-32 Clearance', 0.203125, '#7 drill (10-32 clearance)'),
-    HoleSize('10-32 Tap', 0.1590, '#7 drill (10-32 clearance)'),
-    HoleSize('1/4-20 Clearance', 0.265625, 'F drill (1/4-20 clearance)'),
+    HoleSize('10-32 Clearance', 0.203125, '13/64" drill (10-32 clearance)'),
+    HoleSize('10-32 Tap', 0.1590, '#21 drill (10-32 tap)'),
+    HoleSize('1/4-20 Clearance', 0.265625, '17/64" drill (1/4-20 clearance)'),
     HoleSize('Rivnut Hole', 0.296875, '10-32 rivnut installation hole'),
     HoleSize('1/2 Hex Bearing', 1.125, '1/2" hex bearing'),
     HoleSize('1/2 Hex Bushing', 0.75, '1/2" hex bushing'),
-    HoleSize('Spline Bearing', 1.85039, 'Spine Bearing installation hole'),
+    HoleSize('Spline Bearing', 1.85039, 'Spline Bearing installation hole'),
     HoleSize('Custom', 0.0, 'Enter custom diameter'),
 ]
 
@@ -97,12 +97,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
 
     # Add a value input for custom diameter (initially disabled)
     customDiameterInput = inputs.addValueInput('custom_diameter', 'Custom Diameter', 'in', 
-                                               adsk.core.ValueInput.createByReal(0.25))
+                                               adsk.core.ValueInput.createByString('0.25 in'))
     customDiameterInput.isEnabled = False
 
     # Add a value input for diameter offset (tolerance)
     offsetInput = inputs.addValueInput('diameter_offset', 'Diameter Offset', 'in',
-                                       adsk.core.ValueInput.createByReal(0.0))
+                                       adsk.core.ValueInput.createByString('0 in'))
     offsetInput.tooltip = 'Add tolerance to hole diameter'
 
     # Add description text

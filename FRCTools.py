@@ -43,8 +43,10 @@ def run(context):
 
         # Create the FRCTool submenu in the sketch-create and sketch-modify panels.
         # (Solid commands go straight into the FRC panel above, no submenu needed.)
-        sketch_create_panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
-        sketch_modify_panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
+        # As with the panels above, reuse a submenu left over from a previous run.
+        for panel in ( sketch_create_panel, sketch_modify_panel ):
+            if not panel.controls.itemById( config.FRC_TOOLS_DROPDOWN_ID ):
+                panel.controls.addDropDown( "FRCTools", "", config.FRC_TOOLS_DROPDOWN_ID )
 
         # This will run the start function in each of your commands as defined in commands/__init__.py
         commands.start()
@@ -59,6 +61,7 @@ def stop(context):
         futil.clear_handlers()
 
         # This will run the stop function in each of your commands as defined in commands/__init__.py
+        # (each command's failure is caught and logged there, so the clean-up below always runs)
         commands.stop()
 
         workspace = ui.workspaces.itemById(config.WORKSPACE_ID)

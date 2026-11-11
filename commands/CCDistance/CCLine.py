@@ -190,11 +190,14 @@ def getChildCircles( line: adsk.fusion.SketchLine ) -> list[adsk.fusion.SketchCi
     i = 0
     while i < len(attrNames):
         token = line.attributes.itemByName( CC_ATTRIBUTE_GROUP, attrNames[i] )
-        circle = design.findEntityByToken( token.value )
+        circle = design.findEntityByToken( token.value ) if token else []
         if len( circle ) == 0:
-            futil.log(f'Error getting child circles of line...')
-            return None
-        circles.append( circle[0] )
+            # Keep the slot (as None) so the circles that do survive still
+            # line up with their attribute and can be cleaned up.
+            futil.log(f'Error getting child circle "{attrNames[i]}" of line...')
+            circles.append( None )
+        else:
+            circles.append( circle[0] )
         i += 1
 
     return circles
@@ -206,6 +209,7 @@ def getChildEntity( line: adsk.fusion.SketchLine, attribute: str ) :
     token = line.attributes.itemByName( CC_ATTRIBUTE_GROUP, attribute )
     if not token:
         futil.log(f'Error getting attribute "{attribute}" from line')
+        return None
 
     ents = design.findEntityByToken( token.value )
     if len( ents ) == 0:
@@ -227,23 +231,23 @@ def getCCLineFromEntity( curve: adsk.fusion.SketchCurve ) -> CCLine :
     # Get the associated data from the line attributes
     ccLine.data = getLineData( ccLine.line )
 
+    # A damaged CCLine (a circle deleted or trimmed away) still comes back with
+    # whatever is left, so it can at least be selected and deleted as a whole.
+    ccLine.lengthDim = getChildEntity( ccLine.line, CC_LINE_LENGTH_DIM )
+    ccLine.textBox = getChildEntity( ccLine.line, CC_LINE_TEXT )
+    ccLine.textHeight = getChildEntity( ccLine.line, CC_LINE_TEXT_HEIGHT_DIM )
+
     circles = getChildCircles( ccLine.line )
-    if len(circles) != 4:
-        futil.log( f'Error getting child circle data.')
-        return ccLine
-    
+
     ccLine.pitchCircle1 = circles[0]
     ccLine.pitchCircle2 = circles[1]
     ccLine.ODCircle1 = circles[2]
     ccLine.ODCircle2 = circles[3]
 
-    ccLine.lengthDim = getChildEntity( ccLine.line, CC_LINE_LENGTH_DIM )
     ccLine.PD1Dim = getChildEntity( ccLine.line, CC_LINE_PITCH_CIRCLE1_DIM )
     ccLine.PD2Dim = getChildEntity( ccLine.line, CC_LINE_PITCH_CIRCLE2_DIM )
     ccLine.OD1Dim = getChildEntity( ccLine.line, CC_LINE_OD_CIRCLE1_DIM )
     ccLine.OD2Dim = getChildEntity( ccLine.line, CC_LINE_OD_CIRCLE2_DIM )
-    ccLine.textBox = getChildEntity( ccLine.line, CC_LINE_TEXT )
-    ccLine.textHeight = getChildEntity( ccLine.line, CC_LINE_TEXT_HEIGHT_DIM )
 
     return ccLine
     

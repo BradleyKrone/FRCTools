@@ -564,11 +564,21 @@ def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
         if comp.attributes.itemByName(ATTR_GROUP, ATTR_CUSTOM_NAME):
             return  # user gave this belt a custom name — don't auto-rename it
 
-        # Extract belt width from the existing name (format: "Belt_XXX-NNNTxMMmm")
-        try:
-            width_mm = int(comp.name.split('Tx')[1].replace('mm', ''))
-        except Exception:
-            width_mm = 9  # fallback
+        # Belt width: the stored attribute ("15 mm") is the truth. The name is only a
+        # fallback for belts made before the attribute existed (format
+        # "Belt_XXX-NNNTxMMmm") -- a belt renamed in the browser has no width in its name.
+        width_mm = None
+        width_attr = comp.attributes.itemByName(ATTR_GROUP, ATTR_BELT_WIDTH)
+        if width_attr:
+            try:
+                width_mm = int(round(float(width_attr.value.split()[0])))
+            except Exception:
+                width_mm = None
+        if width_mm is None:
+            try:
+                width_mm = int(comp.name.split('Tx')[1].replace('mm', ''))
+            except Exception:
+                width_mm = 9  # fallback
 
         prefix   = 'Belt_HTD_5mm' if belt_pitch_mm == 5 else 'Belt_GT2_3mm'
         new_name = f'{prefix}-{tooth_count}Tx{width_mm}mm'
@@ -581,6 +591,19 @@ def _update_belt_name(comp: adsk.fusion.Component, belt_type_str: str):
 # ---------------------------------------------------------------------------
 # Public helpers called from PartsGen/entry.py
 # ---------------------------------------------------------------------------
+
+def _is_belt_cc_line(ccLine) -> bool:
+    """True if the C-C Distance object is for a timing belt and still has both pitch
+    circles. Its motion type is an index into CCDistance's list: 0 = gears, 1 = HTD 5mm,
+    2 = GT2 3mm, 3 / 4 = #25 / #35 chain -- only 1 and 2 map onto the belt-type dropdown
+    (as motion - 1). Anything else is rejected with a message instead of an exception."""
+    if ccLine.data.motion in (1, 2) and ccLine.pitchCircle1 and ccLine.pitchCircle2:
+        return True
+    futil.popup_error('Parts Gen: that C-C Distance is not for a timing belt (it is for '
+                      'gears or chain, or is missing a pitch circle). Pick an HTD 5mm or '
+                      'GT2 3mm C-C Distance, or two circles.')
+    return False
+
 
 def handle_belt_selection_changed(inputs: adsk.core.CommandInputs):
     """React to changes in the tb_pitch_circles selection input.
@@ -602,9 +625,11 @@ def handle_belt_selection_changed(inputs: adsk.core.CommandInputs):
         ccLine = getCCLineFromEntity(pitchLineSelection.selection(0).entity)
         if ccLine:
             pitchLineSelection.clearSelection()
-            if ccLine.data.motion != 0:
-                beltType.listItems.item(ccLine.data.motion - 1).isSelected = True
-                beltType.isEnabled = False
+            if not _is_belt_cc_line(ccLine):
+                beltType.isEnabled = True
+                return
+            beltType.listItems.item(ccLine.data.motion - 1).isSelected = True
+            beltType.isEnabled = False
             pitchLineSelection.addSelection(ccLine.pitchCircle1)
             pitchLineSelection.addSelection(ccLine.pitchCircle2)
         else:
@@ -616,9 +641,11 @@ def handle_belt_selection_changed(inputs: adsk.core.CommandInputs):
         ccLine = getCCLineFromEntity(newEntity)
         if ccLine:
             pitchLineSelection.clearSelection()
-            if ccLine.data.motion != 0:
-                beltType.listItems.item(ccLine.data.motion - 1).isSelected = True
-                beltType.isEnabled = False
+            if not _is_belt_cc_line(ccLine):
+                beltType.isEnabled = True
+                return
+            beltType.listItems.item(ccLine.data.motion - 1).isSelected = True
+            beltType.isEnabled = False
             pitchLineSelection.addSelection(ccLine.pitchCircle1)
             pitchLineSelection.addSelection(ccLine.pitchCircle2)
         else:
