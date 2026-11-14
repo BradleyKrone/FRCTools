@@ -6,7 +6,8 @@
 #
 # Source: Notes/Shop/CNC/Shapeoko 5.1 Pro/Shapeoko 5.1 Pro.md. Every row there is
 # still marked "Starting point", so treat these as starting values and update
-# them here as cuts get proven out.
+# them here as cuts get proven out. Wood uses CIC Workshop's published numbers
+# for its bits (see MATERIAL_TOOLS).
 
 MATERIALS = ['Wood', 'Aluminum', 'Polycarb', 'SRPP']
 
@@ -46,6 +47,7 @@ MACHINES = {
 TOOLS = {
     '1/4': {
         'description': '1/4" O-Flute (FRC)',
+        'label': '1/4 O-flute',
         'number': 1,
         'diameter': 0.250,
         'flutes': 1,
@@ -56,6 +58,7 @@ TOOLS = {
     },
     '1/8': {
         'description': '1/8" O-Flute (FRC)',
+        'label': '1/8 O-flute',
         'number': 2,
         'diameter': 0.125,
         'flutes': 1,
@@ -65,6 +68,46 @@ TOOLS = {
         'overall_length': 1.5,
     },
 }
+
+# Per-material bit overrides: a material listed here cuts with these bits instead
+# of TOOLS. Same keys (and diameters) as TOOLS, so feature classification doesn't
+# change. Tool numbers stay 1 / 2 so the post and tool changes look the same.
+#
+# Wood runs CIC Workshop bits (cicworkshop.com/collections/bits):
+#   Golden Boy XL (GDBOYXL) -- 1/4" x 1.5" 3-flute upcut rougher, 3" OAL
+#   UC2175                  -- 1/8" x 3/4" 2-flute upcut, 1/4" shank, 2" OAL
+MATERIAL_TOOLS = {
+    'Wood': {
+        '1/4': {
+            'description': '1/4" Golden Boy XL 3FL Upcut (CIC GDBOYXL)',
+            'label': '1/4 Golden Boy XL',
+            'number': 1,
+            'diameter': 0.250,
+            'flutes': 3,
+            'flute_length': 1.5,
+            'shoulder_length': 1.6,
+            'body_length': 1.75,
+            'overall_length': 3.0,
+        },
+        '1/8': {
+            'description': '1/8" 2FL Upcut (CIC UC2175)',
+            'label': '1/8 upcut',
+            'number': 2,
+            'diameter': 0.125,
+            'shank_diameter': 0.250,
+            'flutes': 2,
+            'flute_length': 0.75,
+            'shoulder_length': 0.80,
+            'body_length': 0.90,
+            'overall_length': 2.0,
+        },
+    },
+}
+
+
+def tool(key, material=None):
+    # The bit a material cuts `key` ('1/4' / '1/8') with.
+    return MATERIAL_TOOLS.get(material, {}).get(key) or TOOLS[key]
 
 # ---------------------------------------------------------------------------
 # Feeds & speeds:  FEEDS[feeds_key][material][tool][strategy]
@@ -102,11 +145,20 @@ FEEDS = {
             '1/8': {'slot':     {'rpm': 18000, 'feed': 90, 'plunge': 30, 'doc': 0.0625},
                     'adaptive': {'rpm': 18000, 'feed': 120, 'plunge': 30, 'doc': 0.125, 'woc': 0.025}},
         },
+        # Wood: the CIC bits in MATERIAL_TOOLS. Slot rows are CIC's published
+        # "Hobby CNC with Spindle" numbers (18k RPM, plunge 50% of feed): Golden
+        # Boy XL 100 IPM @ 0.25" per pass, UC2175 70 IPM @ 0.125". With even
+        # stepdowns a 3/4" sheet profiles in 3 passes, 1/2" in 2, 1/4" in 1.
+        # Adaptive takes a thin radial bite, so it runs deeper and faster: the XL
+        # at 0.5" per pass (a 3/4" sheet = 2 even passes of 0.375", 1/2" and
+        # thinner = 1), the UC2175 at half its flute length.
+        # If the wood scorches, drop RPM before dropping feed (a bigger chip
+        # carries the heat away).
         'Wood': {
-            '1/4': {'slot':     {'rpm': 18000, 'feed': 80, 'plunge': 25, 'doc': 0.125},
-                    'adaptive': {'rpm': 18000, 'feed': 120, 'plunge': 30, 'doc': 0.250, 'woc': 0.050}},
-            '1/8': {'slot':     {'rpm': 18000, 'feed': 50, 'plunge': 15, 'doc': 0.0625},
-                    'adaptive': {'rpm': 18000, 'feed': 70, 'plunge': 20, 'doc': 0.125, 'woc': 0.025}},
+            '1/4': {'slot':     {'rpm': 18000, 'feed': 100, 'plunge': 50, 'doc': 0.25},
+                    'adaptive': {'rpm': 18000, 'feed': 150, 'plunge': 50, 'doc': 0.50, 'woc': 0.040}},
+            '1/8': {'slot':     {'rpm': 18000, 'feed': 70, 'plunge': 35, 'doc': 0.125},
+                    'adaptive': {'rpm': 18000, 'feed': 90, 'plunge': 35, 'doc': 0.375, 'woc': 0.020}},
         },
     },
 }
@@ -132,8 +184,22 @@ SMALL_HOLE_MAX = 0.30               # holes below this use the 1/8" bit
 DRILL_MATCH_TOL = 0.010             # |D - 1/8| at or under this -> plunge drill, no helix
 BORE_MAX = 1.0                      # round holes above this are cleared by adaptive
 MIN_BORE_RATIO = 1.10               # helical bore needs D >= ratio * tool D
-SMALL_TOOL_RADIUS = 0.130           # inside corner radius under this -> 1/8" bit
+# Inside corners smaller than the 1/4" bit's radius (from TOOLS, minus this
+# rounding allowance) go to the 1/8" bit. Derived, not typed in: a hard-coded
+# 0.130 once sent Tab & Slot's 0.127" dogbones and hand-drawn 0.125" fillets --
+# which the 1/4" fits -- to the 1/8". A corner equal to the bit radius cuts fine.
+CORNER_FIT_TOL = 0.0005
 SMALL_TOOL_WIDTH = 0.35             # cut-outs narrower than this -> 1/8" bit
+# Through cut-outs (and 'large' round holes) at least this wide get one inside
+# profile with tabs holding the slug, instead of adaptive clearing the whole
+# slug. Width is Cutout.width (2 * area / perimeter: about a slot's short side,
+# half a circle's diameter). Materials not listed always clear.
+CUTOUT_PROFILE_MIN_WIDTH = {'Wood': 1.0}
+# Cleared cut-outs: the adaptive leaves this much radial stock, then a 2D
+# contour finishes the wall. Adaptive won't drive into a corner about the size
+# of the bit (Tab & Slot dogbones are bit + 0.004"), so without the contour the
+# dogbones keep a sliver of material and the tab won't seat.
+CUTOUT_FINISH_STOCK = 0.010
 
 # ---------------------------------------------------------------------------
 # Setup / hold-down (inches)

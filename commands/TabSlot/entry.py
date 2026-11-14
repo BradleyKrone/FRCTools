@@ -47,8 +47,12 @@ _last = {
     'corner_round': 0.03125,
 }
 
-PICK_PROMPT = 'Pick the tab plate and the slot plate.'
-EDIT_NOTE = 'Editing: no live preview -- click OK to rebuild this joint in place.'
+PICK_PROMPT = 'Pick the tab plate(s) and the slot plate(s).'
+PICK_JOINT = 'Pick the joint to edit'
+EDIT_NOTE = 'Editing: no live preview -- click Rebuild to apply the changes to this joint.'
+# Inputs that stay locked in the Edit dialog until a joint is chosen in the Joint list.
+_EDIT_LOCKED = ('tab_body', 'slot_body', 'count', 'tab_width', 'margin', 'bit', 'bit_dia',
+                'clear_w', 'clear_l', 'protrusion', 'corner_round')
 
 # Problems with the current picks, worked out in inputChanged and used by validateInputs.
 _state = {'problems': [PICK_PROMPT], 'blocking': [PICK_PROMPT]}
@@ -112,14 +116,22 @@ def edit_command_created(args: adsk.core.CommandCreatedEventArgs):
     global _menu_target
     futil.log(f'{EDIT_CMD_NAME} Command Created Event')
     target, _menu_target = _menu_target, None
-    runs = gen.list_runs(adsk.fusion.Design.cast(app.activeProduct))
-    if target == CHOOSE or target is None:
-        target = runs[0] if runs else None
-    if target is None:
+    all_runs = gen.list_runs(adsk.fusion.Design.cast(app.activeProduct))
+    if not all_runs:
         ui.messageBox('There is no Tab & Slot joint in this design to edit.', EDIT_CMD_NAME)
         return
+    if target is None or target[0] == 'choose':
+        # Couldn't tell which joint was right-clicked (a timeline group, or a plate several joints
+        # use): the user picks it. Never guess -- a guess edits the wrong joint without a word.
+        runs = (target[1] if target is not None and target[1] else all_runs)
+        if len(runs) == 1:
+            run_id, data = runs[0]
+            _build_dialog(args, _run_values(data), edit={'run_id': run_id, 'data': data, 'runs': runs})
+        else:
+            _build_dialog(args, dict(_last), edit={'run_id': None, 'data': None, 'runs': runs})
+        return
     run_id, data = target
-    _build_dialog(args, _run_values(data), edit={'run_id': run_id, 'data': data, 'runs': runs})
+    _build_dialog(args, _run_values(data), edit={'run_id': run_id, 'data': data, 'runs': all_runs})
 
 
 def _run_values(data) -> dict:
@@ -143,13 +155,26 @@ def _run_labels(runs) -> list:
     return labels
 
 
+def _lock_inputs(inputs, locked: bool):
+    """Grey out the joint's inputs until a joint is chosen (Edit opened on an unknown joint)."""
+    custom = inputs.itemById('bit').selectedItem.name == CUSTOM_BIT
+    for input_id in _EDIT_LOCKED:
+        inp = inputs.itemById(input_id)
+        if inp is not None:
+            inp.isEnabled = not locked and (input_id != 'bit_dia' or custom)
+
+
 def _switch_run(inputs, index: int):
     """Edit dialog: load another run's settings and plates after the Joint dropdown changes."""
     runs = _state['edit']['runs']
+    index -= _state.get('run_offset', 0)          # the "Pick the joint to edit" placeholder
+    if index < 0:
+        return
+    _lock_inputs(inputs, False)
     run_id, data = runs[index]
     design = adsk.fusion.Design.cast(app.activeProduct)
     _state['edit'] = {'run_id': run_id, 'data': data, 'runs': runs}
-    _state['edit_bodies'] = (gen._resolve(design, data['tab_token']), gen._resolve(design, data['slot_token']))
+    _state['edit_bodies'] = _resolve_plates(design, data)
     vals = _run_values(data)
     inputs.itemById('count').value = vals['count']
     for key in ('tab_width', 'margin', 'clear_w', 'clear_l', 'protrusion', 'corner_round'):
@@ -159,47 +184,60 @@ def _switch_run(inputs, index: int):
     bit_dia = inputs.itemById('bit_dia')
     bit_dia.value = BITS.get(vals['bit'], vals['bit_dia']) * IN_TO_CM
     bit_dia.isEnabled = vals['bit'] == CUSTOM_BIT
-    tab, slot = _state['edit_bodies']
-    for input_id, body in (('tab_body', tab), ('slot_body', slot)):
+    tabs, slots = _state['edit_bodies']
+    for input_id, bodies in (('tab_body', tabs), ('slot_body', slots)):
         sel = inputs.itemById(input_id)
         sel.clearSelection()
-        if body is not None:
-            sel.addSelection(body)
+        for body in bodies:
+            if body is not None:
+                sel.addSelection(body)
+
+
+def _resolve_plates(design, data):
+    """([tab plates], [slot plates]) of a run; an entry is None if that plate is gone."""
+    return ([gen._resolve(design, t) for t in gen.tokens(data, 'tab')],
+            [gen._resolve(design, t) for t in gen.tokens(data, 'slot')])
 
 
 def _build_dialog(args, vals: dict, edit):
     cmd = args.command
     inputs = cmd.commandInputs
+    run_offset = 0
     if edit is not None:
         cmd.okButtonText = 'Rebuild'
         runs = edit.get('runs') or []
-        if len(runs) > 1:
+        if len(runs) > 1 or edit['run_id'] is None:
             run_dd = inputs.addDropDownCommandInput('run', 'Joint', adsk.core.DropDownStyles.TextListDropDownStyle)
             run_dd.tooltip = 'Which Tab & Slot joint to edit'
+            if edit['run_id'] is None:
+                run_dd.listItems.add(PICK_JOINT, True)
+                run_offset = 1
             for (rid, _), label in zip(runs, _run_labels(runs)):
                 run_dd.listItems.add(label, rid == edit['run_id'])
 
-    tab_sel = inputs.addSelectionInput('tab_body', 'Tab Plate',
-                                       'The plate whose edge sits on the other plate -- it gets the tabs')
+    # Both pickers take any number of plates: every tab plate whose edge sits on a slot plate
+    # becomes a joint (e.g. six dividers into one lid in a single run).
+    tab_sel = inputs.addSelectionInput('tab_body', 'Tab Plates',
+                                       'The plates whose edge sits on another plate -- they get the tabs. '
+                                       'Pick as many as you like.')
     tab_sel.addSelectionFilter('SolidBodies')
-    tab_sel.setSelectionLimits(1, 1)
+    tab_sel.setSelectionLimits(1, 0)
 
-    slot_sel = inputs.addSelectionInput('slot_body', 'Slot Plate',
-                                        'The plate the edge sits on -- it gets the slots')
+    slot_sel = inputs.addSelectionInput('slot_body', 'Slot Plates',
+                                        'The plates the edges sit on -- they get the slots. '
+                                        'Pick as many as you like.')
     slot_sel.addSelectionFilter('SolidBodies')
-    slot_sel.setSelectionLimits(1, 1)
+    slot_sel.setSelectionLimits(1, 0)
 
     # Reset first: after a successful run `problems` is empty, and indexing it here threw,
     # leaving a dialog with only the two pickers (no handlers wired either).
     _state.clear()
-    _state.update(problems=[PICK_PROMPT], blocking=[PICK_PROMPT], joint_key=None, joint=None,
-                  joint_clean=True, preview_live=False, edit=edit, edit_bodies=(None, None))
-    if edit is not None:
-        data = edit['data']
-        design = adsk.fusion.Design.cast(app.activeProduct)
-        _state['edit_bodies'] = (gen._resolve(design, data['tab_token']),
-                                 gen._resolve(design, data['slot_token']))
-    info = inputs.addTextBoxCommandInput('info', 'Detected', PICK_PROMPT, 3, True)
+    _state.update(problems=[PICK_PROMPT], blocking=[PICK_PROMPT], joint_key=None, joints=[], notes=[],
+                  joint_clean=True, preview_live=False, edit=edit, edit_bodies=([], []),
+                  run_offset=run_offset)
+    if edit is not None and edit['data'] is not None:
+        _state['edit_bodies'] = _resolve_plates(adsk.fusion.Design.cast(app.activeProduct), edit['data'])
+    info = inputs.addTextBoxCommandInput('info', 'Detected', PICK_PROMPT, 4, True)
     info.isFullWidth = True
 
     inputs.addIntegerSpinnerCommandInput('count', 'Tab Count', 1, 50, 1, vals['count'])
@@ -218,7 +256,8 @@ def _build_dialog(args, vals: dict, edit):
     inputs.addValueInput('clear_l', 'Slot Length Clearance', 'in', futil.inchValue(vals['clear_l'])).tooltip = \
         'Extra gap at EACH end of the slot (along the joint)'
     inputs.addValueInput('protrusion', 'Tab Protrusion', 'in', futil.inchValue(vals['protrusion'])).tooltip = \
-        'How far the tabs stick out past the slot plate (0 = flush)'
+        'How far the tabs stick out past the slot plate (0 = flush; negative = stop short). Tabs always ' \
+        'reach through the slot plate\'s thickness + this, so they follow a thickness change'
     inputs.addValueInput('corner_round', 'Corner Round', 'in', futil.inchValue(vals['corner_round'])).tooltip = \
         'Fillet on the sharp points beside each dogbone so the bit runs smoothly (0 = off)'
 
@@ -236,10 +275,15 @@ def _build_dialog(args, vals: dict, edit):
 # ---------------------------------------------------------------------------
 
 def _picks(inputs):
-    tab_sel, slot_sel = inputs.itemById('tab_body'), inputs.itemById('slot_body')
-    tab = tab_sel.selection(0).entity if tab_sel.selectionCount > 0 else None
-    slot = slot_sel.selection(0).entity if slot_sel.selectionCount > 0 else None
-    return tab, slot
+    """([picked tab plates], [picked slot plates])."""
+    def picked(input_id):
+        sel = inputs.itemById(input_id)
+        return [sel.selection(i).entity for i in range(sel.selectionCount)]
+    return picked('tab_body'), picked('slot_body')
+
+
+def _same_bodies(a, b) -> bool:
+    return len(a) == len(b) and all(any(x == y for y in b) for x in a)
 
 
 def _params(inputs) -> gen.Params:
@@ -273,6 +317,19 @@ def _part_name(body) -> str:
     return occ.component.name if occ is not None else body.name
 
 
+def _plates_label(bodies) -> str:
+    """'Battery_Box_Top', 'Battery_Dividers x6', or '3 plates' -- for the timeline group name."""
+    names = []
+    for b in bodies:
+        if _part_name(b) not in names:
+            names.append(_part_name(b))
+    if len(bodies) == 1:
+        return names[0]
+    if len(names) == 1:
+        return f'{names[0]} x{len(bodies)}'
+    return f'{len(bodies)} plates'
+
+
 def _group_timeline(design, start_marker: int, name: str):
     """Put every sketch and feature this run made into one named timeline group. Unlike
     futil.group_timeline_features, a failure is shown in the Text Command window with the reason."""
@@ -289,62 +346,80 @@ def _group_timeline(design, start_marker: int, name: str):
                   adsk.core.LogLevels.WarningLogLevel, force_console=True)
 
 
-def _pair_key(tab, slot):
-    return (tab.entityToken, slot.entityToken)
+def _picks_key(tabs, slots):
+    return (tuple(b.entityToken for b in tabs), tuple(b.entityToken for b in slots))
 
 
-def _stored_joint(data):
-    """The joint measured when the edited run was first built (the live plates now carry its
+def _stored_joints(data):
+    """The joints measured when the edited run was first built (the live plates now carry its
     tabs and slots, so they can't be re-measured until the rebuild rolls back past them)."""
-    jd = data['joint']
-    return SimpleNamespace(length=jd['length'], t_a=jd['t_a'], t_b=jd['t_b'],
-                           extra={'b_w_range': tuple(jd['b_w_range'])})
+    return [SimpleNamespace(length=jd['length'], t_a=jd['t_a'], t_b=jd['t_b'],
+                            extra={'b_w_range': tuple(jd['b_w_range']), 'name': jd.get('name', 'joint')})
+            for jd in gen.stored_joints(data)]
 
 
-def _joint_for(tab, slot, fresh: bool):
-    """The joint for these picks. In inputChanged the previous preview's tabs/slots are still on
-    the bodies (seen live: a 10 in joint measured 1.141 in -- a shoulder piece between tabs), so
-    re-measure only when the picks change or `fresh` (executePreview, where Fusion has already
-    rolled the old preview back); otherwise reuse the last clean measurement."""
+def _joints_for(tabs, slots, fresh: bool):
+    """([joints], [notes]) for these picks. In inputChanged the previous preview's tabs/slots are
+    still on the bodies (seen live: a 10 in joint measured 1.141 in -- a shoulder piece between
+    tabs), so re-measure only when the picks change or `fresh` (executePreview, where Fusion has
+    already rolled the old preview back); otherwise reuse the last clean measurement."""
     edit = _state.get('edit')
-    if edit is not None and (tab, slot) == _state.get('edit_bodies'):
+    if edit is not None and _same_bodies(tabs, _state['edit_bodies'][0]) and \
+            _same_bodies(slots, _state['edit_bodies'][1]):
         _state['joint_clean'] = True
-        return _stored_joint(edit['data'])
-    key = _pair_key(tab, slot)
+        return _stored_joints(edit['data']), []
+    key = _picks_key(tabs, slots)
     if fresh or _state.get('joint_key') != key:
         _state['joint_key'] = key
-        _state['joint'] = gen.find_joint(tab, slot)
+        _state['joints'], _state['notes'] = gen.find_joints(tabs, slots)
         # A re-pick while a preview is up may have measured the preview's geometry.
         _state['joint_clean'] = fresh or not _state.get('preview_live', False)
-    return _state['joint']
+    return _state['joints'], _state['notes']
+
+
+def _span(values) -> str:
+    lo, hi = min(values) / IN_TO_CM, max(values) / IN_TO_CM
+    return f'{lo:.3f}' if hi - lo < 0.0005 else f'{lo:.3f}-{hi:.3f}'
 
 
 def _refresh(inputs, fresh: bool = False):
-    """Check the joint and layout, and show the result in the Detected box. Sets
+    """Check the joints and layout, and show the result in the Detected box. Sets
     `_state['problems']` (all of them, shown) and `_state['blocking']` (what disables OK)."""
     problems, lines, hard = [], [], True
-    tab, slot = _picks(inputs)
-    if tab is None or slot is None:
+    tabs, slots = _picks(inputs)
+    edit = _state.get('edit')
+    if edit is not None and edit.get('run_id') is None:
+        problems.append('First choose the joint to edit in the Joint list at the top -- '
+                        'its settings and plates load, then they can be changed.')
+    elif not tabs or not slots:
         problems.append(PICK_PROMPT)
-    elif tab == slot:
+    elif len(tabs) == 1 and len(slots) == 1 and tabs[0] == slots[0]:
         problems.append('Pick two different bodies.')
-    elif not gen.is_editable(tab) or not gen.is_editable(slot):
+    elif not all(gen.is_editable(b) for b in tabs + slots):
         problems.append('One of the bodies is in a linked component and can\'t be edited.')
-    elif _state.get('edit') is not None and (tab, slot) != _state.get('edit_bodies'):
-        problems.append('Editing rebuilds this joint on its original plates -- re-pick those two, '
+    elif edit is not None and not (_same_bodies(tabs, _state['edit_bodies'][0]) and
+                                   _same_bodies(slots, _state['edit_bodies'][1])):
+        problems.append('Editing rebuilds this joint on its original plates -- re-pick those, '
                         'or run Tab & Slot from the FRC panel for a new joint.')
     else:
-        joint = _joint_for(tab, slot, fresh)
-        if joint is None:
-            problems.append('The tab plate\'s edge doesn\'t sit flat on the slot plate\'s face. '
+        joints, notes = _joints_for(tabs, slots, fresh)
+        if not joints:
+            problems.append('No tab plate\'s edge sits flat on a slot plate\'s face. '
                             'Butt the edge against the face (T or L joint) and try again.')
         else:
-            lines.append(f'Joint {joint.length / IN_TO_CM:.3f} in, tab plate {joint.t_a / IN_TO_CM:.3f} in, '
-                         f'slot plate {joint.t_b / IN_TO_CM:.3f} in')
+            head = 'Joint' if len(joints) == 1 else f'{len(joints)} joints,'
+            lines.append(f'{head} {_span([j.length for j in joints])} in, '
+                         f'tab plate {_span([j.t_a for j in joints])} in, '
+                         f'slot plate {_span([j.t_b for j in joints])} in')
             params = _params(inputs)
-            _, layout_problems = gen.layout_tabs(joint, params)
-            problems.extend(layout_problems)
-            lines.extend(gen.warnings(joint, params))
+            if edit is None:
+                problems.extend(gen.plan_units(joints)[1])
+            problems.extend(gen.layout_problems(joints, params))
+            for j in joints:
+                for note in gen.warnings(j, params):
+                    if note not in lines:
+                        lines.append(note)
+            lines.extend(notes)
         # Don't block on a measurement that may include an old preview: blocking would stop
         # the preview that re-measures it cleanly (executePreview only runs on valid inputs).
         hard = _state.get('joint_clean', True)
@@ -366,18 +441,23 @@ def command_execute(args: adsk.core.CommandEventArgs):
     design = adsk.fusion.Design.cast(app.activeProduct)
     edit = _state.get('edit')
     try:
-        tab, slot = _picks(inputs)
+        tabs, slots = _picks(inputs)
         params = _params(inputs)
         bit_label = inputs.itemById('bit').selectedItem.name
         if edit is not None:
             data = dict(edit['data'], bit_label=bit_label)
-            report = gen.rebuild_run(design, edit['run_id'], tab.entityToken, slot.entityToken, params, data)
+            report = gen.rebuild_run(design, edit['run_id'], [b.entityToken for b in tabs],
+                                     [b.entityToken for b in slots], params, data)
         else:
+            # Measure before anything changes; the whole batch is one group and one editable run.
             start_marker = design.timeline.markerPosition
-            report = gen.build(tab, slot, params, constrain=True)
-            group_name = f'{CMD_NAME} ({_part_name(tab)} -> {_part_name(slot)})'
+            joints, _ = gen.find_joints(tabs, slots)
+            report = gen.build_many(tabs, slots, params, constrain=True, joints=joints)
+            used_tabs = [b for b in tabs if any(j.extra['tab'] == b for j in joints)]
+            used_slots = [b for b in slots if any(j.extra['slot'] == b for j in joints)]
+            group_name = f'{CMD_NAME} ({_plates_label(used_tabs)} -> {_plates_label(used_slots)})'
             _group_timeline(design, start_marker, group_name)
-            gen.tag_run(report, gen.make_data(tab, slot, params, report['joint'], bit_label, group_name))
+            gen.tag_run(report, gen.make_data(used_tabs, used_slots, params, joints, bit_label, group_name))
         _remember(inputs)
         loose = [name for name, ok in report.get('fully_constrained', {}).items() if not ok]
         if loose:
@@ -397,8 +477,8 @@ def command_preview(args: adsk.core.CommandEventArgs):
         # Editing: the plates still carry the old tabs/slots, so there is nothing sensible to
         # preview on -- OK rolls back and rebuilds.
         if not _state['problems'] and _state.get('edit') is None:
-            tab, slot = _picks(inputs)
-            gen.build(tab, slot, _params(inputs), constrain=False, joint=_state['joint'])
+            tabs, slots = _picks(inputs)
+            gen.build_many(tabs, slots, _params(inputs), constrain=False, joints=_state['joints'])
             _state['preview_live'] = True
     except Exception:
         futil.handle_error(CMD_NAME, show_message_box=False)
@@ -407,18 +487,21 @@ def command_preview(args: adsk.core.CommandEventArgs):
 
 
 def command_activate(args: adsk.core.CommandEventArgs):
-    """Edit only: re-pick the joint's two plates. Must be here, not in commandCreated --
+    """Edit only: re-pick the joint's plates. Must be here, not in commandCreated --
     addSelection does nothing while the inputs are still being built (LESSONS_LEARNED)."""
     inputs = args.command.commandInputs
-    tab, slot = _state.get('edit_bodies', (None, None))
+    tabs, slots = _state.get('edit_bodies', ([], []))
     try:
-        if tab is not None:
-            inputs.itemById('tab_body').addSelection(tab)
-        if slot is not None:
-            inputs.itemById('slot_body').addSelection(slot)
+        for input_id, bodies in (('tab_body', tabs), ('slot_body', slots)):
+            for body in bodies:
+                if body is not None:
+                    inputs.itemById(input_id).addSelection(body)
     except Exception:
         futil.log(f'{EDIT_CMD_NAME}: could not re-select the original plates')
-    if tab is None or slot is None:
+    edit = _state.get('edit') or {}
+    if edit.get('run_id') is None:
+        _lock_inputs(inputs, True)
+    if edit.get('run_id') is not None and (not tabs or not slots or any(b is None for b in tabs + slots)):
         inputs.itemById('info').text = ('The original plates could not be found -- they may have been '
                                         'deleted. Cancel and run Tab & Slot again.')
     else:
@@ -433,11 +516,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
             _switch_run(inputs, changed.selectedItem.index)
         except Exception:
             futil.handle_error(EDIT_CMD_NAME, show_message_box=False)
-    if changed.id == 'tab_body':
-        # Once the tab plate is picked, move straight on to the slot plate.
-        slot_sel = inputs.itemById('slot_body')
-        if inputs.itemById('tab_body').selectionCount == 1 and slot_sel.selectionCount == 0:
-            slot_sel.hasFocus = True
+    # No auto-jump to the slot picker after the first tab plate: several tab plates can be picked.
     if changed.id == 'bit':
         label = inputs.itemById('bit').selectedItem.name
         bit_dia = inputs.itemById('bit_dia')
@@ -459,7 +538,7 @@ def command_destroy(args: adsk.core.CommandEventArgs):
     global local_handlers
     local_handlers = []
     _state['edit'] = None
-    _state['edit_bodies'] = (None, None)
+    _state['edit_bodies'] = ([], [])
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +551,14 @@ def _find_run(entity):
     if run_id:
         return run_id, data
     if adsk.fusion.BRepBody.cast(entity) is not None:
+        # A plate can belong to several joints (e.g. one back plate slotted for three sides):
+        # one -> edit it; several -> let the dialog ask which.
         design = adsk.fusion.Design.cast(app.activeProduct)
-        run_id, data = gen.read_run_for_body(design, entity)
-        if run_id:
-            return run_id, data
+        runs = gen.runs_for_body(design, entity)
+        if len(runs) == 1:
+            return runs[0]
+        if runs:
+            return ('choose', runs)
     return None
 
 

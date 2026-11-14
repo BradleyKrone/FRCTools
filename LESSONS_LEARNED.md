@@ -23,6 +23,91 @@ session.
 
 ## Lessons
 
+### Geometry that must follow ANOTHER part: build a tool body in that part, Combine-cut across components
+Slots sketched in the slot plate stayed put when a joint moved the tab plate. **Fix:** NewBody extrude in the tab
+plate's component, then `rootComponent.features.combineFeatures` (target = slot proxy, tools =
+`body.createForAssemblyContext(occ)` for every copy, Cut, last one `isKeepToolBodies=False` consumes them). Healthy
+through thickness/length/joint changes, copies and box (mutual) runs. A multi-profile extrude makes one body PER
+disjoint region -- pass `feature.bodies`, not `.item(0)`.
+`commands/TabSlot/tab_slot_gen.py` (`_build_slot_tool`, `_cut_slots`)
+
+### Spread sketch items along an edge: expressions of a DRIVEN dimension, never spacer lines + equal
+Margin spacers to both edge ends + equal gaps flipped to the wrong side of a corner when the edge shrank 20 -> 15 in
+(a distance dim has no sign). **Fix:** `addDistanceDimension(a0, a1, ..., False)` on the edge (driven dims can be used in
+expressions and update), then every item = distance from the fixed start corner, `m + k*(dNN - 2m - w)/(N-1)`.
+Also: a line drawn with `addByTwoPoints(projectedLine.endSketchPoint, ...)` lost that link on recompute -- draw from
+`.geometry` and add explicit coincidents.
+`commands/TabSlot/tab_slot_gen.py` (`_space_along`)
+
+### Never project ANOTHER component's geometry into a generated sketch -- link plates through parameters
+Fusion resolves a cross-component projection against the other part's FINAL state, so in a multi-run design (A's
+slots from B, B later gets more features) it made CIRCULAR_DEPENDENCY errors, lost fillets and "No target body" on
+user features -- even one-way. **Fix:** drive dims by expressions (`dim.parameter.expression = 'd268'`; model params
+work from any component's sketch), project only the sketch's own body. Same-component `project2(..., True)` is fine.
+`commands/TabSlot/tab_slot_gen.py` (`_project_lines`, `tab_length_expression`, `_thickness_expression`)
+
+### Make an old generated feature parametric IN PLACE -- don't rebuild it mid-timeline
+Rebuilding runs mid-timeline (roll back, delete, recreate) changed topology later features depended on: fillets lost
+edges, cuts lost bodies. **Fix:** set expressions on the existing dims/extents (no shape change today), and re-tie
+fixed sketch anchors to a projected own-body edge with `obj.timelineObject.rollTo(False)` then `moveToEnd()`.
+`commands/TabSlot/tab_slot_gen.py` (`make_run_parametric`, `anchor_tab_axes`)
+
+### Plate thickness parameter: the NewBody extrude that made the body
+`ext.bodies` contains the (native) body and `extentOne.distance` is its thickness parameter (`d268`, expression
+`Plywood_3_4`). `profile.parentSketch` comes back as an occurrence PROXY -- `nativeObject` before `sketchToModelSpace`.
+`ext.participantBodies` raises "Didn't roll editing feature back" at the end of the timeline; use `ext.bodies`.
+`commands/TabSlot/tab_slot_gen.py` (`_plate_extrude`, `_fixed_side`)
+
+### Extent choice decides whether fillets survive a parameter change
+A join `ToEntityExtentDefinition` (to the plate's far face) made every downstream corner-round fillet lose its edges on
+recompute; a distance extent with a parameter expression did not. A one-side through-all tab relief failed both ways
+on a plain test plate. **Fix:** distance extents with `thickness_param (+ 0.01 cm)` expressions.
+`commands/TabSlot/tab_slot_gen.py` (`_extrude`, `_param_depth`)
+
+### Sketch API quirks: `project2` on a deferred sketch, and constraint order against a projected line
+`project2` raises InternalValidationError while `sketch.isComputeDeferred` is True -- lift it around the call.
+`addCoincident(pt, projectedLine)` then `addParallel(line, projectedLine)` raises VCS_SKETCH_OVER_CONSTRAINTS;
+parallel FIRST, then coincident, works. A zero `addOffsetDimension` isn't allowed -- use point-on-line instead.
+`commands/TabSlot/tab_slot_gen.py` (`_project_lines`, `_rect_on_axis`)
+
+### MCP scripts: a failed script rolls back as one unit, but undo steps are finer-grained
+An exception in an MCP `script` rolled the whole script's changes back; a long script can time out on the MCP side
+while Fusion still finishes it -- re-check state before retrying. Undoing one script can take several `undo` calls:
+check a fingerprint (run ids, feature expressions, health) after each, and `redo` once to make sure you didn't overshoot.
+
+### CamSetup: 2D Adaptive leaves material in bit-sized corners -- follow it with a 2D contour
+Adaptive won't drive into a corner close to the tool radius, so Tab & Slot dogbones (bit + 0.004") kept a sliver
+and the tab wouldn't seat. **Fix:** adaptive leaves `CUTOUT_FINISH_STOCK` radial, then `add_inside_profile(..., tabs=False)`
+on the same chains finishes the wall. Don't enlarge the dogbones instead; the adaptive still won't go into them.
+`commands/CamSetup/cam_builder.py` (`build_plate`, `build_tube`)
+
+### CamSetup: derive the bit-choice corner cutoff from the bit, never hard-code it
+A typed-in `SMALL_TOOL_RADIUS = 0.130` sent Tab & Slot's 1/4"-bit dogbones (r = 0.125 + 0.002 = 0.127) and hand
+0.125" fillets to the 1/8" bit, so a whole battery box ran on the 1/8". **Fix:** cutoff = `TOOLS['1/4']` radius −
+`CORNER_FIT_TOL` (0.0005). Note `_concave_radius` returns `inf` for a loop with *sharp* inside corners (no arcs).
+`commands/CamSetup/feature_finder.py` (`_cutout_tool`)
+
+### CAM: `contour2d` chain selections follow the same cut-on-the-LEFT rule as `adaptive2d`
+An inside profile of a through cut-out works with `createNewChainSelection` + `isReverted = ff.material_on_left(...)`,
+the same as adaptive. Checked live: flipping `isReverted` on the built op made its feed path ~6" longer (outside).
+Wood 10x8 test plate, old → new (CIC bits, inside profiles for cut-outs ≥1" wide, one tool change): 3/4" 26.6 → 8.4 min,
+1/2" 17.7 → 6.3, 1/4" 9.3 → 3.9. `cam.getMachiningTime` takes feedScale in **%** (100) and rapid in **cm/s**.
+`commands/CamSetup/cam_builder.py` (`add_inside_profile`)
+
+### A/B test CamSetup code changes: exec the HEAD file under the package name with the old `cam_data` swapped in
+`git show HEAD:...cam_builder.py` to a scratch file, `spec_from_file_location(pkg + '.cam_builder_old', path)`, set
+`sys.modules[pkg + '.cam_data']` *and* `pkg_module.cam_data` to the old cam_data while you `exec_module` (relative
+`from . import cam_data` reads the package attribute), then restore them. Run one or two plates per MCP call --
+six generations in one script timed out the MCP request and its output was lost.
+
+### Multi-pick on copies of one component: build per NATIVE body once, measure everything up front
+Six `Battery_Dividers:N` are one component -- tabs added to one copy land on all six, and re-measuring copy 2 then
+finds the tabbed edge. **Fix:** `find_joint` every pick pair *before* building; group joints by native
+(body, face) -- `BRepFace ==` works on native faces -- so tabs build once per end face (check the copies' spans match
+in native coords) and all slots on one face share one sketch + one cut. Re-find a face by point + normal
+(`evaluator.isParameterOnFace`) if an earlier unit invalidated it. Tag the batch as one run so Edit rebuilds it all.
+`commands/TabSlot/tab_slot_gen.py` (`find_joints`, `plan_units`, `build_many`, `_live_face`)
+
 ### Right-clicking a timeline GROUP gives `markingMenuDisplaying` an entity of `None` -- you can't tell which group
 `args.selectedEntities` / `ui.activeSelections` hold `None` for a right-clicked group (seen live; reading `.objectType`
 on it threw), and `TimelineObject` has no selected flag. **Fix:** treat a `None` entity as "maybe a group": show the

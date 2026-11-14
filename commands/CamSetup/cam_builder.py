@@ -102,7 +102,7 @@ def find_machine(machine_name, log=_noop_log):
 
 
 def _tool_json(key, material, machine_name):
-    t = cam_data.TOOLS[key]
+    t = cam_data.tool(key, material)
     feeds_key = cam_data.MACHINES[machine_name]['feeds']
     rows = cam_data.FEEDS[feeds_key][material][key]
     presets = []
@@ -136,7 +136,7 @@ def _tool_json(key, material, machine_name):
         'geometry': {
             'CSP': False, 'DC': t['diameter'], 'HAND': True,
             'LB': t['body_length'], 'LCF': t['flute_length'], 'NOF': t['flutes'], 'NT': 1,
-            'OAL': t['overall_length'], 'RE': 0, 'SFDM': t['diameter'], 'TA': 0, 'TP': 0,
+            'OAL': t['overall_length'], 'RE': 0, 'SFDM': t.get('shank_diameter', t['diameter']), 'TA': 0, 'TP': 0,
             'shoulder-diameter': t['diameter'], 'shoulder-length': t['shoulder_length'],
             'tip-diameter': t['diameter'], 'tip-length': 0, 'tip-offset': 0,
             'thread-profile-angle': 60,
@@ -245,8 +245,8 @@ class _Ctx:
         return self.feeds[tool][strategy]
 
 
-def _tool_label(key):
-    return f'{key} O-flute'
+def _tool_label(key, ctx):
+    return cam_data.tool(key, ctx.material)['label']
 
 
 def add_drill(setup, holes, ctx):
@@ -256,7 +256,7 @@ def add_drill(setup, holes, ctx):
     key = holes[0].tool
     row = ctx.row(key, 'slot')
     d = holes[0].diameter
-    oi = _new_op(setup, 'drill', f'Drill {len(holes)}x Ø{d:.3f} - {_tool_label(key)}', ctx.tools[key], ctx.log)
+    oi = _new_op(setup, 'drill', f'Drill {len(holes)}x Ø{d:.3f} - {_tool_label(key, ctx)}', ctx.tools[key], ctx.log)
     p = oi.parameters
     _set(p, 'holeMode', _q('selection-faces'), ctx.log)
     _set_geometry(p, 'holeFaces', [f for h in holes for f in h.faces], ctx.log)
@@ -292,7 +292,7 @@ def add_bore(setup, holes, ctx, name, pitch=None, row=None, stock_to_leave=None,
         _through_bottom(p, ctx.log)
     # Holes much bigger than the bit need extra radial passes -- unless an
     # earlier op already cleared them (clear=False: one helix at final size).
-    tool_d = cam_data.TOOLS[key]['diameter']
+    tool_d = cam_data.tool(key, ctx.material)['diameter']
     if clear and max(h.diameter for h in holes) > 2.0 * tool_d:
         _set(p, 'doMultiplePasses', 'true', ctx.log)
         _set(p, 'stepover', _inch(tool_d * 0.4), ctx.log)
@@ -347,7 +347,7 @@ def add_profile(setup, bodies, key, ctx, tabs):
     # slot DOC, tabs on every part.
     row = ctx.row(key, 'slot')
     count = f'{len(bodies)}x ' if len(bodies) > 1 else ''
-    oi = _new_op(setup, 'contour2d', f'Profile {count}- {_tool_label(key)}', ctx.tools[key], ctx.log)
+    oi = _new_op(setup, 'contour2d', f'Profile {count}- {_tool_label(key, ctx)}', ctx.tools[key], ctx.log)
     op = setup.operations.add(oi)
     p = op.parameters
     try:
@@ -362,6 +362,35 @@ def add_profile(setup, bodies, key, ctx, tabs):
         pv.applyCurveSelections(sels)
     except Exception as e:
         ctx.log(f'profile geometry selection failed: {e}')
+    _contour_common(p, row, ctx, tabs)
+    return [op]
+
+
+def add_inside_profile(setup, name, key, ctx, chains, tabs):
+    # Through cut-outs too big to be worth clearing: one contour around the
+    # inside of each loop. Tabs hold the slug so it can't fly into the bit.
+    row = ctx.row(key, 'slot')
+    oi = _new_op(setup, 'contour2d', name, ctx.tools[key], ctx.log)
+    op = setup.operations.add(oi)
+    p = op.parameters
+    try:
+        pv = adsk.cam.CadContours2dParameterValue.cast(p.itemByName('contours').value)
+        sels = pv.getCurveSelections()
+        up = _setup_z(setup)
+        for loop_edges in chains:
+            s = sels.createNewChainSelection()
+            s.inputGeometry = [loop_edges[0]]
+            # Same rule as add_adaptive: the API cuts on the LEFT of the first edge.
+            s.isReverted = ff.material_on_left(loop_edges, up)
+        pv.applyCurveSelections(sels)
+    except Exception as e:
+        ctx.log(f'{name}: geometry selection failed: {e}')
+    _contour_common(p, row, ctx, tabs)
+    return [op]
+
+
+def _contour_common(p, row, ctx, tabs):
+    # Shared by the outside part profile and the inside cut-out profile.
     _through_bottom(p, ctx.log)
     _set(p, 'doMultipleDepths', 'true', ctx.log)
     _set(p, 'maximumStepdown', _inch(row['doc']), ctx.log)
@@ -382,7 +411,6 @@ def add_profile(setup, bodies, key, ctx, tabs):
         _set(p, 'tabWidth', _inch(cam_data.TAB_WIDTH), ctx.log)
         _set(p, 'tabHeight', _inch(cam_data.TAB_HEIGHT), ctx.log)
     _apply_feeds(p, row, ctx.log)
-    return [op]
 
 
 def _group(items, key_fn):
@@ -406,8 +434,9 @@ def _wall_bottom(ops, wall, ctx):
     return ops
 
 
-def _hole_ops(setup, holes, ctx, tube_wall=False, wall=0.0):
+def _hole_ops(setup, holes, ctx, tube_wall=False, wall=0.0, tabs=True):
     # wall: tube wall thickness (in); only used when tube_wall is True.
+    # tabs: hold the slugs of large holes that get an inside profile.
     ops = []
     by_kind = _group(holes, lambda h: h.kind)
     for kind in ('drill', 'small', 'bolt'):
@@ -416,7 +445,7 @@ def _hole_ops(setup, holes, ctx, tube_wall=False, wall=0.0):
                 ops += add_drill(setup, group, ctx)
                 continue
             key = group[0].tool
-            name = f'Bore {len(group)}x Ø{d:.3f} - {_tool_label(key)}'
+            name = f'Bore {len(group)}x Ø{d:.3f} - {_tool_label(key, ctx)}'
             if tube_wall:
                 if ctx.material == 'Aluminum' and key == '1/8':
                     r = cam_data.TUBE_BORE_ALUMINUM
@@ -432,19 +461,48 @@ def _hole_ops(setup, holes, ctx, tube_wall=False, wall=0.0):
     def nominal(h):
         return min(cam_data.BEARING_ODS, key=lambda od: abs(od - h.diameter))
     for od, group in sorted(_group(by_kind.get('bearing', []), nominal).items()):
-        rough = add_adaptive(setup, f'Bearing {len(group)}x Ø{od:.3f} rough - {_tool_label("1/4")}', '1/4', ctx,
+        rough = add_adaptive(setup, f'Bearing {len(group)}x Ø{od:.3f} rough - {_tool_label("1/4", ctx)}', '1/4', ctx,
                              chains=[h.edges for h in group], through=not tube_wall,
                              stock_to_leave=cam_data.BEARING_ROUGH_STOCK)
         ops += _wall_bottom(rough, wall, ctx) if tube_wall else rough
-        ops += add_bore(setup, group, ctx, f'Bearing {len(group)}x Ø{od:.3f} clean-up - {_tool_label("1/4")}',
+        ops += add_bore(setup, group, ctx, f'Bearing {len(group)}x Ø{od:.3f} clean-up - {_tool_label("1/4", ctx)}',
                         pitch=cam_data.BEARING_CLEANUP_PITCH, stock_to_leave=cam_data.BEARING_FIT_OFFSET,
                         hole_bottom=tube_wall, clear=False)
     large = by_kind.get('large', [])
     if large:
-        clear = add_adaptive(setup, f'Large holes {len(large)}x - {_tool_label("1/4")}', '1/4', ctx,
-                             chains=[h.edges for h in large], through=not tube_wall)
-        ops += _wall_bottom(clear, wall, ctx) if tube_wall else clear
+        label = _tool_label("1/4", ctx)
+        # On a plate, big round holes in a profiling material just get their
+        # slug cut free (a round hole's width is D / 2, see _profile_cutout).
+        def profiled(h):
+            return not tube_wall and _profile_cutout(h.diameter / 2.0, ctx)
+        big = [h for h in large if profiled(h)]
+        rest = [h for h in large if not profiled(h)]
+        if big:
+            ops += add_inside_profile(setup, f'Large holes {len(big)}x profile - {label}', '1/4', ctx,
+                                      [h.edges for h in big], tabs)
+        if rest:
+            clear = add_adaptive(setup, f'Large holes {len(rest)}x - {label}', '1/4', ctx,
+                                 chains=[h.edges for h in rest], through=not tube_wall)
+            ops += _wall_bottom(clear, wall, ctx) if tube_wall else clear
     return ops
+
+
+def _profile_cutout(width, ctx):
+    # True -> profile the inside and leave the slug on tabs; False -> clear it.
+    limit = cam_data.CUTOUT_PROFILE_MIN_WIDTH.get(ctx.material)
+    return limit is not None and width >= limit
+
+
+def _plate_tool_order(sheet):
+    # Each bit runs all of its work in one go (every switch on the Shapeoko is a
+    # manual change and a re-zero). The bit that cuts the most parts free goes
+    # last, so the parts stay held until the end; ties -> the 1/4" last.
+    used = {h.tool for f in sheet for h in f.holes if h.tool}
+    used |= {c.tool for f in sheet for c in f.cutouts}
+    used |= {pk.tool for f in sheet for pk in f.pockets}
+    profiles = _group(sheet, lambda f: f.profile_tool)
+    used |= set(profiles)
+    return sorted(used, key=lambda k: (len(profiles.get(k, [])), k == '1/4'))
 
 
 def build_plate(cam, sheet, ctx, machine, tabs, setup_name):
@@ -457,17 +515,31 @@ def build_plate(cam, sheet, ctx, machine, tabs, setup_name):
     setup = _new_setup(cam, [f.body for f in sheet], setup_name, first.top_face, x_edge,
                        cam_data.PLATE_WCS_POINT, cam_data.STOCK_SIDE_OFFSET, machine, ctx.log)
     _fix_orientation(setup, first.top_face, ctx.log)
-    ops = _hole_ops(setup, [h for f in sheet for h in f.holes], ctx)
-    cutouts = [c for f in sheet for c in f.cutouts]
-    for key, group in sorted(_group(cutouts, lambda c: c.tool).items(), reverse=True):
-        ops += add_adaptive(setup, f'Cut-outs {len(group)}x - {_tool_label(key)}', key, ctx,
-                            chains=[c.edges for c in group])
-    pockets = [pk for f in sheet for pk in f.pockets]
-    for key, group in sorted(_group(pockets, lambda pk: pk.tool).items(), reverse=True):
-        ops += add_adaptive(setup, f'Pockets {len(group)}x - {_tool_label(key)}', key, ctx,
-                            floors=[pk.floor for pk in group], through=False)
-    for key, group in sorted(_group(sheet, lambda f: f.profile_tool).items(), reverse=True):
-        ops += add_profile(setup, [f.body for f in group], key, ctx, tabs)
+    ops = []
+    for key in _plate_tool_order(sheet):
+        label = _tool_label(key, ctx)
+        ops += _hole_ops(setup, [h for f in sheet for h in f.holes if h.tool == key], ctx, tabs=tabs)
+        cutouts = [c for f in sheet for c in f.cutouts if c.tool == key]
+        big = [c for c in cutouts if _profile_cutout(c.width, ctx)]
+        rest = [c for c in cutouts if not _profile_cutout(c.width, ctx)]
+        if rest:
+            chains = [c.edges for c in rest]
+            ops += add_adaptive(setup, f'Cut-outs {len(rest)}x - {label}', key, ctx,
+                                chains=chains, stock_to_leave=cam_data.CUTOUT_FINISH_STOCK)
+            # Adaptive skips bit-sized corners (dogbones); the contour cuts them.
+            # No tabs: the slug is already gone.
+            ops += add_inside_profile(setup, f'Cut-outs {len(rest)}x finish - {label}', key, ctx,
+                                      chains, tabs=False)
+        if big:
+            ops += add_inside_profile(setup, f'Cut-outs {len(big)}x profile - {label}', key, ctx,
+                                      [c.edges for c in big], tabs)
+        pockets = [pk for f in sheet for pk in f.pockets if pk.tool == key]
+        if pockets:
+            ops += add_adaptive(setup, f'Pockets {len(pockets)}x - {label}', key, ctx,
+                                floors=[pk.floor for pk in pockets], through=False)
+        parts = [f for f in sheet if f.profile_tool == key]
+        if parts:
+            ops += add_profile(setup, [f.body for f in parts], key, ctx, tabs)
     return [setup]
 
 
@@ -490,8 +562,12 @@ def build_tube(cam, feats, ctx, machine, setup_name):
         _fix_orientation(setup, side.face, ctx.log)
         _hole_ops(setup, side.holes, ctx, tube_wall=True, wall=side.wall)
         for key, group in sorted(_group(side.cutouts, lambda c: c.tool).items(), reverse=True):
-            ops = add_adaptive(setup, f'Cut-outs {len(group)}x - {_tool_label(key)}', key, ctx,
-                               chains=[c.edges for c in group], through=False)
+            label = _tool_label(key, ctx)
+            chains = [c.edges for c in group]
+            ops = add_adaptive(setup, f'Cut-outs {len(group)}x - {label}', key, ctx,
+                               chains=chains, through=False, stock_to_leave=cam_data.CUTOUT_FINISH_STOCK)
+            ops += add_inside_profile(setup, f'Cut-outs {len(group)}x finish - {label}', key, ctx,
+                                      chains, tabs=False)
             _wall_bottom(ops, side.wall, ctx)
         setups.append(setup)
     return setups

@@ -48,13 +48,25 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
 - **`commands/CamSetup/`** — the only Manufacture-workspace command (button in the FRC panel of the
   MILLING tab, `config.get_frc_cam_panel()`). `feature_finder.py` classifies a plate's / box tube's
   holes, cut-outs, pockets and profile; `cam_builder.py` makes the setups, tools and operations and
-  generates them; `cam_data.py` holds the machines, bits and feeds & speeds (from the Shapeoko notes).
-- **`commands/TabSlot/`** — Tab & Slot: the user picks a tab plate whose edge butts a slot plate's
-  face; it adds evenly spaced tabs, cuts dogboned slots and tab-root dogbones sized to the router bit
+  generates them; `cam_data.py` holds the machines, bits and feeds & speeds (from the Shapeoko notes;
+  `MATERIAL_TOOLS` swaps in per-material bits, e.g. Wood runs CIC's Golden Boy XL / UC2175 — always look a bit up
+  with `cam_data.tool(key, material)`). Ops are grouped per bit (one tool change per plate), and in Wood a cut-out
+  wider than `CUTOUT_PROFILE_MIN_WIDTH` gets an inside profile with tabs instead of adaptive clearing.
+- **`commands/TabSlot/`** — Tab & Slot: the user picks one or more tab plates whose edges butt one or
+  more slot plates' faces (every touching pair becomes a joint; copies of one component share their
+  tabs, see `plan_units`); it adds evenly spaced tabs, cuts dogboned slots and tab-root dogbones sized to the router bit
   (bit list from `cam_data.TOOLS`). `tab_slot_gen.py` holds the geometry (`find_joint`, `layout_tabs`,
   `build`) with no dialog code, so MCP scripts can drive it directly. Every run is tagged
   (`FRCTools_TabSlot` attributes on its sketches/features) so the right-click **Edit Tab & Slot**
   item can reopen the dialog with its settings and `rebuild_run` it in place in the timeline.
+  Fully parametric: the slots are cut by a **slot tool body built in the tab plate's own
+  component** (sketched on its end face from its own projected edges, consumed by a root-level
+  Combine cut), so they follow the tab plate through any thickness/length/joint change. Tab length
+  = the slot plate's thickness parameter (+ protrusion, may be negative); tabs and slots are spaced
+  by expressions of a driven dimension on the plate edge, so they re-space when it changes length.
+  Never project another plate's geometry (circular dependencies). `make_run_parametric` +
+  `anchor_tab_axes` (and the `Tab_Length` parameter) are legacy upgrades for runs made before the
+  tool-body method (MCP-script only); an Edit rebuilds an old run the new way.
 - **`lib/fusionAddInUtils/`** — shared helpers, imported everywhere as
   `from ...lib import fusionAddInUtils as futil`:
   - `general_utils.py` — `log()`, `handle_error()`, `popup_error()`, a family of `print_*` /

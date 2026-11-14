@@ -302,7 +302,8 @@ def classify_hole(d):
     return 'bolt', '1/4'
 
 def _cutout_tool(min_radius, width):
-    if min_radius < cam_data.SMALL_TOOL_RADIUS or width < cam_data.SMALL_TOOL_WIDTH:
+    big_r = cam_data.TOOLS['1/4']['diameter'] / 2.0 - cam_data.CORNER_FIT_TOL
+    if min_radius < big_r or width < cam_data.SMALL_TOOL_WIDTH:
         return '1/8'
     return '1/4'
 
