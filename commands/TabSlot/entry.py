@@ -184,13 +184,21 @@ def _switch_run(inputs, index: int):
     bit_dia = inputs.itemById('bit_dia')
     bit_dia.value = BITS.get(vals['bit'], vals['bit_dia']) * IN_TO_CM
     bit_dia.isEnabled = vals['bit'] == CUSTOM_BIT
-    tabs, slots = _state['edit_bodies']
+    _select_plates(inputs, *_state['edit_bodies'])
+
+
+def _select_plates(inputs, tabs, slots):
+    """Put the run's plates back in the two pickers. addSelection goes to whichever selection
+    input has FOCUS, not the one it is called on (seen live: all 8 plates landed in Tab Plates,
+    Slot Plates stayed empty and Rebuild greyed out), so focus each picker before filling it."""
     for input_id, bodies in (('tab_body', tabs), ('slot_body', slots)):
         sel = inputs.itemById(input_id)
+        sel.hasFocus = True
         sel.clearSelection()
         for body in bodies:
             if body is not None:
                 sel.addSelection(body)
+    inputs.itemById('tab_body').hasFocus = True
 
 
 def _resolve_plates(design, data):
@@ -280,6 +288,28 @@ def _picks(inputs):
         sel = inputs.itemById(input_id)
         return [sel.selection(i).entity for i in range(sel.selectionCount)]
     return picked('tab_body'), picked('slot_body')
+
+
+def _current_picks(inputs):
+    """_picks, except that while editing, the run's own plates picked in EITHER picker count as
+    its saved tab/slot split. Fusion can drop a re-selected plate into the wrong picker (seen live:
+    the edit check failed and Rebuild greyed out), and an edit only ever rebuilds on those plates."""
+    tabs, slots = _picks(inputs)
+    edit = _state.get('edit')
+    if edit is not None and edit.get('run_id') is not None:
+        e_tabs, e_slots = (list(filter(None, bodies)) for bodies in _state['edit_bodies'])
+        # Seen live: the slot plates also landed in Tab Plates (8 + 2 picks for 8 plates).
+        if e_tabs and e_slots and _same_bodies(_unique(tabs + slots), _unique(e_tabs + e_slots)):
+            return e_tabs, e_slots
+    return tabs, slots
+
+
+def _unique(bodies) -> list:
+    out = []
+    for b in bodies:
+        if not any(b == o for o in out):
+            out.append(b)
+    return out
 
 
 def _same_bodies(a, b) -> bool:
@@ -386,7 +416,7 @@ def _refresh(inputs, fresh: bool = False):
     """Check the joints and layout, and show the result in the Detected box. Sets
     `_state['problems']` (all of them, shown) and `_state['blocking']` (what disables OK)."""
     problems, lines, hard = [], [], True
-    tabs, slots = _picks(inputs)
+    tabs, slots = _current_picks(inputs)
     edit = _state.get('edit')
     if edit is not None and edit.get('run_id') is None:
         problems.append('First choose the joint to edit in the Joint list at the top -- '
@@ -441,7 +471,7 @@ def command_execute(args: adsk.core.CommandEventArgs):
     design = adsk.fusion.Design.cast(app.activeProduct)
     edit = _state.get('edit')
     try:
-        tabs, slots = _picks(inputs)
+        tabs, slots = _current_picks(inputs)
         params = _params(inputs)
         bit_label = inputs.itemById('bit').selectedItem.name
         if edit is not None:
@@ -492,10 +522,7 @@ def command_activate(args: adsk.core.CommandEventArgs):
     inputs = args.command.commandInputs
     tabs, slots = _state.get('edit_bodies', ([], []))
     try:
-        for input_id, bodies in (('tab_body', tabs), ('slot_body', slots)):
-            for body in bodies:
-                if body is not None:
-                    inputs.itemById(input_id).addSelection(body)
+        _select_plates(inputs, tabs, slots)
     except Exception:
         futil.log(f'{EDIT_CMD_NAME}: could not re-select the original plates')
     edit = _state.get('edit') or {}

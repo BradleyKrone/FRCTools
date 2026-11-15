@@ -28,7 +28,9 @@ IN_TO_CM = 2.54
 DOGBONE_EXTRA = 0.002 * IN_TO_CM
 
 # Small extra depth on cuts so they clear the far face (cuts only touch participantBodies).
-CUT_EXTRA = 0.01
+CUT_EXTRA = 0.004 * IN_TO_CM
+# Runs made before the switch to inch expressions used 0.01 cm (make_run_parametric matches it).
+LEGACY_CUT_EXTRA = 0.01
 
 _TOL = 1e-4
 
@@ -240,17 +242,7 @@ def _joint_from_pair(fa, fb, pa, na, body_a, body_b, xf_a, xf_b):
     if broad_a is None:
         return None
 
-    # Slot plate thickness: nearest face of B facing +n, beyond the contact plane.
-    t_b = None
-    for f in body_b.faces:
-        if not _planar(f):
-            continue
-        p, nn = _world_face(f, xf_b)
-        if _dot(nn, n) < 0.9999:
-            continue
-        dist = _dot(_sub(p, origin), n)
-        if dist > 10 * _TOL and (t_b is None or dist < t_b):
-            t_b = dist
+    t_b = _slot_plate_thickness(body_b, xf_b, origin, d, w, n, s1 - s0, t_a)
     if t_b is None:
         return None
 
@@ -261,6 +253,41 @@ def _joint_from_pair(fa, fb, pa, na, body_a, body_b, xf_a, xf_b):
                  fa=fa, fb=fb, broad_a=broad_a, broad_w=round(broad_w / t_a) * t_a,
                  origin=origin, d=d, w=w, n=n, length=s1 - s0, t_a=t_a, t_b=t_b,
                  extra={'b_w_range': (wb0 - wa0, wb1 - wa0)})
+
+
+def _slot_plate_thickness(body_b, xf_b, origin, d, w, n, length, t_a):
+    """Slot plate thickness under the joint: for points along the joint's centre line, the nearest
+    face of B facing +n that lies over the point; the deepest of those. Only faces over the joint
+    count -- a pocket elsewhere on the plate (a 0.2" recess for a power inlet, say) has a +n floor
+    nearer than the far face, and picking it made the slots blind (checked live). Falls back to the
+    nearest +n face anywhere if no sample lands on one."""
+    xf_b_inv = xf_b.copy()
+    xf_b_inv.invert()
+    cands = []                                      # (distance, face) of every +n face past contact
+    for f in body_b.faces:
+        if not _planar(f):
+            continue
+        p, nn = _world_face(f, xf_b)
+        if _dot(nn, n) < 0.9999:
+            continue
+        dist = _dot(_sub(p, origin), n)
+        if dist > 10 * _TOL:
+            cands.append((dist, f))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c[0])
+
+    best = None
+    samples = 11
+    for k in range(samples):
+        s = length * (0.05 + 0.9 * k / (samples - 1))
+        for dist, f in cands:
+            pt = _xpt(_add(origin, (s, d), (t_a / 2.0, w), (dist, n)), xf_b_inv)
+            ok, prm = f.evaluator.getParameterAtPoint(pt)
+            if ok and f.evaluator.isParameterOnFace(prm):
+                best = dist if best is None else max(best, dist)
+                break
+    return best if best is not None else cands[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -428,11 +455,18 @@ def _root_axis(sk: _Sk, fa, broad):
     return None
 
 
+def _in(cm: float) -> str:
+    """A length in cm written as inches for an expression -- '0.01 in', not '0.025400 cm' (FRC
+    designs are imperial, and these expressions show in the dimension/parameter dialogs)."""
+    text = f'{cm / IN_TO_CM:.6f}'.rstrip('0').rstrip('.')
+    return f'{text or "0"} in'
+
+
 def _plus(expr, extra_cm):
-    """`expr` + a length in cm, as a Fusion expression."""
+    """`expr` + a length in cm, as a Fusion expression (written in inches)."""
     if abs(extra_cm) < 1e-9:
         return expr
-    return f'{expr} + {extra_cm:.6f} cm' if extra_cm > 0 else f'{expr} - {-extra_cm:.6f} cm'
+    return f'{expr} + {_in(extra_cm)}' if extra_cm > 0 else f'{expr} - {_in(-extra_cm)}'
 
 
 def _rect_on_axis(sk: _Sk, axis, s_a, s_b, w_base, h_dir_w, h_dir_n, height, height_expr=None,
@@ -537,11 +571,11 @@ def _space_along(sk: _Sk, axis, bottoms, edge_driven: bool, margin: float, rect_
         if length is None:
             continue
         if n == 1:
-            expr = f'({length} - {rect_len:.6f} cm) / 2'
+            expr = f'({length} - {_in(rect_len)}) / 2'
         elif k == 0:
-            expr = f'{margin:.6f} cm'
+            expr = _in(margin)
         else:
-            expr = f'{margin:.6f} cm + {k} * ({length} - {2 * margin + rect_len:.6f} cm) / {n - 1}'
+            expr = f'{_in(margin)} + {k} * ({length} - {_in(2 * margin + rect_len)}) / {n - 1}'
         try:
             dim.parameter.expression = expr
         except Exception as ex:
@@ -1610,7 +1644,7 @@ def make_run_parametric(design, run_id, data: dict) -> dict:
             if dist is None or ext.bodies.count != 1:
                 continue
             body, val = _native(ext.bodies.item(0)), dist.distance.value
-            extra = 0.0 if '(Join)' in ext.name else CUT_EXTRA
+            extra = 0.0 if '(Join)' in ext.name else LEGACY_CUT_EXTRA
             thk = _thickness_expression(body, abs(val) - extra)
             if thk is None:
                 out['skipped'].append(f'{ext.name}: depth (no thickness parameter)')

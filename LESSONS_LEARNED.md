@@ -23,6 +23,32 @@ session.
 
 ## Lessons
 
+### CAM face-contour selections default to AllLoops + StartOutside -- set loop and side types explicitly
+A 2D adaptive pocket picked by its floor face cleared the whole plate around the pocket: the outer loop was cut
+on its outside. **Fix:** `loopType = OnlyOutsideLoops`, `sideType = AlwaysInsideSideType` on each
+`FaceContourSelection` (check the result with a top screenshot of the generated toolpath).
+`commands/CamSetup/cam_builder.py` (`add_adaptive`)
+
+### Measure a plate's thickness under the feature, not "nearest opposite face anywhere"
+Tab & Slot took the slot plate's nearest +n face on the whole body; a 0.2" inlet pocket elsewhere on the Back made
+it 0.5" of 0.7", so every slot came out blind (and the depth lost its parameter). **Fix:** sample points along the
+joint and keep only faces that contain them (`face.evaluator.getParameterAtPoint` + `isParameterOnFace`).
+`commands/TabSlot/tab_slot_gen.py` (`_slot_plate_thickness`)
+
+### Don't trust which of TWO selection inputs a re-`addSelection` lands in
+Edit Tab & Slot re-picked 6 tab + 2 slot plates in `activate`: Tab Plates showed 8 (the slot plates landed in BOTH
+inputs, even with `hasFocus` set first), so the edit check failed and Rebuild greyed out. **Fix:** when editing,
+check only that the de-duplicated union of picks equals the saved plates, and use the saved split.
+`commands/TabSlot/entry.py` (`_current_picks`)
+
+### Read-only MCP scripts roll back Python changes too
+Monkeypatching an add-in module function from a `readOnly: true` script didn't stick. Read-only scripts can't
+leave hooks behind for later inspection.
+
+### Never hot-reload an add-in module (`stop()` / `importlib.reload` / `start()`) from an MCP script
+It crashed Fusion outright (socket reset, process gone). **Fix:** have the user Stop -> Run the add-in in
+Scripts and Add-Ins (Shift+S), then drive the command.
+
 ### Geometry that must follow ANOTHER part: build a tool body in that part, Combine-cut across components
 Slots sketched in the slot plate stayed put when a joint moved the tab plate. **Fix:** NewBody extrude in the tab
 plate's component, then `rootComponent.features.combineFeatures` (target = slot proxy, tools =

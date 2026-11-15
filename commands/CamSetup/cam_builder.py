@@ -325,6 +325,11 @@ def add_adaptive(setup, name, key, ctx, chains=None, floors=None, through=True,
         for face in (floors or []):
             s = sels.createNewFaceContourSelection()
             s.inputGeometry = [face]
+            # Default is AllLoops + StartOutside: the floor's outer loop gets
+            # cleared on its OUTSIDE (the whole plate around the pocket). Outer
+            # wall only, tool inside; an inner loop (a hole in the floor) isn't a wall.
+            s.loopType = adsk.cam.LoopTypes.OnlyOutsideLoops
+            s.sideType = adsk.cam.SideTypes.AlwaysInsideSideType
         pv.applyCurveSelections(sels)
     except Exception as e:
         ctx.log(f'{name}: geometry selection failed: {e}')

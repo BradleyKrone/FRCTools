@@ -363,9 +363,15 @@ def analyze_plate(body, prefer_dir=(0.0, 0.0, 1.0)):
     feats = PlateFeatures(body=body, top_face=top, bottom_face=bottom, x_edge=x_edge,
                           thickness=thickness, profile_tool=_cutout_tool(profile_r, math.inf))
 
+    # Blind pocket floors: planar faces facing up, below the top face.
+    h_top = _plane_height(top, up)
+    floors = [f for f in planes if f != top and _dot(_face_normal(f), up) >= PAR_TOL
+              and (h_top - _plane_height(f, up)) > LEN_TOL]
+
     # Through features: an inner loop on the bottom face with a matching loop
-    # on the top face. Machine from the bottom loop (it sits at the exit depth).
-    top_keys = [(_loop_key(l, frame), l) for l in top.loops if not l.isOuter]
+    # on the top face -- or on a pocket floor (a hole through the bottom of a
+    # pocket). Machine from the bottom loop (it sits at the exit depth).
+    top_keys = [(_loop_key(l, frame), l) for f in [top] + floors for l in f.loops if not l.isOuter]
     matched_top = set()
     for loop in bottom.loops:
         if loop.isOuter:
@@ -387,14 +393,8 @@ def analyze_plate(body, prefer_dir=(0.0, 0.0, 1.0)):
         else:
             feats.cutouts.append(_make_cutout(loop, frame))
 
-    # Blind pockets: planar floors facing up, below the top face.
-    h_top = _plane_height(top, up)
-    for f in planes:
-        if f == top or _dot(_face_normal(f), up) < PAR_TOL:
-            continue
+    for f in floors:
         depth = (h_top - _plane_height(f, up)) / IN
-        if depth <= LEN_TOL / IN:
-            continue
         outer = next(l for l in f.loops if l.isOuter)
         r = _concave_radius(list(outer.edges), frame, True)
         area, per = _poly_area_perimeter(_loop_polygon(list(outer.edges), frame))
