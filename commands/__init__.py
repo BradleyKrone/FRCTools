@@ -13,6 +13,7 @@ from .AutoHole import entry as AutoHole
 from .JointInspector import entry as JointInspector
 from .CamSetup import entry as CamSetup
 from .TabSlot import entry as TabSlot
+from .FRCShaper import entry as FRCShaper
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
@@ -25,7 +26,8 @@ commands = [
     AutoHole,
     JointInspector,
     CamSetup,
-    TabSlot
+    TabSlot,
+    FRCShaper
 ]
 
 

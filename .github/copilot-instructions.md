@@ -67,6 +67,16 @@ Fusion loads this add-in from its `AddIns/FRCTools` directory and automatically 
   Never project another plate's geometry (circular dependencies). `make_run_parametric` +
   `anchor_tab_axes` (and the `Tab_Length` parameter) are legacy upgrades for runs made before the
   tool-body method (MCP-script only); an Edit rebuilds an old run the new way.
+- **`commands/FRCShaper/`** — FRC Shaper (after the Onshape FRCShaper extension): pick hole rims,
+  press Enter. A plain hole gets a **bolt stack** — `scan_stack` walks every visible body's coaxial
+  rims along the hole axis (material vs air by a `pointContainment` probe), so the bolt length is
+  the shortest stock length covering grip + washers + nylock + 1 pitch, and air gaps get generated
+  round spacers. A motor mount's pilot/bolt hole gets the **motor** (`find_motor_pattern` matches
+  pilot + bolt circle + hole spacing against `shaper_data.MOTORS`; `_motor_mount` finds the model's
+  mounting face by geometry, so any vendor file works), placed by `transform2`, held by a
+  snapshot + rigid as-built joint, and optionally bolted in from the far side. Library parts by
+  URN (`shaper_data`); bolt lengths with no library file are generated (head + shank, fully
+  constrained, reused by their `gen_key` attribute). `shaper_gen.py` has no dialog code.
 - **`lib/fusionAddInUtils/`** — shared helpers, imported everywhere as
   `from ...lib import fusionAddInUtils as futil`:
   - `general_utils.py` — `log()`, `handle_error()`, `popup_error()`, a family of `print_*` /

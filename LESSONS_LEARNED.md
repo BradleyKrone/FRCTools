@@ -23,6 +23,32 @@ session.
 
 ## Lessons
 
+### Don't reload FRCTools from an MCP script (`Script.stop(); Script.run()`) -- it can crash Fusion
+Worked a few times, then crashed Fusion twice (connection reset mid-script). **Fix:** reload by hand (Shift+S >
+Stop/Run) or restart Fusion; drive `sys.modules[...FRCShaper.shaper_gen]` from scripts only after that.
+`.github/copilot-instructions.md` (Dev / test workflow)
+
+### Rigid joint on a part's *hole* (not its origin): a lost spin moves the origin too
+Jointing a Kraken by one bolt-hole edge to a plate hole kept Z but spun it about that hole; the check "origin
+unmoved AND x unmoved" rejected every try before measuring the spin. **Fix:** check Z first, measure the spin
+about Z (`atan2`), retry with `JointInput.angle = ±spin`, then check origin + X. `commands/FRCShaper/shaper_gen.py` (`_joint_keep`)
+
+### Vendor motor models: joint with a snapshot + rigid as-built joint, not their hole edges
+The Falcon 500's mount holes live in a sub-component of the linked file; a rigid joint on one jumped the whole motor
+~9 in, unchanged by flip or angle. **Fix:** place by `transform2`, `design.snapshots.add()`, then
+`asBuiltJoints.createInput(motor, plateOcc, None)` rigid. Find the mounting face by geometry (planar face with 3+
+equal small holes on the bolt circle; circumcentre of 3 holes -- the mean is off when a hole is missing; the face
+"in front" along its own normal). Argos motors: Kraken X60 face z=1.23", X44 z=0.18", Falcon centre (0.049, 0.246).
+`commands/FRCShaper/shaper_gen.py` (`_motor_mount`, `_as_built_rigid`)
+
+### Through-hole grip / plate stack: coaxial rims per body + a containment probe between them
+**Fix:** per visible body (bbox-vs-axis prefilter), collect native circles on the hole axis (radius 0.3-3x the hole),
+probe `pointContainment` just outside the widest rim at each mid-span: inside = material layer. Merge touching
+layers; a gap <= max becomes a spacer. Skip Hardware-tagged occurrences (old bolts sit in the holes).
+`app.data.findFileById` *raises* "file not found" (not None) when the part's hub isn't the active one -- wrap it.
+Library bolt/washer/nut files: origin on the seat, +Z out; washers 0.060", 10-32 nylock 0.234", 1/4-20 0.313".
+`commands/FRCShaper/shaper_gen.py` (`scan_stack`)
+
 ### CAM face-contour selections default to AllLoops + StartOutside -- set loop and side types explicitly
 A 2D adaptive pocket picked by its floor face cleared the whole plate around the pocket: the outer loop was cut
 on its outside. **Fix:** `loopType = OnlyOutsideLoops`, `sideType = AlwaysInsideSideType` on each

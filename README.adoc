@@ -36,6 +36,24 @@ image::BoltPatternCreate.png[]
 
 == Solid Tab Tools
 
+== FRC Shaper Tool
+TIP: kbd:[Solid Tab] menu:FRC[FRC Shaper]
+
+Click hole rims and press Enter -- the right hardware goes in, jointed. Inspired by the
+https://frcshaper.org[FRCShaper] extension for Onshape.
+
+* *Bolt stacks* -- click a hole's rim on the face the bolt head sits on (as many holes as you like).
+  The tool follows the hole through every plate on its axis, measures the grip, and adds a washer,
+  the shortest stock bolt that's long enough, a spacer cut to length for any air gap (box tube,
+  standoff), and a washer + nylock on the far side. Thread (10-32 / 1/4-20) comes from the hole size.
+* *Motors* -- click a motor mount's pilot hole (or one of its bolt holes) on the face the motor sits
+  against. The mount is recognised from its pilot, bolt circle and hole spacing (Kraken X60, Kraken
+  X44, Falcon 500), the motor is inserted from the Argos CAD Motors folder with its holes lined up on
+  the plate's, jointed, and bolted in from the far side.
+
+Parts come from *Argos CAD > 1 Parts > Standard Parts* (Parts_Gen and Electronics > Motors). A bolt
+length with no library file is generated as a simple head + shank.
+
 == Lighten Tool image:icons/Lighten.png['Lighten', 30]
 TIP: kbd:[Solid Tab] menu:Create[FRCTools > Lighten]
 
