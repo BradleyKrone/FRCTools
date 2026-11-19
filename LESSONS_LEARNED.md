@@ -23,6 +23,12 @@ session.
 
 ## Lessons
 
+### CAM adaptive ramp angle comes from the tool, not the op
+`adaptive2d`'s `rampAngle` defaults to the expression `tool_rampAngle` (the tool preset's `ramp-angle`, 2 deg), and
+ramp feed is `tool_feedRamp`. **Fix:** set `rampAngle` (e.g. `'5 deg'`) and `tool_feedRamp` on the op explicitly.
+Other speed knobs on the op: `retractionPolicy` (default `'full'`), `stayDownDistance`, `useFeedOptimization`.
+`commands/CamSetup/cam_builder.py` (`add_adaptive`)
+
 ### CAM face-contour selections default to AllLoops + StartOutside -- set loop and side types explicitly
 A 2D adaptive pocket picked by its floor face cleared the whole plate around the pocket: the outer loop was cut
 on its outside. **Fix:** `loopType = OnlyOutsideLoops`, `sideType = AlwaysInsideSideType` on each

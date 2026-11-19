@@ -114,10 +114,10 @@ def _tool_json(key, material, machine_name):
             'n': row['rpm'], 'n_ramp': row['rpm'],
             'v_f': row['feed'], 'v_f_leadIn': row['feed'], 'v_f_leadOut': row['feed'],
             'v_f_transition': row['feed'],
-            'v_f_plunge': row['plunge'], 'v_f_ramp': row['plunge'],
+            'v_f_plunge': row['plunge'], 'v_f_ramp': row.get('ramp', row['plunge']),
             'f_z': row['feed'] / (row['rpm'] * t['flutes']),
             'f_n': row['feed'] / row['rpm'],
-            'ramp-angle': 2,
+            'ramp-angle': row.get('ramp_angle', 2),
             'stepdown': row['doc'], 'use-stepdown': True,
             'stepover': row.get('woc', t['diameter']), 'use-stepover': True,
             'tool-coolant': cam_data.COOLANT,
@@ -225,7 +225,7 @@ def _apply_feeds(params, row, log):
     _set(params, 'tool_feedExit', _ipm(row['feed']), log)
     _set(params, 'tool_feedTransition', _ipm(row['feed']), log)
     _set(params, 'tool_feedPlunge', _ipm(row['plunge']), log)
-    _set(params, 'tool_feedRamp', _ipm(row['plunge']), log)
+    _set(params, 'tool_feedRamp', _ipm(row.get('ramp', row['plunge'])), log)
     _set(params, 'tool_coolant', _q(cam_data.COOLANT), log)
 
 
@@ -283,7 +283,7 @@ def add_bore(setup, holes, ctx, name, pitch=None, row=None, stock_to_leave=None,
     _set_geometry(p, 'circularFaces', [f for h in holes for f in h.faces], ctx.log)
     # 'Use Ramp Angle' defaults on (2 deg) and silently overrides the pitch.
     _set(p, 'useAngle', 'false', ctx.log)
-    _set(p, 'threadPitch', _inch(pitch if pitch is not None else row['doc']), ctx.log)
+    _set(p, 'threadPitch', _inch(pitch if pitch is not None else row.get('pitch', row['doc'])), ctx.log)
     _set(p, 'direction', _q('climb'), ctx.log)
     if hole_bottom:
         _set(p, 'bottomHeight_mode', _q('from hole bottom'), ctx.log)
@@ -344,6 +344,9 @@ def add_adaptive(setup, name, key, ctx, chains=None, floors=None, through=True,
         _set(p, 'stockToLeave', _inch(stock_to_leave), ctx.log)
         _set(p, 'verticalStockToLeave', _inch(0), ctx.log)
     _apply_feeds(p, row, ctx.log)
+    if 'ramp_angle' in row:
+        # rampAngle defaults to the op's tool_rampAngle; set it outright.
+        _set(p, 'rampAngle', f"{row['ramp_angle']} deg", ctx.log)
     return [op]
 
 
@@ -401,7 +404,7 @@ def _contour_common(p, row, ctx, tabs):
     _set(p, 'maximumStepdown', _inch(row['doc']), ctx.log)
     _set(p, 'useEvenStepdowns', 'true', ctx.log)
     _set(p, 'doRamp', 'true', ctx.log)
-    _set(p, 'rampAngle', '2 deg', ctx.log)
+    _set(p, 'rampAngle', f"{row.get('ramp_angle', 2)} deg", ctx.log)
     # API-made contours default this to maximumStepdown, so every layer spirals
     # down from the ramp clearance height one stepdown per lap at ramp feed.
     _set(p, 'maximumRampZStepdown', 'tool_fluteLength', ctx.log)
@@ -414,7 +417,7 @@ def _contour_common(p, row, ctx, tabs):
         _set(p, 'tabPositioning', _q('tabCount'), ctx.log)
         _set(p, 'tabsPerContour', str(cam_data.TAB_COUNT), ctx.log)
         _set(p, 'tabWidth', _inch(cam_data.TAB_WIDTH), ctx.log)
-        _set(p, 'tabHeight', _inch(cam_data.TAB_HEIGHT), ctx.log)
+        _set(p, 'tabHeight', _inch(cam_data.tab_height(ctx.material)), ctx.log)
     _apply_feeds(p, row, ctx.log)
 
 

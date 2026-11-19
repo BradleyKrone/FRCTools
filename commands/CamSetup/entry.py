@@ -98,8 +98,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     _add_dropdown(inputs, 'part_type', 'Part Type', PART_TYPES, _last['part_type'])
 
     tabs = inputs.addBoolValueInput('tabs', 'Tabs on Profile', True, '', _last['tabs'])
-    tabs.tooltip = (f'{cam_data.TAB_COUNT} tabs, {cam_data.TAB_WIDTH}" wide x {cam_data.TAB_HEIGHT}" thick, '
-                    'on each plate\'s outside profile')
+    heights = ', '.join(f'{m} {h}"' for m, h in cam_data.TAB_HEIGHT_BY_MATERIAL.items())
+    tabs.tooltip = (f'{cam_data.TAB_COUNT} tabs, {cam_data.TAB_WIDTH}" wide x {cam_data.TAB_HEIGHT}" thick '
+                    f'({heights}), on each plate\'s outside profile')
 
     summary = inputs.addTextBoxCommandInput('summary', 'Found', 'Select parts to see what will be machined.', 4, True)
     summary.isFullWidth = False

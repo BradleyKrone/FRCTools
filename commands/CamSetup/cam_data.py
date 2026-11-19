@@ -117,6 +117,9 @@ def tool(key, material=None):
 #   plunge   plunge / ramp feed (IPM)
 #   doc      'slot': depth per pass;  'adaptive': max roughing stepdown
 #   woc      'adaptive' only: optimal load (radial width of cut)
+#   ramp       optional: helical ramp feed (IPM); defaults to plunge
+#   ramp_angle optional: helical ramp angle (deg); defaults to 2
+#   pitch      optional, 'slot' only: helical bore depth per rev (in); defaults to doc
 # 'slot' rows are used for full-width cuts: profile contours and helical bores.
 # 'adaptive' rows are used for pocket / through-cutout clearing.
 FEEDS = {
@@ -147,18 +150,40 @@ FEEDS = {
         },
         # Wood: the CIC bits in MATERIAL_TOOLS. Slot rows are CIC's published
         # "Hobby CNC with Spindle" numbers (18k RPM, plunge 50% of feed): Golden
-        # Boy XL 100 IPM @ 0.25" per pass, UC2175 70 IPM @ 0.125". With even
-        # stepdowns a 3/4" sheet profiles in 3 passes, 1/2" in 2, 1/4" in 1.
+        # Boy XL 100 IPM @ 0.25" per pass (raised below), UC2175 70 IPM @ 0.125".
         # Adaptive takes a thin radial bite, so it runs deeper and faster: the XL
         # at 0.5" per pass (a 3/4" sheet = 2 even passes of 0.375", 1/2" and
         # thinner = 1), the UC2175 at half its flute length.
         # If the wood scorches, drop RPM before dropping feed (a bigger chip
         # carries the heat away).
+        # Adaptive ramps: the first test cut showed the 2 deg / plunge-feed helix
+        # was far too timid in wood (~17 s per entry at 0.5" deep), so the XL
+        # helixes in at 5 deg / 100 IPM and the UC2175 at 3 deg / 50 IPM.
+        # It also cut with no strain at a 16% bite, so the optimal load went up
+        # (feed unchanged: adaptive caps engagement, so tight corners don't spike):
+        # XL 0.040 -> 0.0625 (25%), UC2175 0.020 -> 0.025. A wider bite thins the
+        # chip (~0.0032" at 18k), so if it scorches drop to ~16k RPM.
+        # 200 IPM was tried and dropped: adaptive is mostly tight arcs, so the
+        # Shapeoko's acceleration keeps it well under 150-200 IPM anyway -- a
+        # GRBL planner sim saved only 0-0.8 min on a 12-cut-out job. A wider
+        # bite isn't acceleration-limited, so the XL's load went 0.080" -> 0.100"
+        # (40%). If it chatters, back off to 0.080". IDC rates its similar "Beast"
+        # rougher at 0.2" stepover, but only with 100 IPM / 0.0015" chip -- going
+        # wider than 0.100" here means dropping the feed too.
+        # Profiles ramp along the contour into each layer; same fix, the XL at
+        # 5 deg / slot feed (a 0.375" layer ramps in over ~4.3").
+        # The XL profiled 0.25" layers with no strain, so its slot DOC went to
+        # 0.375": a 0.70-3/4" sheet profiles in 2 passes (was 3), 1/2" in 2,
+        # 1/4" in 1. Helical bores keep their proven 0.25" pitch ('pitch').
         'Wood': {
-            '1/4': {'slot':     {'rpm': 18000, 'feed': 100, 'plunge': 50, 'doc': 0.25},
-                    'adaptive': {'rpm': 18000, 'feed': 150, 'plunge': 50, 'doc': 0.50, 'woc': 0.040}},
-            '1/8': {'slot':     {'rpm': 18000, 'feed': 70, 'plunge': 35, 'doc': 0.125},
-                    'adaptive': {'rpm': 18000, 'feed': 90, 'plunge': 35, 'doc': 0.375, 'woc': 0.020}},
+            '1/4': {'slot':     {'rpm': 18000, 'feed': 100, 'plunge': 50, 'doc': 0.375,
+                                 'ramp': 100, 'ramp_angle': 5, 'pitch': 0.25},
+                    'adaptive': {'rpm': 18000, 'feed': 150, 'plunge': 50, 'doc': 0.50, 'woc': 0.100,
+                                 'ramp': 100, 'ramp_angle': 5}},
+            '1/8': {'slot':     {'rpm': 18000, 'feed': 70, 'plunge': 35, 'doc': 0.125,
+                                 'ramp': 50, 'ramp_angle': 3},
+                    'adaptive': {'rpm': 18000, 'feed': 90, 'plunge': 35, 'doc': 0.375, 'woc': 0.025,
+                                 'ramp': 50, 'ramp_angle': 3}},
         },
     },
 }
@@ -209,6 +234,12 @@ STOCK_SIDE_OFFSET = 0.125           # plate stock box grows this much on each si
 TAB_COUNT = 4
 TAB_WIDTH = 0.25
 TAB_HEIGHT = 0.03
+# Per-material tab heights; wood needs thicker tabs to hold the part.
+TAB_HEIGHT_BY_MATERIAL = {'Wood': 0.2}
+
+
+def tab_height(material):
+    return TAB_HEIGHT_BY_MATERIAL.get(material, TAB_HEIGHT)
 
 # WCS origin box points (Fusion's `wcs_origin_boxPoint` choices).
 # Plates: Z0 on the spoilboard (stock bottom), X/Y at the front-left corner.
